@@ -1154,6 +1154,16 @@ impl TextEngine {
         self.fonts.family_names()
     }
 
+    /// Whether `s` shapes to exactly one non-`.notdef` glyph — i.e. the fonts
+    /// render it as a single unit (a plain glyph, or a fully-ligated emoji
+    /// sequence). `false` means the shaper fell back to several glyphs, e.g. a ZWJ
+    /// or flag sequence a font can't form, which would render as overlapping
+    /// pieces rather than one emoji. Useful for grid/cell layouts.
+    pub fn is_single_glyph(&mut self, s: &str) -> bool {
+        let run = shape_text(&self.fonts, &mut self.glyph_cache, s, 0.0, 0.0);
+        run.glyphs.len() == 1 && run.glyphs[0].glyph_id != 0
+    }
+
     /// Family name of the face that would render `c`, resolving presentation the
     /// same way shaping does (emoji-default → a color face). `None` if uncovered.
     pub fn family_for(&self, c: char) -> Option<String> {
@@ -1712,6 +1722,15 @@ mod tests {
             second.lines.last().unwrap().byte_range.end,
             first.lines.last().unwrap().byte_range.end
         );
+    }
+
+    #[test]
+    fn single_glyph_detection() {
+        let Some(mut engine) = test_engine() else {
+            return;
+        };
+        assert!(engine.is_single_glyph("A"), "one letter is one glyph");
+        assert!(!engine.is_single_glyph("AB"), "two letters shape to two glyphs");
     }
 
     #[test]

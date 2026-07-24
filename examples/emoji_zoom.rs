@@ -183,10 +183,18 @@ impl Viewer {
         }
         let (t, e) = if r >= 0 && (r as usize) < self.layout.len() {
             let ink = args(GLYPH_PX, INK);
+            let tofu = args(GLYPH_PX * 0.72, [0.72, 0.73, 0.77, 1.0]);
             let y = r as f32 * CELL_H + GLYPH_PX + 4.0;
             let cells = &self.layout[r as usize].cells;
             for cell in cells {
-                self.engine.text(cell.x, y, cell.emoji, &ink);
+                // Sequences the font can't ligate (a missing ZWJ/flag component)
+                // shape to several glyphs that overflow the cell — show one tofu
+                // box instead of the overlapping pieces.
+                if self.engine.is_single_glyph(cell.emoji) {
+                    self.engine.text(cell.x, y, cell.emoji, &ink);
+                } else {
+                    self.engine.text(cell.x + 3.0, y - 5.0, "\u{25A1}", &tofu);
+                }
             }
             self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
             self.engine.sync_emoji_atlas(&mut self.emoji_atlas, &self.device, &self.queue, &self.emoji_renderer.atlas_layout);
