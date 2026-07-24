@@ -3,6 +3,14 @@
 //! Loads TTF/OTF fonts, shapes text with rustybuzz, builds a GPU glyph cache of
 //! quadratic Bézier curves and bands, and renders solid filled text via a wgpu
 //! pipeline.
+//!
+//! # Compatibility
+//!
+//! - **wgpu: `29`** — this crate is built against wgpu 29 and re-exports types
+//!   ([`TextRenderer`], [`TextAtlas`]) that borrow `wgpu::Device`/`Queue`
+//!   directly, so your application **must** depend on the same wgpu major
+//!   version. Bumping wgpu here is a breaking change.
+//! - **MSRV: Rust 1.82.**
 
 
 mod bands;

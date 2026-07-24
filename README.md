@@ -1,9 +1,74 @@
-# text
+# sanscale
 
-GPU font renderer based on the **Slug** algorithm (Lengyel, 2017): quadratic
-Bézier outlines rendered with per-pixel analytic coverage, resolution-independent,
-no glyph rasterization. Loads TTF/OTF, shapes with rustybuzz, draws through wgpu.
-Color glyphs (emoji) fall back to a rasterized atlas.
+**Resolution-independent GPU text rendering for [wgpu](https://wgpu.rs).**
+
+sanscale draws each glyph directly from its quadratic Bézier outline with
+analytic per-pixel coverage — Eric Lengyel's [Slug](https://sluglibrary.com)
+algorithm. There is no glyph bitmap and no signed-distance field, so text stays
+razor-sharp at any zoom without ever re-rasterizing an atlas.
+
+```toml
+[dependencies]
+sanscale = { git = "https://github.com/xpjb/sanscale" }
+```
+
+<sub>License: MIT OR Apache-2.0 · wgpu 29</sub>
+
+## Features
+
+- **Resolution-independent** — coverage is computed from curves per fragment;
+  zoom freely, no atlas resolution to outgrow.
+- **Anti-aliased** by construction (analytic coverage, not supersampling).
+- **Band-accelerated** — glyph outlines are spatially indexed into bands so the
+  fragment shader tests only nearby curves, not the whole outline.
+- **Lazy, incremental atlas** — glyphs are cached and uploaded to the GPU on
+  first use; nothing to pre-declare.
+- **Real shaping** via [rustybuzz](https://crates.io/crates/rustybuzz), script
+  itemization, and multi-font **fallback chains**.
+- **Color emoji** (COLR v0/v1) through a rasterized side atlas.
+- **Layout**: line wrapping, left/center/right alignment, multi-paragraph runs.
+- **Editor geometry**: measurement, caret positions, hit-testing, selection
+  rectangles, and pixel clip rectangles.
+
+## Quick start
+
+```rust
+use sanscale::{TextArgs, TextEngine, TextRenderer};
+
+// 1. Load a font (from a path, bytes, or an ordered fallback chain).
+let mut engine = TextEngine::load("/path/to/font.ttf")?;
+
+// 2. Create the pipeline and a GPU glyph atlas.
+let renderer = TextRenderer::new(&device, &surface_config);
+let mut atlas = engine.new_atlas(&device, &queue, &renderer.atlas_layout);
+
+// 3. Each frame: queue text, upload any newly-cached glyphs, flush vertices.
+let args = TextArgs { size_px: 32.0, ..Default::default() };
+engine.text(40.0, 80.0, "Hello, sanscale!", &args);      // pixel baseline
+engine.sync_atlas(&mut atlas, &device, &queue, &renderer.atlas_layout);
+let vertices = engine.flush();
+
+// 4. Draw with a pixel-space orthographic matrix (0,0 = top-left).
+let buffer = TextRenderer::build_vertices(&device, vertices);
+renderer.render(&queue, &mut encoder, &view, &atlas, &buffer,
+    vertices.len() as u32, ortho, (width, height), Some(wgpu::Color::WHITE));
+```
+
+## Examples
+
+Both are headless — they render to a PNG, no window required.
+
+```
+cargo run --example hello_png    # one line of text  -> hello.png
+cargo run --example paragraph    # wrapping, alignment, sizes -> paragraph.png
+```
+
+## Status
+
+Extracted from a shipping infinite-canvas app, where it renders live editable
+text across a zooming viewport. The public API in `engine` is the stable
+surface; the pipeline internals may change. Not yet published to crates.io —
+depend on it via git.
 
 ## Pipeline
 
@@ -18,8 +83,6 @@ font bytes ──► shape (rustybuzz) ──► outlines ──► bands ──
 The engine is the surface; everything else is internal. `TextEngine::text*`
 queues glyphs, `flush()` returns vertices, and `sync_atlas()` uploads any newly
 cached glyphs before drawing.
-
-## Modules
 
 | Module | Role |
 |---|---|
@@ -59,6 +122,12 @@ would cross the boundary (as Slug's font compiler does), recomputing header
 offsets to match. Break this and glyphs intermittently lose a band or render
 scrambled, depending on where they land in the atlas — a bug that rotates between
 letters as the atlas fills. Covered by `cache::tests::band_runs_never_straddle_a_texture_row`.
+
+## License
+
+Dual-licensed under either of [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option. The Slug algorithm and reference
+shaders were dedicated to the public domain by Eric Lengyel.
 
 ## Reference
 
