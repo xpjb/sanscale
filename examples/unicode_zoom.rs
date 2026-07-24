@@ -15,11 +15,15 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{Mat4, Vec2, Vec3};
-use sanscale::{EmojiAtlas, EmojiRenderer, TextArgs, TextAtlas, TextEngine, TextRenderer};
+use sanscale::{
+    EmojiAtlas, EmojiRenderer, EmojiVertex, TextArgs, TextAtlas, TextEngine, TextRenderer,
+    TextVertex,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -36,7 +40,6 @@ const GLYPH_PX: f32 = 15.0;
 const MAX_ROW: i64 = 0x2_FFFF / COLS; // planes 0–2
 const GUTTER_W: f32 = 560.0; // world-space column reserved on the left for titles
 const TITLE_PX: f32 = 52.0; // world-space title height (scales with zoom)
-const MIN_CELL_PX: f32 = 9.0; // below this on-screen cell size, cull glyphs
 const WORLD_W: f32 = GUTTER_W + COLS as f32 * CELL_W;
 const WORLD_H: f32 = (MAX_ROW as f32 + 1.0) * CELL_H;
 const INK: [f32; 4] = [0.12, 0.13, 0.16, 1.0];
@@ -132,6 +135,11 @@ struct Viewer {
     grid_buf: DynBuf,
     emoji_buf: DynBuf,
     overlay_buf: DynBuf,
+    /// Per-row cached vertices. A cell's world position and glyph are fixed by its
+    /// code point, so a row is shaped/emitted once and then just re-gathered.
+    rows: HashMap<i64, (Vec<TextVertex>, Vec<EmojiVertex>)>,
+    scratch_text: Vec<TextVertex>,
+    scratch_emoji: Vec<EmojiVertex>,
 }
 
 impl Viewer {
@@ -155,42 +163,44 @@ impl Viewer {
             grid_buf,
             emoji_buf,
             overlay_buf,
+            rows: HashMap::new(),
+            scratch_text: Vec::new(),
+            scratch_emoji: Vec::new(),
         }
     }
 
-    /// Emit only the cells inside the viewport; covered → glyph, else → tofu box.
-    fn emit_grid(&mut self, offset: Vec2, scale: f32, w: f32, h: f32) {
-        let inv = 1.0 / scale;
-        // World x of a column starts after the reserved title gutter.
-        let col = |sx: f32| ((((sx - offset.x) * inv) - GUTTER_W) / CELL_W).floor() as i64;
-        let row = |sy: f32| (((sy - offset.y) * inv) / CELL_H).floor() as i64;
-        let c0 = col(0.0).clamp(0, COLS - 1);
-        let c1 = col(w).clamp(0, COLS - 1);
-        let r0 = row(0.0).clamp(0, MAX_ROW);
-        let r1 = row(h).clamp(0, MAX_ROW);
-
+    /// Shape and cache one row's cells (covered → glyph, else → tofu box). Cheap
+    /// no-op once the row is cached.
+    fn build_row(&mut self, r: i64) {
+        if self.rows.contains_key(&r) {
+            return;
+        }
         let ink = args(GLYPH_PX, INK);
         let tofu = args(GLYPH_PX, TOFU);
         let mut buf = [0u8; 4];
-        for r in r0..=r1 {
-            for c in c0..=c1 {
-                let cp = (r * COLS + c) as u32;
-                if (0xD800..=0xDFFF).contains(&cp) {
-                    continue;
-                }
-                let Some(ch) = char::from_u32(cp) else { continue };
-                if ch.is_control() || ch.is_whitespace() {
-                    continue;
-                }
-                let x = GUTTER_W + c as f32 * CELL_W + 3.0;
-                let y = r as f32 * CELL_H + 16.0;
-                if self.engine.covers(ch) {
-                    self.engine.text(x, y, ch.encode_utf8(&mut buf), &ink);
-                } else {
-                    self.engine.text(x, y, "\u{25A1}", &tofu); // tofu box
-                }
+        let base = r * COLS;
+        for c in 0..COLS {
+            let cp = (base + c) as u32;
+            if (0xD800..=0xDFFF).contains(&cp) {
+                continue;
+            }
+            let Some(ch) = char::from_u32(cp) else { continue };
+            if ch.is_control() || ch.is_whitespace() {
+                continue;
+            }
+            let x = GUTTER_W + c as f32 * CELL_W + 3.0;
+            let y = r as f32 * CELL_H + 16.0;
+            if self.engine.covers(ch) {
+                self.engine.text(x, y, ch.encode_utf8(&mut buf), &ink);
+            } else {
+                self.engine.text(x, y, "\u{25A1}", &tofu);
             }
         }
+        self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
+        self.engine.sync_emoji_atlas(&mut self.emoji_atlas, &self.device, &self.queue, &self.emoji_renderer.atlas_layout);
+        let t = self.engine.flush().to_vec();
+        let e = self.engine.emoji_vertices().to_vec();
+        self.rows.insert(r, (t, e));
     }
 
     /// World-space block titles in the gutter — big, scaling with the map. Kept
@@ -224,18 +234,27 @@ impl Viewer {
         offset: Vec2,
         scale: f32,
         hud: Option<&str>,
-        hover: Option<(&str, Vec2)>,
     ) {
-        if scale * CELL_W >= MIN_CELL_PX {
-            self.emit_grid(offset, scale, w, h);
+        // Gather cached vertices for the visible rows (building any not yet seen).
+        let inv = 1.0 / scale;
+        let r0 = ((((0.0 - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, MAX_ROW);
+        let r1 = ((((h - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, MAX_ROW);
+        self.scratch_text.clear();
+        self.scratch_emoji.clear();
+        for r in r0..=r1 {
+            self.build_row(r);
+            let (t, e) = &self.rows[&r];
+            self.scratch_text.extend_from_slice(t);
+            self.scratch_emoji.extend_from_slice(e);
         }
+        // Titles depend on the camera, so emit them fresh each frame and append.
         self.emit_titles(offset, scale, h);
         self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
-        self.engine.sync_emoji_atlas(&mut self.emoji_atlas, &self.device, &self.queue, &self.emoji_renderer.atlas_layout);
-        let tv = self.engine.flush().to_vec();
-        let ev = self.engine.emoji_vertices().to_vec();
-        let tn = self.grid_buf.upload(&self.device, &self.queue, &tv);
-        let en = self.emoji_buf.upload(&self.device, &self.queue, &ev);
+        let titles = self.engine.flush().to_vec();
+        self.scratch_text.extend_from_slice(&titles);
+
+        let tn = self.grid_buf.upload(&self.device, &self.queue, &self.scratch_text);
+        let en = self.emoji_buf.upload(&self.device, &self.queue, &self.scratch_emoji);
 
         let cam = ortho(w, h) * model(offset, scale);
         self.text_renderer.write_matrix(&self.queue, cam);
@@ -263,16 +282,9 @@ impl Viewer {
         }
         self.queue.submit([enc.finish()]);
 
-        // Screen-space overlay (perf HUD + hovered code point) in a second pass.
-        if hud.is_none() && hover.is_none() {
-            return;
-        }
-        if let Some(hud) = hud {
-            self.engine.text(12.0, h - 12.0, hud, &args(16.0, [0.85, 0.15, 0.15, 1.0]));
-        }
-        if let Some((text, pos)) = hover {
-            self.engine.text(pos.x, pos.y, text, &args(16.0, [0.13, 0.35, 0.75, 1.0]));
-        }
+        // Screen-space debug line (bottom-left), drawn over the map in a second pass.
+        let Some(hud) = hud else { return };
+        self.engine.text(12.0, h - 12.0, hud, &args(16.0, [0.85, 0.15, 0.15, 1.0]));
         self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
         let ov = self.engine.flush().to_vec();
         let on = self.overlay_buf.upload(&self.device, &self.queue, &ov);
@@ -298,9 +310,8 @@ impl Viewer {
     }
 }
 
-/// The code point under the cursor, if it's over a grid cell, as a screen-space
-/// `(label, position)` for the overlay.
-fn hovered(cursor: Vec2, offset: Vec2, scale: f32) -> Option<(String, Vec2)> {
+/// The code point under the cursor, if it's over a grid cell (`U+XXXX char block`).
+fn hovered(cursor: Vec2, offset: Vec2, scale: f32) -> Option<String> {
     let world = (cursor - offset) / scale;
     let col = ((world.x - GUTTER_W) / CELL_W).floor() as i64;
     let row = (world.y / CELL_H).floor() as i64;
@@ -314,7 +325,7 @@ fn hovered(cursor: Vec2, offset: Vec2, scale: f32) -> Option<(String, Vec2)> {
     let ch = char::from_u32(cp)?;
     let block = BLOCKS.iter().rev().find(|(s, _)| *s <= cp).map(|(_, n)| *n).unwrap_or("—");
     let shown = if ch.is_control() || ch.is_whitespace() { ' ' } else { ch };
-    Some((format!("U+{cp:04X}  {shown}  ·  {block}"), cursor + Vec2::new(18.0, -12.0)))
+    Some(format!("U+{cp:04X}  {shown}  ·  {block}"))
 }
 
 fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
@@ -516,16 +527,13 @@ impl Gfx {
         };
         let view = frame.texture.create_view(&Default::default());
 
-        // HUD shows the p99 of the last ~5s of per-frame CPU render cost (emit +
-        // buffer build + encode + submit; the GPU runs asynchronously after).
-        let (p99, avg) = percentiles(&self.samples);
-        let hud = format!(
-            "render p99 {p99:.2} ms · avg {avg:.2} ms · n={} · zoom {:.2}x",
-            self.samples.len(),
-            self.scale
-        );
-        let hover = hovered(self.cursor, self.offset, self.scale);
-        let hover_ref = hover.as_ref().map(|(s, p)| (s.as_str(), *p));
+        // Debug line: only what was asked for — p99 of the last ~5s of per-frame
+        // CPU render cost, and the hovered code point.
+        let p99 = p99(&self.samples);
+        let hud = match hovered(self.cursor, self.offset, self.scale) {
+            Some(h) => format!("p99 {p99:.2} ms   ·   {h}"),
+            None => format!("p99 {p99:.2} ms"),
+        };
 
         let t0 = Instant::now();
         self.viewer.render(
@@ -535,7 +543,6 @@ impl Gfx {
             self.offset,
             self.scale,
             Some(&hud),
-            hover_ref,
         );
         let cost = t0.elapsed().as_secs_f32() * 1000.0;
         frame.present();
@@ -548,16 +555,14 @@ impl Gfx {
     }
 }
 
-/// (p99, mean) of the sample costs, in ms.
-fn percentiles(samples: &[(Instant, f32)]) -> (f32, f32) {
+/// p99 of the sample costs, in ms.
+fn p99(samples: &[(Instant, f32)]) -> f32 {
     if samples.is_empty() {
-        return (0.0, 0.0);
+        return 0.0;
     }
     let mut v: Vec<f32> = samples.iter().map(|&(_, c)| c).collect();
-    let mean = v.iter().sum::<f32>() / v.len() as f32;
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let idx = (((v.len() - 1) as f32) * 0.99).round() as usize;
-    (v[idx], mean)
+    v[(((v.len() - 1) as f32) * 0.99).round() as usize]
 }
 
 fn clamp_axis(v: f32, min: f32, max: f32) -> f32 {
@@ -597,6 +602,44 @@ fn dump() {
     dump_png(&mut viewer, 1000, 620, offset, scale, "unicode_map_zoom.png");
 
     println!("wrote unicode_map.png (regional) and unicode_map_zoom.png (CJK deep zoom)");
+
+    // Perf probe: time the per-frame CPU render cost (emit + buffer upload +
+    // encode + submit) for a dense, fully zoomed-out frame — the worst case now
+    // that there is no LOD cull. Warm the caches first, then report percentiles.
+    let (w, h) = (1600u32, 1000u32);
+    let target = viewer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("probe"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scale = w as f32 / WORLD_W; // fit whole width → most cells on screen
+    let offset = Vec2::new(0.0, 0.0);
+    let cells = {
+        let cols = COLS;
+        let rows = (h as f32 / (CELL_H * scale)).ceil() as i64;
+        cols * rows
+    };
+    for _ in 0..5 {
+        viewer.render(&view, w as f32, h as f32, offset, scale, None);
+    }
+    let mut times = Vec::new();
+    for _ in 0..60 {
+        let t = Instant::now();
+        viewer.render(&view, w as f32, h as f32, offset, scale, None);
+        times.push(t.elapsed().as_secs_f32() * 1000.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = times[times.len() / 2];
+    let p99 = times[((times.len() - 1) as f32 * 0.99) as usize];
+    println!(
+        "perf probe: ~{cells} cells/frame at fit-width, CPU render median {med:.2} ms · p99 {p99:.2} ms"
+    );
 }
 
 fn dummy_config() -> wgpu::SurfaceConfiguration {
@@ -624,7 +667,7 @@ fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path:
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    viewer.render(&view, w as f32, h as f32, offset, scale, None, None);
+    viewer.render(&view, w as f32, h as f32, offset, scale, None);
 
     let unpadded = w * 4;
     let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
