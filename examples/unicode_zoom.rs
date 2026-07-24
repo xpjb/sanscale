@@ -262,9 +262,11 @@ impl Viewer {
         let ch = char::from_u32(cp)?;
         let block = BLOCKS.iter().rev().find(|(s, _)| *s <= cp).map(|(_, n)| *n).unwrap_or("—");
         let family = self.engine.family_for(ch).unwrap_or_else(|| "—".into());
+        // Canonical Unicode name (handles algorithmic CJK/Hangul ranges too).
+        let name = unicode_names2::name(ch).map(|n| n.to_string()).unwrap_or_else(|| "—".into());
         let shown = if ch.is_control() || ch.is_whitespace() { ' ' } else { ch };
         Some(Hover {
-            label: format!("U+{cp:04X}  {shown}  ·  {block}  ·  {family}"),
+            label: format!("U+{cp:04X}  {shown}  ·  {name}  ·  {block}  ·  {family}"),
             text: ch.to_string(),
             code: format!("U+{cp:04X}"),
         })

@@ -37,6 +37,8 @@ winit = "0.30"
 bytemuck = "1"
 # Clipboard: click-to-copy in the interactive examples.
 arboard = "3"
+# Canonical Unicode character names for the unicode_zoom hover.
+unicode_names2 = "3"
 
 [lints.clippy]
 too_many_arguments = "allow"
