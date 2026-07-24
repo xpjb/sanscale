@@ -182,10 +182,6 @@ impl FontSet {
             .collect()
     }
 
-    pub fn faces(&self) -> &[Font] {
-        &self.faces
-    }
-
     /// Face by id; ids are indices produced by itemization, always in range.
     pub fn face(&self, id: u16) -> &Font {
         &self.faces[id as usize]
