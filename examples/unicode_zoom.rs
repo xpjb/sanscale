@@ -86,6 +86,40 @@ fn args(size_px: f32, color: [f32; 4]) -> TextArgs {
     TextArgs { size_px, color, ..Default::default() }
 }
 
+/// A vertex buffer that's written in place each frame and only reallocated when
+/// it needs to grow — avoids allocating a fresh GPU buffer every frame.
+struct DynBuf {
+    buf: wgpu::Buffer,
+    cap: u64,
+}
+
+impl DynBuf {
+    fn new(device: &wgpu::Device) -> Self {
+        Self { buf: Self::alloc(device, 4096), cap: 4096 }
+    }
+    fn alloc(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dyn vertices"),
+            size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+    /// Upload `data`, growing the buffer if needed; returns the element count.
+    fn upload<T: bytemuck::Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[T]) -> u32 {
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        if bytes.is_empty() {
+            return 0;
+        }
+        if bytes.len() as u64 > self.cap {
+            self.cap = (bytes.len() as u64).next_power_of_two();
+            self.buf = Self::alloc(device, self.cap);
+        }
+        queue.write_buffer(&self.buf, 0, bytes);
+        data.len() as u32
+    }
+}
+
 /// Owns the engine, GPU renderers, and atlases; renders one culled frame on demand.
 struct Viewer {
     device: wgpu::Device,
@@ -95,6 +129,9 @@ struct Viewer {
     emoji_renderer: EmojiRenderer,
     text_atlas: TextAtlas,
     emoji_atlas: EmojiAtlas,
+    grid_buf: DynBuf,
+    emoji_buf: DynBuf,
+    overlay_buf: DynBuf,
 }
 
 impl Viewer {
@@ -105,7 +142,20 @@ impl Viewer {
         let emoji_renderer = EmojiRenderer::new(&device, config);
         let text_atlas = engine.new_atlas(&device, &queue, &text_renderer.atlas_layout);
         let emoji_atlas = engine.new_emoji_atlas(&device, &queue, &emoji_renderer.atlas_layout);
-        Self { device, queue, engine, text_renderer, emoji_renderer, text_atlas, emoji_atlas }
+        let (grid_buf, emoji_buf, overlay_buf) =
+            (DynBuf::new(&device), DynBuf::new(&device), DynBuf::new(&device));
+        Self {
+            device,
+            queue,
+            engine,
+            text_renderer,
+            emoji_renderer,
+            text_atlas,
+            emoji_atlas,
+            grid_buf,
+            emoji_buf,
+            overlay_buf,
+        }
     }
 
     /// Emit only the cells inside the viewport; covered → glyph, else → tofu box.
@@ -144,23 +194,25 @@ impl Viewer {
     }
 
     /// World-space block titles in the gutter — big, scaling with the map. Kept
-    /// from overlapping via a *screen-space* gap, so zooming in reveals more of
-    /// them (near-adjacent blocks only merge when they'd physically collide).
+    /// from overlapping via a *screen-space* gap so zooming in reveals more of
+    /// them. The winner set is decided over *all* blocks (the gap test is
+    /// offset-invariant, since baseline differences cancel `offset.y`), and only
+    /// drawing is gated on visibility — so panning a title off-screen no longer
+    /// reshuffles which of the others show.
     fn emit_titles(&mut self, offset: Vec2, scale: f32, h: f32) {
         let args = args(TITLE_PX, TITLE);
         let min_gap = TITLE_PX * scale * 1.1; // screen px between title baselines
-        let mut last_y = f32::MIN;
+        let mut last_kept = f32::MIN;
         for &(start, name) in BLOCKS {
             let r = (start as i64 / COLS) as f32;
             let screen_y = r * CELL_H * scale + offset.y;
-            if screen_y > h {
-                break; // blocks are ascending; the rest are below the viewport
+            if screen_y < last_kept + min_gap {
+                continue; // loses its slot to a nearby title above it
             }
-            if screen_y < -TITLE_PX * scale || screen_y < last_y + min_gap {
-                continue;
+            last_kept = screen_y; // wins its slot whether or not it's on-screen
+            if screen_y >= -TITLE_PX * scale && screen_y <= h {
+                self.engine.text(10.0, r * CELL_H + TITLE_PX * 0.82, name, &args);
             }
-            self.engine.text(10.0, r * CELL_H + TITLE_PX * 0.82, name, &args);
-            last_y = screen_y;
         }
     }
 
@@ -172,6 +224,7 @@ impl Viewer {
         offset: Vec2,
         scale: f32,
         hud: Option<&str>,
+        hover: Option<(&str, Vec2)>,
     ) {
         if scale * CELL_W >= MIN_CELL_PX {
             self.emit_grid(offset, scale, w, h);
@@ -181,8 +234,8 @@ impl Viewer {
         self.engine.sync_emoji_atlas(&mut self.emoji_atlas, &self.device, &self.queue, &self.emoji_renderer.atlas_layout);
         let tv = self.engine.flush().to_vec();
         let ev = self.engine.emoji_vertices().to_vec();
-        let tb = TextRenderer::build_vertices(&self.device, &tv);
-        let eb = EmojiRenderer::build_vertices(&self.device, &ev);
+        let tn = self.grid_buf.upload(&self.device, &self.queue, &tv);
+        let en = self.emoji_buf.upload(&self.device, &self.queue, &ev);
 
         let cam = ortho(w, h) * model(offset, scale);
         self.text_renderer.write_matrix(&self.queue, cam);
@@ -205,38 +258,63 @@ impl Viewer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &tb, 0..tv.len() as u32);
-            self.emoji_renderer.draw(&mut pass, &self.emoji_atlas, &eb, 0..ev.len() as u32);
+            self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &self.grid_buf.buf, 0..tn);
+            self.emoji_renderer.draw(&mut pass, &self.emoji_atlas, &self.emoji_buf.buf, 0..en);
         }
         self.queue.submit([enc.finish()]);
 
-        // Screen-space perf HUD, drawn over the map in a second (ortho) pass.
+        // Screen-space overlay (perf HUD + hovered code point) in a second pass.
+        if hud.is_none() && hover.is_none() {
+            return;
+        }
         if let Some(hud) = hud {
             self.engine.text(12.0, h - 12.0, hud, &args(16.0, [0.85, 0.15, 0.15, 1.0]));
-            self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
-            let hv = self.engine.flush().to_vec();
-            let hb = TextRenderer::build_vertices(&self.device, &hv);
-            self.text_renderer.write_matrix(&self.queue, ortho(w, h));
-            let mut enc = self.device.create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("hud"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &hb, 0..hv.len() as u32);
-            }
-            self.queue.submit([enc.finish()]);
         }
+        if let Some((text, pos)) = hover {
+            self.engine.text(pos.x, pos.y, text, &args(16.0, [0.13, 0.35, 0.75, 1.0]));
+        }
+        self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
+        let ov = self.engine.flush().to_vec();
+        let on = self.overlay_buf.upload(&self.device, &self.queue, &ov);
+        self.text_renderer.write_matrix(&self.queue, ortho(w, h));
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &self.overlay_buf.buf, 0..on);
+        }
+        self.queue.submit([enc.finish()]);
     }
+}
+
+/// The code point under the cursor, if it's over a grid cell, as a screen-space
+/// `(label, position)` for the overlay.
+fn hovered(cursor: Vec2, offset: Vec2, scale: f32) -> Option<(String, Vec2)> {
+    let world = (cursor - offset) / scale;
+    let col = ((world.x - GUTTER_W) / CELL_W).floor() as i64;
+    let row = (world.y / CELL_H).floor() as i64;
+    if !(0..COLS).contains(&col) || !(0..=MAX_ROW).contains(&row) {
+        return None;
+    }
+    let cp = (row * COLS + col) as u32;
+    if (0xD800..=0xDFFF).contains(&cp) {
+        return None;
+    }
+    let ch = char::from_u32(cp)?;
+    let block = BLOCKS.iter().rev().find(|(s, _)| *s <= cp).map(|(_, n)| *n).unwrap_or("—");
+    let shown = if ch.is_control() || ch.is_whitespace() { ' ' } else { ch };
+    Some((format!("U+{cp:04X}  {shown}  ·  {block}"), cursor + Vec2::new(18.0, -12.0)))
 }
 
 fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
@@ -360,10 +438,17 @@ impl Gfx {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            // Lowest-latency present mode available (Mailbox → drag tracks the
+            // cursor without buffering extra frames), and only 1 frame in flight.
+            present_mode: caps
+                .present_modes
+                .iter()
+                .copied()
+                .find(|m| *m == wgpu::PresentMode::Mailbox)
+                .unwrap_or(wgpu::PresentMode::Fifo),
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
         let viewer = Viewer::new(device, queue, &config);
@@ -439,6 +524,8 @@ impl Gfx {
             self.samples.len(),
             self.scale
         );
+        let hover = hovered(self.cursor, self.offset, self.scale);
+        let hover_ref = hover.as_ref().map(|(s, p)| (s.as_str(), *p));
 
         let t0 = Instant::now();
         self.viewer.render(
@@ -448,6 +535,7 @@ impl Gfx {
             self.offset,
             self.scale,
             Some(&hud),
+            hover_ref,
         );
         let cost = t0.elapsed().as_secs_f32() * 1000.0;
         frame.present();
@@ -536,7 +624,7 @@ fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path:
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    viewer.render(&view, w as f32, h as f32, offset, scale, None);
+    viewer.render(&view, w as f32, h as f32, offset, scale, None, None);
 
     let unpadded = w * 4;
     let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)

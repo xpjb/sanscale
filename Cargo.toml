@@ -33,6 +33,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 fontdb = "0.22"
 # The interactive `unicode_zoom` example opens a window.
 winit = "0.30"
+# Write reused vertex buffers directly (avoid per-frame buffer allocation).
+bytemuck = "1"
 
 [lints.clippy]
 too_many_arguments = "allow"
