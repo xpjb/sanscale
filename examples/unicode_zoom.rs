@@ -2,15 +2,15 @@
 //!
 //! Fixed Unifont-style grid — 256 columns, `code point = row*256 + col` — across
 //! planes 0–2. Nothing is enumerated up front: each frame culls to the visible
-//! cells and only shapes/draws those, so cost tracks the viewport, not the ~200k
-//! code points. Covered code points draw their glyph; the rest draw a faint tofu
-//! box. Below a minimum on-screen cell size, glyphs are skipped and only the
-//! Unicode **block labels** are drawn (a legend); zoom in and the glyphs appear,
-//! razor-sharp at any scale because coverage is analytic (color emoji, a raster
-//! atlas, is the one thing that pixelates).
+//! cells and only shapes/draws those. Covered code points draw their glyph; the
+//! rest draw a faint tofu box. A reserved left gutter holds big **world-space**
+//! block titles that scale with the map like everything else. Below a minimum
+//! on-screen cell size the glyphs are culled (the titles carry navigation). It
+//! all stays razor-sharp at any zoom because coverage is analytic — only the
+//! color-emoji raster atlas pixelates.
 //!
 //! Interactive:  `cargo run --example unicode_zoom`
-//!     scroll = zoom at cursor · drag = pan · R = reset · Esc = quit
+//!     scroll = zoom at cursor · drag (any button) = pan · R = reset · Esc = quit
 //! Headless PNGs: `cargo run --example unicode_zoom -- --dump`
 
 mod common;
@@ -33,33 +33,35 @@ const CELL_W: f32 = 20.0;
 const CELL_H: f32 = 22.0;
 const GLYPH_PX: f32 = 15.0;
 const MAX_ROW: i64 = 0x2_FFFF / COLS; // planes 0–2
-const GUTTER_W: f32 = 380.0; // world-space column reserved on the left for titles
-const MIN_CELL_PX: f32 = 9.0; // below this on-screen cell size, draw labels only
+const GUTTER_W: f32 = 560.0; // world-space column reserved on the left for titles
+const TITLE_PX: f32 = 52.0; // world-space title height (scales with zoom)
+const MIN_CELL_PX: f32 = 9.0; // below this on-screen cell size, cull glyphs
+const WORLD_W: f32 = GUTTER_W + COLS as f32 * CELL_W;
+const WORLD_H: f32 = (MAX_ROW as f32 + 1.0) * CELL_H;
 const INK: [f32; 4] = [0.12, 0.13, 0.16, 1.0];
 const TOFU: [f32; 4] = [0.80, 0.81, 0.84, 1.0];
-const LABEL: [f32; 4] = [0.15, 0.40, 0.85, 1.0];
+const TITLE: [f32; 4] = [0.16, 0.40, 0.82, 1.0];
 
-/// Major Unicode blocks (start, name), ascending — enough to label the map.
+/// Major Unicode blocks (start, short name), ascending. Names are kept short so
+/// they fit the title gutter at the world-space title size.
 const BLOCKS: &[(u32, &str)] = &[
-    (0x0000, "Basic Latin"), (0x0080, "Latin-1 Supplement"), (0x0100, "Latin Extended-A"),
-    (0x0180, "Latin Extended-B"), (0x0250, "IPA Extensions"), (0x0300, "Combining Diacritics"),
-    (0x0370, "Greek and Coptic"), (0x0400, "Cyrillic"), (0x0530, "Armenian"),
-    (0x0590, "Hebrew"), (0x0600, "Arabic"), (0x0700, "Syriac"), (0x0900, "Devanagari"),
-    (0x0980, "Bengali"), (0x0B80, "Tamil"), (0x0C00, "Telugu"), (0x0D00, "Malayalam"),
-    (0x0E00, "Thai"), (0x0E80, "Lao"), (0x0F00, "Tibetan"), (0x1000, "Myanmar"),
-    (0x10A0, "Georgian"), (0x1100, "Hangul Jamo"), (0x1200, "Ethiopic"), (0x13A0, "Cherokee"),
-    (0x1780, "Khmer"), (0x1800, "Mongolian"), (0x1E00, "Latin Extended Additional"),
-    (0x1F00, "Greek Extended"), (0x2000, "General Punctuation"), (0x20A0, "Currency Symbols"),
-    (0x2100, "Letterlike Symbols"), (0x2190, "Arrows"), (0x2200, "Mathematical Operators"),
-    (0x2300, "Misc Technical"), (0x2460, "Enclosed Alphanumerics"), (0x2500, "Box Drawing"),
-    (0x2600, "Misc Symbols"), (0x2700, "Dingbats"), (0x2800, "Braille"),
-    (0x2E80, "CJK Radicals"), (0x3000, "CJK Symbols & Punct."), (0x3040, "Hiragana"),
-    (0x30A0, "Katakana"), (0x3100, "Bopomofo"), (0x3130, "Hangul Compat. Jamo"),
-    (0x3400, "CJK Extension A"), (0x4E00, "CJK Unified Ideographs"), (0xA000, "Yi Syllables"),
-    (0xAC00, "Hangul Syllables"), (0xF900, "CJK Compatibility"), (0xFB00, "Presentation Forms"),
-    (0xFF00, "Halfwidth & Fullwidth"), (0x10000, "Linear B — plane 1"),
-    (0x1D400, "Math Alphanumerics"), (0x1F300, "Misc Symbols & Pictographs"),
-    (0x1F600, "Emoticons"), (0x1F680, "Transport & Map"), (0x20000, "CJK Extension B — plane 2"),
+    (0x0000, "Basic Latin"), (0x0080, "Latin-1 Suppl."), (0x0100, "Latin Ext-A"),
+    (0x0180, "Latin Ext-B"), (0x0250, "IPA Extensions"), (0x0300, "Combining Marks"),
+    (0x0370, "Greek"), (0x0400, "Cyrillic"), (0x0530, "Armenian"), (0x0590, "Hebrew"),
+    (0x0600, "Arabic"), (0x0700, "Syriac"), (0x0900, "Devanagari"), (0x0980, "Bengali"),
+    (0x0B80, "Tamil"), (0x0C00, "Telugu"), (0x0D00, "Malayalam"), (0x0E00, "Thai"),
+    (0x0E80, "Lao"), (0x0F00, "Tibetan"), (0x1000, "Myanmar"), (0x10A0, "Georgian"),
+    (0x1100, "Hangul Jamo"), (0x1200, "Ethiopic"), (0x13A0, "Cherokee"), (0x1780, "Khmer"),
+    (0x1800, "Mongolian"), (0x1E00, "Latin Ext. Add'l"), (0x1F00, "Greek Ext."),
+    (0x2000, "Punctuation"), (0x20A0, "Currency"), (0x2100, "Letterlike"), (0x2190, "Arrows"),
+    (0x2200, "Math Operators"), (0x2300, "Misc Technical"), (0x2460, "Enclosed Alnum"),
+    (0x2500, "Box Drawing"), (0x2600, "Misc Symbols"), (0x2700, "Dingbats"), (0x2800, "Braille"),
+    (0x2E80, "CJK Radicals"), (0x3000, "CJK Symbols"), (0x3040, "Hiragana"), (0x30A0, "Katakana"),
+    (0x3100, "Bopomofo"), (0x3130, "Hangul Compat."), (0x3400, "CJK Ext-A"),
+    (0x4E00, "CJK Ideographs"), (0xA000, "Yi Syllables"), (0xAC00, "Hangul Syllables"),
+    (0xF900, "CJK Compat."), (0xFB00, "Present. Forms"), (0xFF00, "Half/Fullwidth"),
+    (0x10000, "Linear B (pl.1)"), (0x1D400, "Math Alnum."), (0x1F300, "Pictographs"),
+    (0x1F600, "Emoticons"), (0x1F680, "Transport"), (0x20000, "CJK Ext-B (pl.2)"),
 ];
 
 fn main() {
@@ -67,7 +69,7 @@ fn main() {
         dump();
         return;
     }
-    println!("scroll = zoom · drag = pan · R = reset · Esc = quit");
+    println!("scroll = zoom · drag (any button) = pan · R = reset · Esc = quit");
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App::default()).unwrap();
@@ -78,6 +80,9 @@ fn ortho(w: f32, h: f32) -> Mat4 {
 }
 fn model(offset: Vec2, scale: f32) -> Mat4 {
     Mat4::from_translation(Vec3::new(offset.x, offset.y, 0.0)) * Mat4::from_scale(Vec3::splat(scale))
+}
+fn args(size_px: f32, color: [f32; 4]) -> TextArgs {
+    TextArgs { size_px, color, ..Default::default() }
 }
 
 /// Owns the engine, GPU renderers, and atlases; renders one culled frame on demand.
@@ -99,15 +104,7 @@ impl Viewer {
         let emoji_renderer = EmojiRenderer::new(&device, config);
         let text_atlas = engine.new_atlas(&device, &queue, &text_renderer.atlas_layout);
         let emoji_atlas = engine.new_emoji_atlas(&device, &queue, &emoji_renderer.atlas_layout);
-        Self {
-            device,
-            queue,
-            engine,
-            text_renderer,
-            emoji_renderer,
-            text_atlas,
-            emoji_atlas,
-        }
+        Self { device, queue, engine, text_renderer, emoji_renderer, text_atlas, emoji_atlas }
     }
 
     /// Emit only the cells inside the viewport; covered → glyph, else → tofu box.
@@ -145,99 +142,65 @@ impl Viewer {
         }
     }
 
-    /// Screen-space block labels. When the grid is culled they become the primary
-    /// content, so they grow large — a navigable table of contents; when glyphs
-    /// are visible they shrink to fit the reserved gutter.
-    fn emit_labels(&mut self, offset: Vec2, scale: f32, h: f32, culling: bool) {
-        let title_px = if culling { 34.0 } else { 16.0 };
-        let args = args(title_px, LABEL);
-        let gap = title_px + 8.0;
+    /// World-space block titles in the gutter — big, scaling with the map. Kept
+    /// from overlapping via a *screen-space* gap, so zooming in reveals more of
+    /// them (near-adjacent blocks only merge when they'd physically collide).
+    fn emit_titles(&mut self, offset: Vec2, scale: f32, h: f32) {
+        let args = args(TITLE_PX, TITLE);
+        let min_gap = TITLE_PX * scale * 1.1; // screen px between title baselines
         let mut last_y = f32::MIN;
         for &(start, name) in BLOCKS {
-            let screen_y = (start as i64 / COLS) as f32 * CELL_H * scale + offset.y;
-            if screen_y < -title_px || screen_y > h {
+            let r = (start as i64 / COLS) as f32;
+            let screen_y = r * CELL_H * scale + offset.y;
+            if screen_y > h {
+                break; // blocks are ascending; the rest are below the viewport
+            }
+            if screen_y < -TITLE_PX * scale || screen_y < last_y + min_gap {
                 continue;
             }
-            if screen_y < last_y + gap {
-                continue; // avoid stacking labels into mush when zoomed out
-            }
-            self.engine.text(12.0, screen_y + title_px, name, &args);
+            self.engine.text(10.0, r * CELL_H + TITLE_PX * 0.82, name, &args);
             last_y = screen_y;
         }
     }
 
     fn render(&mut self, view: &wgpu::TextureView, w: f32, h: f32, offset: Vec2, scale: f32) {
-        let culling = scale * CELL_W < MIN_CELL_PX;
-        // Screen x where the grid begins (right edge of the title gutter).
-        let grid_left = (offset.x + GUTTER_W * scale).clamp(0.0, w) as u32;
-
-        // --- grid pass (world space), scissored out of the title gutter ---
-        if !culling {
+        if scale * CELL_W >= MIN_CELL_PX {
             self.emit_grid(offset, scale, w, h);
         }
+        self.emit_titles(offset, scale, h);
         self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
         self.engine.sync_emoji_atlas(&mut self.emoji_atlas, &self.device, &self.queue, &self.emoji_renderer.atlas_layout);
         let tv = self.engine.flush().to_vec();
         let ev = self.engine.emoji_vertices().to_vec();
         let tb = TextRenderer::build_vertices(&self.device, &tv);
         let eb = EmojiRenderer::build_vertices(&self.device, &ev);
+
         let cam = ortho(w, h) * model(offset, scale);
         self.text_renderer.write_matrix(&self.queue, cam);
         self.emoji_renderer.write_matrix(&self.queue, cam);
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
-            let mut pass = begin(&mut enc, view, wgpu::LoadOp::Clear(bg()));
-            if grid_left < w as u32 {
-                pass.set_scissor_rect(grid_left, 0, w as u32 - grid_left, h as u32);
-                self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &tb, 0..tv.len() as u32);
-                self.emoji_renderer.draw(&mut pass, &self.emoji_atlas, &eb, 0..ev.len() as u32);
-            }
-        }
-        self.queue.submit([enc.finish()]);
-
-        // --- label pass (screen space). Clipped to the gutter when glyphs are
-        // showing; free to span the empty grid when the grid is culled. ---
-        self.emit_labels(offset, scale, h, culling);
-        self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
-        let lv = self.engine.flush().to_vec();
-        let lb = TextRenderer::build_vertices(&self.device, &lv);
-        self.text_renderer.write_matrix(&self.queue, ortho(w, h));
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = begin(&mut enc, view, wgpu::LoadOp::Load);
-            if !culling && grid_left > 0 {
-                pass.set_scissor_rect(0, 0, grid_left, h as u32);
-            }
-            self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &lb, 0..lv.len() as u32);
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("map"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.99, g: 0.99, b: 0.99, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &tb, 0..tv.len() as u32);
+            self.emoji_renderer.draw(&mut pass, &self.emoji_atlas, &eb, 0..ev.len() as u32);
         }
         self.queue.submit([enc.finish()]);
     }
-}
-
-fn args(size_px: f32, color: [f32; 4]) -> TextArgs {
-    TextArgs { size_px, color, ..Default::default() }
-}
-fn bg() -> wgpu::Color {
-    wgpu::Color { r: 0.99, g: 0.99, b: 0.99, a: 1.0 }
-}
-fn begin<'a>(
-    encoder: &'a mut wgpu::CommandEncoder,
-    view: &'a wgpu::TextureView,
-    load: wgpu::LoadOp<wgpu::Color>,
-) -> wgpu::RenderPass<'a> {
-    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("map"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    })
 }
 
 fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
@@ -293,13 +256,19 @@ impl ApplicationHandler for App {
                 gfx.zoom_at_cursor(1.15f32.powf(dy));
                 gfx.window.request_redraw();
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+            // Any mouse button drags the camera.
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left | MouseButton::Right | MouseButton::Middle,
+                ..
+            } => {
                 gfx.dragging = state == ElementState::Pressed;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = Vec2::new(position.x as f32, position.y as f32);
                 if gfx.dragging {
                     gfx.offset += p - gfx.cursor;
+                    gfx.clamp_camera();
                     gfx.window.request_redraw();
                 }
                 gfx.cursor = p;
@@ -378,9 +347,9 @@ impl Gfx {
     }
 
     fn reset_view(&mut self) {
-        // Start showing the top of the map with readable glyphs + a title gutter.
         self.scale = 0.6;
         self.offset = Vec2::new(10.0, 16.0);
+        self.clamp_camera();
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -390,13 +359,27 @@ impl Gfx {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.viewer.device, &self.config);
+        self.clamp_camera();
     }
 
     fn zoom_at_cursor(&mut self, factor: f32) {
-        let new_scale = (self.scale * factor).clamp(0.03, 60.0);
+        let w = self.config.width as f32;
+        let min_scale = w / WORLD_W; // never zoom out past the full map width
+        let new_scale = (self.scale * factor).clamp(min_scale, 60.0);
         let world = (self.cursor - self.offset) / self.scale;
         self.offset = self.cursor - world * new_scale;
         self.scale = new_scale;
+        self.clamp_camera();
+    }
+
+    /// Keep the camera over the map (plus a small margin), never off in the void.
+    fn clamp_camera(&mut self) {
+        let (w, h) = (self.config.width as f32, self.config.height as f32);
+        self.scale = self.scale.clamp(w / WORLD_W, 60.0);
+        let s = self.scale;
+        let margin = 40.0;
+        self.offset.x = clamp_axis(self.offset.x, w - WORLD_W * s - margin, margin);
+        self.offset.y = clamp_axis(self.offset.y, h - WORLD_H * s - margin, margin);
     }
 
     fn draw(&mut self) {
@@ -420,6 +403,14 @@ impl Gfx {
     }
 }
 
+fn clamp_axis(v: f32, min: f32, max: f32) -> f32 {
+    if min > max {
+        (min + max) * 0.5 // content smaller than viewport on this axis: center it
+    } else {
+        v.clamp(min, max)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Headless dump: a regional view + a deep zoom (no window)
 // ---------------------------------------------------------------------------
@@ -437,18 +428,12 @@ fn dump() {
             .expect("adapter");
         adapter.request_device(&device_descriptor()).await.expect("device")
     });
-    let config = dummy_config();
-    let mut viewer = Viewer::new(device, queue, &config);
+    let mut viewer = Viewer::new(device, queue, &dummy_config());
 
-    // Zoomed out past the glyph-cull threshold: the block titles become a large,
-    // navigable table of contents (grid culled).
-    dump_png(&mut viewer, 900, 900, Vec2::new(10.0, 20.0), 0.1, "unicode_map_toc.png");
+    // Regional: Latin → CJK-radicals, big world-space titles + glyph grid + tofu.
+    dump_png(&mut viewer, 1450, 920, Vec2::new(10.0, 16.0), 0.9, "unicode_map.png");
 
-    // Regional: Latin → CJK-radicals, real glyphs + tofu + block titles.
-    dump_png(&mut viewer, 1450, 920, Vec2::new(10.0, 14.0), 0.9, "unicode_map.png");
-
-    // Deep zoom on the CJK Unified Ideographs block — big, crisp curves. Offset so
-    // the block's first column (world x = GUTTER_W) sits near the left edge.
+    // Deep zoom on the CJK Unified Ideographs block — big, crisp curves.
     let row = (0x4E00i64 / COLS) as f32;
     let scale = 2.6;
     let offset = Vec2::new(40.0 - GUTTER_W * scale, 40.0 - row * CELL_H * scale);
