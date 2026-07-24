@@ -16,6 +16,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use glam::{Mat4, Vec2, Vec3};
 use sanscale::{EmojiAtlas, EmojiRenderer, TextArgs, TextAtlas, TextEngine, TextRenderer};
@@ -163,7 +164,15 @@ impl Viewer {
         }
     }
 
-    fn render(&mut self, view: &wgpu::TextureView, w: f32, h: f32, offset: Vec2, scale: f32) {
+    fn render(
+        &mut self,
+        view: &wgpu::TextureView,
+        w: f32,
+        h: f32,
+        offset: Vec2,
+        scale: f32,
+        hud: Option<&str>,
+    ) {
         if scale * CELL_W >= MIN_CELL_PX {
             self.emit_grid(offset, scale, w, h);
         }
@@ -200,6 +209,33 @@ impl Viewer {
             self.emoji_renderer.draw(&mut pass, &self.emoji_atlas, &eb, 0..ev.len() as u32);
         }
         self.queue.submit([enc.finish()]);
+
+        // Screen-space perf HUD, drawn over the map in a second (ortho) pass.
+        if let Some(hud) = hud {
+            self.engine.text(12.0, h - 12.0, hud, &args(16.0, [0.85, 0.15, 0.15, 1.0]));
+            self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
+            let hv = self.engine.flush().to_vec();
+            let hb = TextRenderer::build_vertices(&self.device, &hv);
+            self.text_renderer.write_matrix(&self.queue, ortho(w, h));
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("hud"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &hb, 0..hv.len() as u32);
+            }
+            self.queue.submit([enc.finish()]);
+        }
     }
 }
 
@@ -288,6 +324,7 @@ struct Gfx {
     offset: Vec2,
     cursor: Vec2,
     dragging: bool,
+    samples: Vec<(Instant, f32)>, // (timestamp, render-cost ms) over ~5s
 }
 
 impl Gfx {
@@ -340,6 +377,7 @@ impl Gfx {
             offset: Vec2::ZERO,
             cursor: Vec2::ZERO,
             dragging: false,
+            samples: Vec::new(),
         };
         gfx.reset_view();
         gfx.window.request_redraw();
@@ -392,15 +430,46 @@ impl Gfx {
             _ => return,
         };
         let view = frame.texture.create_view(&Default::default());
+
+        // HUD shows the p99 of the last ~5s of per-frame CPU render cost (emit +
+        // buffer build + encode + submit; the GPU runs asynchronously after).
+        let (p99, avg) = percentiles(&self.samples);
+        let hud = format!(
+            "render p99 {p99:.2} ms · avg {avg:.2} ms · n={} · zoom {:.2}x",
+            self.samples.len(),
+            self.scale
+        );
+
+        let t0 = Instant::now();
         self.viewer.render(
             &view,
             self.config.width as f32,
             self.config.height as f32,
             self.offset,
             self.scale,
+            Some(&hud),
         );
+        let cost = t0.elapsed().as_secs_f32() * 1000.0;
         frame.present();
+
+        let now = Instant::now();
+        self.samples.push((now, cost));
+        self.samples.retain(|(t, _)| now.duration_since(*t).as_secs_f32() < 5.0);
+        // Keep sampling continuously so the p99 window stays live.
+        self.window.request_redraw();
     }
+}
+
+/// (p99, mean) of the sample costs, in ms.
+fn percentiles(samples: &[(Instant, f32)]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut v: Vec<f32> = samples.iter().map(|&(_, c)| c).collect();
+    let mean = v.iter().sum::<f32>() / v.len() as f32;
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let idx = (((v.len() - 1) as f32) * 0.99).round() as usize;
+    (v[idx], mean)
 }
 
 fn clamp_axis(v: f32, min: f32, max: f32) -> f32 {
@@ -467,7 +536,7 @@ fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path:
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    viewer.render(&view, w as f32, h as f32, offset, scale);
+    viewer.render(&view, w as f32, h as f32, offset, scale, None);
 
     let unpadded = w * 4;
     let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)

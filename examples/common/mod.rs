@@ -20,18 +20,27 @@ pub const FONT_CANDIDATES: &[&str] = &[
 /// A broad fallback chain (by family name) covering Latin, CJK, Indic, emoji, and
 /// symbols. Families absent on this OS are skipped, so the same list works across
 /// platforms — the emoji/CJK samples simply need *some* covering face installed.
+///
+/// Color emoji fonts are placed **near the front** so that codepoints a text font
+/// would also cover (☺ ❤ ✈ ★ …) resolve to the color face rather than a mono text
+/// glyph. The primary Latin font still precedes them so ASCII digits/letters stay
+/// text (emoji fonts also map 0-9 # * for keycap sequences). Note: this is a
+/// coarse fix — there is no Unicode emoji-presentation / VS16 handling yet, so
+/// text-default symbols the primary font covers can still come out monochrome.
 pub const UNICODE_FALLBACK: &[&str] = &[
-    // Latin / UI
-    "Segoe UI", "Helvetica Neue", "DejaVu Sans", "Arial", "Noto Sans",
-    // CJK
-    "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Hiragino Sans",
-    "Malgun Gothic", "Noto Sans CJK KR", "Yu Gothic", "Noto Sans CJK JP",
-    // Indic / SE-Asia
-    "Nirmala UI", "Noto Sans Devanagari", "Leelawadee UI", "Noto Sans Thai",
-    // Color emoji
+    // Primary Latin first (keeps digits/letters as text).
+    "Segoe UI",
+    // Color emoji, high priority.
     "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji",
-    // Symbols
-    "Segoe UI Symbol", "Noto Sans Symbols 2", "DejaVu Sans",
+    // More Latin.
+    "Helvetica Neue", "Arial", "Noto Sans", "DejaVu Sans",
+    // CJK.
+    "Microsoft YaHei", "Malgun Gothic", "Yu Gothic", "Noto Sans CJK SC",
+    "Noto Sans CJK KR", "Noto Sans CJK JP", "PingFang SC", "Hiragino Sans",
+    // Indic / SE-Asia / African.
+    "Nirmala UI", "Noto Sans Devanagari", "Leelawadee UI", "Noto Sans Thai", "Ebrima",
+    // Symbols / math / historic — broad coverage to reduce tofu.
+    "Segoe UI Symbol", "Noto Sans Symbols 2", "Cambria Math", "Segoe UI Historic", "Sylfaen",
 ];
 
 /// Resolve family names (or explicit file paths) into loadable font sources via
