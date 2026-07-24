@@ -56,23 +56,28 @@ fn is_emoji_sequence(grapheme: &str) -> bool {
         })
 }
 
-/// Whether `face` shapes `text` to a single non-`.notdef` glyph — i.e. it can
-/// form the whole sequence (a flag, a ZWJ emoji) rather than falling back to
-/// several pieces.
-fn shapes_single(face: &rustybuzz::Face, text: &str) -> bool {
+/// Whether `font` shapes `text` to a single **color** glyph — i.e. it can form
+/// the whole emoji sequence (a flag, a ZWJ emoji) into one color glyph rather
+/// than several pieces. Requiring color avoids a monochrome text font hijacking
+/// a non-ligating sequence (which would render a mono base instead of a tofu).
+fn shapes_single_color(font: &crate::font::Font, text: &str) -> bool {
     let mut buffer = UnicodeBuffer::new();
     buffer.push_str(text);
     buffer.guess_segment_properties();
-    let glyphs = shape(face, &[], buffer);
-    glyphs.len() == 1 && glyphs.glyph_infos()[0].glyph_id != 0
+    let glyphs = shape(font.face(), &[], buffer);
+    if glyphs.len() != 1 {
+        return false;
+    }
+    let gid = glyphs.glyph_infos()[0].glyph_id;
+    gid != 0 && font.is_color_glyph(gid as u16)
 }
 
-/// First face in the chain that ligates the whole grapheme into one glyph.
+/// First face in the chain that ligates the whole grapheme into one color glyph.
 fn single_glyph_face(fonts: &FontSet, grapheme: &str) -> Option<u16> {
     fonts
         .faces()
         .iter()
-        .position(|f| shapes_single(f.face(), grapheme))
+        .position(|f| shapes_single_color(f, grapheme))
         .map(|i| i as u16)
 }
 
@@ -108,7 +113,7 @@ fn face_for_grapheme(fonts: &FontSet, grapheme: &str) -> u16 {
     // indicators but no flag ligatures), fall back to a face in the chain that can.
     if is_emoji_sequence(grapheme) {
         if let Some(p) = preferred {
-            if shapes_single(fonts.face(p).face(), grapheme) {
+            if shapes_single_color(fonts.face(p), grapheme) {
                 return p;
             }
         }
