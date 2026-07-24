@@ -31,18 +31,32 @@ pub(crate) struct ShapedRun {
     pub glyphs: Vec<ShapedGlyph>,
 }
 
-/// The first face in the chain that covers `c`; primary (0) for whitespace/control
-/// (so runs don't fragment on spaces) and for characters no face has (→ `.notdef`
-/// tofu on the primary, the pre-fallback behavior for the truly-missing).
-fn face_for(fonts: &FontSet, c: char) -> u16 {
-    if c.is_whitespace() || c.is_control() {
+/// Emoji (VS16) and text (VS15) variation selectors, which override the
+/// presentation of the preceding base character.
+const VS16: char = '\u{FE0F}';
+const VS15: char = '\u{FE0E}';
+
+/// The face a grapheme resolves to. Primary (0) for whitespace/control (so runs
+/// don't fragment on spaces) and for characters no face covers (→ `.notdef` tofu).
+/// A trailing variation selector forces presentation: U+FE0F picks a color
+/// (emoji) face, U+FE0E a monochrome one — this is how emoji sequences from a
+/// picker are encoded, so `❤\u{FE0F}` renders red even when a text font would
+/// also cover `❤`. Without a selector, the first covering face wins as before.
+fn face_for_grapheme(fonts: &FontSet, grapheme: &str) -> u16 {
+    let base = grapheme.chars().next().unwrap_or(' ');
+    if base.is_whitespace() || base.is_control() {
         return 0;
     }
-    fonts
-        .faces()
-        .iter()
-        .position(|font| font.has_glyph(c))
-        .unwrap_or(0) as u16
+    if grapheme.chars().any(|c| c == VS16) {
+        if let Some(f) = fonts.color_face_for(base) {
+            return f;
+        }
+    } else if grapheme.chars().any(|c| c == VS15) {
+        if let Some(f) = fonts.text_face_for(base) {
+            return f;
+        }
+    }
+    fonts.covering_face(base).unwrap_or(0)
 }
 
 /// Split `text` into maximal `(byte_start, run_text, face_id)` runs where every
@@ -54,8 +68,7 @@ fn itemize<'a>(fonts: &FontSet, text: &'a str) -> Vec<(usize, &'a str, u16)> {
     let mut run_face: Option<u16> = None;
 
     for (idx, grapheme) in text.grapheme_indices(true) {
-        let base = grapheme.chars().next().unwrap_or(' ');
-        let face = face_for(fonts, base);
+        let face = face_for_grapheme(fonts, grapheme);
         match run_face {
             Some(f) if f == face => {}
             Some(f) => {
@@ -193,6 +206,32 @@ mod tests {
         for g in &run.glyphs {
             assert!(text.is_char_boundary(g.cluster));
         }
+    }
+
+    #[test]
+    fn variation_selector_forces_emoji_presentation() {
+        let sym = "C:\\Windows\\Fonts\\seguisym.ttf";
+        let emoji = "C:\\Windows\\Fonts\\seguiemj.ttf";
+        if !exists(sym) || !exists(emoji) {
+            return;
+        }
+        let fonts =
+            FontSet::load(vec![FontSource::Path(sym), FontSource::Path(emoji)]).unwrap();
+        let mut cache = GlyphCache::new();
+
+        // A monochrome symbol font precedes the emoji font, so a bare heart is
+        // text (its first covering face is the mono one)…
+        let mono = shape_text(&fonts, &mut cache, "\u{2764}", 0.0, 0.0);
+        assert!(
+            mono.glyphs.iter().all(|g| !g.is_color),
+            "bare U+2764 should render as text"
+        );
+        // …but U+2764 U+FE0F forces the color face despite the ordering.
+        let color = shape_text(&fonts, &mut cache, "\u{2764}\u{FE0F}", 0.0, 0.0);
+        assert!(
+            color.glyphs.iter().any(|g| g.is_color),
+            "U+2764 U+FE0F should render as a color glyph"
+        );
     }
 
     #[test]

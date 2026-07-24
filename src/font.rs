@@ -81,6 +81,14 @@ impl Font {
         self.face.is_color_glyph(GlyphId(glyph_id))
     }
 
+    /// True when this face covers `c` *and* its glyph is a color (COLR) glyph —
+    /// i.e. this face would render `c` as emoji.
+    pub fn color_glyph(&self, c: char) -> bool {
+        self.face
+            .glyph_index(c)
+            .is_some_and(|g| self.face.is_color_glyph(g))
+    }
+
     /// Human-readable family name (from the `name` table), for diagnostics.
     pub fn family_name(&self) -> Option<String> {
         self.face
@@ -145,6 +153,24 @@ impl FontSet {
         self.faces
             .iter()
             .position(|f| f.has_glyph(c))
+            .map(|i| i as u16)
+    }
+
+    /// First face that renders `c` as a color (emoji) glyph — used to honor an
+    /// emoji variation selector (U+FE0F).
+    pub fn color_face_for(&self, c: char) -> Option<u16> {
+        self.faces
+            .iter()
+            .position(|f| f.color_glyph(c))
+            .map(|i| i as u16)
+    }
+
+    /// First face that covers `c` with a monochrome glyph — used to honor a text
+    /// variation selector (U+FE0E).
+    pub fn text_face_for(&self, c: char) -> Option<u16> {
+        self.faces
+            .iter()
+            .position(|f| f.has_glyph(c) && !f.color_glyph(c))
             .map(|i| i as u16)
     }
 
