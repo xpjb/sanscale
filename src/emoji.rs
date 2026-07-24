@@ -11,6 +11,7 @@
 //! incrementally when the revision moves. Bounded by a small fixed set of size
 //! buckets, so zoom re-rasters an emoji at most a few times.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use rustybuzz::Face as RustyFace;
@@ -19,15 +20,23 @@ use tiny_skia::{
     Pixmap, Point, RadialGradient, Shader, SpreadMode, Transform as SkTransform,
 };
 use ttf_parser::colr::{ClipBox, CompositeMode, GradientExtend, Paint, Painter};
-use ttf_parser::{GlyphId, OutlineBuilder, RgbaColor, Transform};
+use ttf_parser::{GlyphId, OutlineBuilder, RasterImageFormat, RgbaColor, Transform};
 
-/// Atlas is a fixed width; height grows in power-of-two steps (like `TextAtlas`).
+/// Atlas is a fixed width; height grows in power-of-two steps up to a cap, after
+/// which cells are recycled by eviction (see [`EmojiCache`]) so the texture never
+/// exceeds the GPU's `max_texture_dimension_2d`.
 pub const EMOJI_ATLAS_WIDTH: u32 = 2048;
 
 /// Raster resolutions. On-screen pixel size snaps up to the nearest bucket, so an
 /// emoji is rasterized at most `SIZE_BUCKETS.len()` times across all zooms.
 const SIZE_BUCKETS: [u32; 4] = [32, 64, 128, 256];
 const ATLAS_PAD: u32 = 2;
+
+/// Default cap on atlas height. Kept ≤ the wgpu default `max_texture_dimension_2d`
+/// (8192) so the atlas can never silently overflow even on a default-limits device;
+/// callers with a known device limit raise it via
+/// [`TextEngine::set_emoji_atlas_max_height`](crate::TextEngine::set_emoji_atlas_max_height).
+pub(crate) const DEFAULT_EMOJI_ATLAS_MAX_HEIGHT: u32 = 4096;
 
 /// Bucket (raster resolution) for an on-screen pixel size.
 pub(crate) fn bucket_for(px: f32) -> u32 {
@@ -38,6 +47,11 @@ pub(crate) fn bucket_for(px: f32) -> u32 {
         .unwrap_or(SIZE_BUCKETS[SIZE_BUCKETS.len() - 1])
 }
 
+/// Index of a bucket size in [`SIZE_BUCKETS`] (bucket sizes are the only valid keys).
+fn bucket_index(bucket: u32) -> usize {
+    SIZE_BUCKETS.iter().position(|&b| b == bucket).unwrap_or(0)
+}
+
 /// A rasterized emoji's texel rect in the atlas (square, `size`×`size`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EmojiSlot {
@@ -46,17 +60,46 @@ pub(crate) struct EmojiSlot {
     pub size: u32,
 }
 
-/// CPU-side emoji atlas: premultiplied-RGBA pixels + shelf packer + slot map.
-/// Append-only; keyed by `(face_id, glyph_id, bucket)`. A cached `None` records a
-/// glyph that isn't a renderable color glyph, so we don't retry it every frame.
+/// Which key currently owns a cell, and when it was last drawn. `size` (== bucket)
+/// lets eviction scan only cells of the target bucket.
+struct Occupant {
+    key: (u16, u32, u32),
+    size: u32,
+    last_used: u64,
+}
+
+/// CPU-side emoji atlas: premultiplied-RGBA pixels + a **per-bucket slab allocator**
+/// with an LRU free list, keyed `(face_id, glyph_id, bucket)`.
+///
+/// Because the four bucket sizes are fixed, each shelf holds uniform cells for one
+/// bucket, so an evicted cell is reused in place with no repacking. Height is capped
+/// at [`max_height`](Self::set_max_height); once every shelf is spoken for, the
+/// least-recently-used cell of the requested bucket (that wasn't drawn this frame) is
+/// evicted and recycled. A cached `None` records a glyph that isn't renderable, so we
+/// don't retry it every frame.
+///
+/// **Eviction invalidates baked UVs.** [`epoch`](Self::epoch) bumps whenever a cell is
+/// recycled; holders of cached vertices (e.g. the examples' per-row cache) must drop
+/// them when it changes. The engine's per-frame re-emit path re-fetches slots each
+/// frame, so it is unaffected.
 pub(crate) struct EmojiCache {
     pixels: Vec<u8>,
     height: u32,
-    shelf_x: u32,
-    shelf_y: u32,
-    shelf_h: u32,
+    max_height: u32,
+    /// Next free row for a brand-new shelf (shelves are handed out top-to-bottom).
+    next_y: u32,
+    /// Unused cell origins per bucket, replenished a shelf at a time.
+    free: [Vec<(u32, u32)>; SIZE_BUCKETS.len()],
     slots: HashMap<(u16, u32, u32), Option<EmojiSlot>>,
+    /// Reverse map: occupied cell origin → occupant, for LRU eviction.
+    cells: HashMap<(u32, u32), Occupant>,
+    frame: u64,
+    epoch: u64,
     revision: u64,
+    /// Row range whose pixels changed since the last GPU sync (min..max, exclusive).
+    dirty: Cell<Option<(u32, u32)>>,
+    dropped: u64,
+    warned: bool,
 }
 
 impl EmojiCache {
@@ -64,16 +107,45 @@ impl EmojiCache {
         Self {
             pixels: Vec::new(),
             height: 0,
-            shelf_x: 0,
-            shelf_y: 0,
-            shelf_h: 0,
+            max_height: DEFAULT_EMOJI_ATLAS_MAX_HEIGHT,
+            next_y: 0,
+            free: Default::default(),
             slots: HashMap::new(),
+            cells: HashMap::new(),
+            frame: 0,
+            epoch: 0,
             revision: 0,
+            dirty: Cell::new(None),
+            dropped: 0,
+            warned: false,
         }
+    }
+
+    /// Cap the atlas height in texels (clamped to at least one 256px shelf). Callers
+    /// with a known device limit set this to `min(limit, budget)` for more headroom.
+    pub fn set_max_height(&mut self, max_height: u32) {
+        self.max_height = max_height.max(SIZE_BUCKETS[SIZE_BUCKETS.len() - 1] + ATLAS_PAD);
     }
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Bumped whenever a cell is recycled under eviction; see the type docs.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Total glyphs dropped because a bucket was full of glyphs already needed this
+    /// frame (the working set exceeded the atlas budget). Should stay 0 in practice.
+    pub fn dropped_glyphs(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Advance the frame clock. Cells drawn in the current frame are never evicted, so
+    /// this must be called once per rendered frame (the engine does so in `flush`).
+    pub fn begin_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
     }
 
     /// Atlas `(width, height)` in texels (height ≥ 1 for a valid texture).
@@ -85,8 +157,16 @@ impl EmojiCache {
         &self.pixels
     }
 
+    /// Take (and clear) the dirty row range accumulated since the last call, so the
+    /// GPU side re-uploads exactly the texels that changed — including recycled cells,
+    /// which an append-only upload would miss.
+    pub fn take_dirty(&self) -> Option<(u32, u32)> {
+        self.dirty.take()
+    }
+
     /// Slot for a color glyph at a size bucket, rasterizing + packing on first use.
-    /// `None` when the glyph isn't a renderable color glyph.
+    /// `None` when the glyph isn't renderable, or the atlas is momentarily full of
+    /// glyphs already needed this frame.
     pub fn get_or_insert(
         &mut self,
         face: &RustyFace,
@@ -95,44 +175,113 @@ impl EmojiCache {
         bucket: u32,
     ) -> Option<EmojiSlot> {
         let key = (face_id, glyph_id, bucket);
-        if let Some(slot) = self.slots.get(&key) {
-            return *slot;
+        if let Some(&cached) = self.slots.get(&key) {
+            if let Some(slot) = cached {
+                if let Some(occ) = self.cells.get_mut(&(slot.x, slot.y)) {
+                    occ.last_used = self.frame;
+                }
+            }
+            return cached;
         }
-        let slot = rasterize(face, glyph_id as u16, bucket).and_then(|rgba| self.pack(bucket, &rgba));
+        let slot = match rasterize(face, glyph_id as u16, bucket) {
+            Some(rgba) => self.place(key, bucket, &rgba),
+            None => None,
+        };
         self.slots.insert(key, slot);
         self.revision = self.revision.wrapping_add(1);
         slot
     }
 
-    /// Shelf-pack a `size`×`size` RGBA image; grows atlas height as needed.
-    fn pack(&mut self, size: u32, rgba: &[u8]) -> Option<EmojiSlot> {
-        let cell = size + ATLAS_PAD;
+    /// Allocate a cell for `bucket`, write the `size`×`size` image into it, and record
+    /// the occupant. `None` only if the bucket is wider than the atlas or fully in use
+    /// this frame.
+    fn place(&mut self, key: (u16, u32, u32), bucket: u32, rgba: &[u8]) -> Option<EmojiSlot> {
+        let (x, y) = self.alloc_cell(bucket)?;
+        self.write_cell(x, y, bucket, rgba);
+        self.cells.insert(
+            (x, y),
+            Occupant {
+                key,
+                size: bucket,
+                last_used: self.frame,
+            },
+        );
+        Some(EmojiSlot { x, y, size: bucket })
+    }
+
+    /// A free cell for `bucket`: reuse one, else open a new shelf, else evict LRU.
+    fn alloc_cell(&mut self, bucket: u32) -> Option<(u32, u32)> {
+        let cell = bucket + ATLAS_PAD;
         if cell > EMOJI_ATLAS_WIDTH {
             return None;
         }
-        if self.shelf_x + cell > EMOJI_ATLAS_WIDTH {
-            self.shelf_y += self.shelf_h;
-            self.shelf_x = 0;
-            self.shelf_h = 0;
+        let bi = bucket_index(bucket);
+        if let Some(pos) = self.free[bi].pop() {
+            return Some(pos);
         }
-        let (x, y) = (self.shelf_x, self.shelf_y);
-        self.shelf_x += cell;
-        self.shelf_h = self.shelf_h.max(cell);
-
-        let needed = y + cell;
-        if needed > self.height {
-            self.height = needed;
-            self.pixels
-                .resize((EMOJI_ATLAS_WIDTH * self.height * 4) as usize, 0);
+        // Open a fresh shelf if there's vertical room, filling its free list.
+        if self.next_y + cell <= self.max_height {
+            let y = self.next_y;
+            let cols = EMOJI_ATLAS_WIDTH / cell;
+            for i in 0..cols {
+                self.free[bi].push((i * cell, y));
+            }
+            self.next_y += cell;
+            if self.next_y > self.height {
+                self.height = self.next_y;
+                self.pixels
+                    .resize((EMOJI_ATLAS_WIDTH * self.height * 4) as usize, 0);
+            }
+            return self.free[bi].pop();
         }
+        // Atlas full: recycle the least-recently-used cell of this bucket that isn't
+        // part of the current frame's working set.
+        if let Some(pos) = self.evict_lru(bucket) {
+            return Some(pos);
+        }
+        // Everything in this bucket is needed this frame — a genuine over-budget frame.
+        self.dropped = self.dropped.wrapping_add(1);
+        if !self.warned {
+            self.warned = true;
+            log::warn!(
+                "emoji atlas full at {bucket}px (cap {} rows): working set exceeds budget, \
+                 dropping glyphs; raise the atlas max height for more headroom",
+                self.max_height
+            );
+        }
+        None
+    }
 
+    /// Evict the LRU occupied cell of `bucket` not drawn this frame; returns its origin
+    /// (now free for reuse). Bumps [`epoch`](Self::epoch) so baked-UV holders refresh.
+    // A linear scan over occupied cells; eviction only runs once the atlas is full, and
+    // cell count is bounded by the cap, so this stays cheap. Swap for a per-bucket LRU
+    // list if profiling ever shows it hot.
+    fn evict_lru(&mut self, bucket: u32) -> Option<(u32, u32)> {
+        let frame = self.frame;
+        let victim = self
+            .cells
+            .iter()
+            .filter(|(_, occ)| occ.size == bucket && occ.last_used != frame)
+            .min_by_key(|(_, occ)| occ.last_used)
+            .map(|(&pos, _)| pos)?;
+        let occ = self.cells.remove(&victim).unwrap();
+        self.slots.remove(&occ.key);
+        self.epoch = self.epoch.wrapping_add(1);
+        Some(victim)
+    }
+
+    /// Copy a `size`×`size` premultiplied-RGBA image to cell origin `(x, y)` and mark
+    /// those rows dirty for the next GPU upload.
+    fn write_cell(&mut self, x: u32, y: u32, size: u32, rgba: &[u8]) {
         let row_bytes = (size * 4) as usize;
         for row in 0..size {
             let src = (row * size * 4) as usize;
             let dst = (((y + row) * EMOJI_ATLAS_WIDTH + x) * 4) as usize;
             self.pixels[dst..dst + row_bytes].copy_from_slice(&rgba[src..src + row_bytes]);
         }
-        Some(EmojiSlot { x, y, size })
+        let (lo, hi) = self.dirty.get().unwrap_or((y, y + size));
+        self.dirty.set(Some((lo.min(y), hi.max(y + size))));
     }
 }
 
@@ -149,7 +298,9 @@ impl Default for EmojiCache {
 fn rasterize(face: &RustyFace, glyph_id: u16, size: u32) -> Option<Vec<u8>> {
     let gid = GlyphId(glyph_id);
     if !face.is_color_glyph(gid) {
-        return None;
+        // No COLR outline: fall back to an embedded bitmap strike (CBDT/sbix), which
+        // is how Apple Color Emoji and Noto Color Emoji ship their color glyphs.
+        return rasterize_bitmap(face, gid, size);
     }
     let upem = face.units_per_em() as f32;
     let n = size as f32;
@@ -203,6 +354,92 @@ fn rasterize(face: &RustyFace, glyph_id: u16, size: u32) -> Option<Vec<u8>> {
         return None;
     }
     Some(pm.data().to_vec())
+}
+
+/// Rasterize a bitmap color glyph (CBDT/sbix) into a `size`×`size` premultiplied-RGBA
+/// buffer. The embedded strike is always PNG per the OpenType spec; we decode it,
+/// aspect-fit it into the bucket square (centered), and premultiply. `None` if the
+/// glyph has no strike or the PNG can't be decoded. Fixed-resolution strikes go soft
+/// under deep zoom — acceptable for the "user sees the right thing" bar.
+fn rasterize_bitmap(face: &RustyFace, gid: GlyphId, size: u32) -> Option<Vec<u8>> {
+    let img = face.glyph_raster_image(gid, size as u16)?;
+    if img.format != RasterImageFormat::PNG {
+        return None;
+    }
+    let (sw, sh, src) = decode_png_rgba(img.data)?;
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let n = size as usize;
+    let mut out = vec![0u8; n * n * 4];
+
+    // Preserve aspect and center in the cell (strikes are usually square already).
+    let scale = (n as f32 / sw as f32).min(n as f32 / sh as f32);
+    let dw = ((sw as f32 * scale).round() as usize).clamp(1, n);
+    let dh = ((sh as f32 * scale).round() as usize).clamp(1, n);
+    let ox = (n - dw) / 2;
+    let oy = (n - dh) / 2;
+
+    for dy in 0..dh {
+        let fy = (dy as f32 + 0.5) / dh as f32 * sh as f32 - 0.5;
+        for dx in 0..dw {
+            let fx = (dx as f32 + 0.5) / dw as f32 * sw as f32 - 0.5;
+            let [r, g, b, a] = bilerp_rgba(&src, sw, sh, fx, fy);
+            // Straight alpha (PNG) -> premultiplied, to match the tiny-skia atlas.
+            let af = a as f32 / 255.0;
+            let px = ((oy + dy) * n + ox + dx) * 4;
+            out[px] = (r as f32 * af).round() as u8;
+            out[px + 1] = (g as f32 * af).round() as u8;
+            out[px + 2] = (b as f32 * af).round() as u8;
+            out[px + 3] = a;
+        }
+    }
+    Some(out)
+}
+
+/// Decode a PNG into straight-alpha RGBA8 `(width, height, pixels)`. Handles the
+/// 8-bit RGBA / RGB / grayscale(+alpha) strikes emoji fonts ship; other formats bail.
+fn decode_png_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut reader = png::Decoder::new(data).read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    let (w, h) = (info.width, info.height);
+    let px = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => px.to_vec(),
+        png::ColorType::Rgb => px
+            .chunks_exact(3)
+            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => px
+            .chunks_exact(2)
+            .flat_map(|c| [c[0], c[0], c[0], c[1]])
+            .collect(),
+        png::ColorType::Grayscale => px.iter().flat_map(|&v| [v, v, v, 255]).collect(),
+        png::ColorType::Indexed => return None,
+    };
+    Some((w, h, rgba))
+}
+
+/// Bilinear sample of straight-alpha RGBA8 at `(fx, fy)`, clamping to the edges.
+fn bilerp_rgba(src: &[u8], w: u32, h: u32, fx: f32, fy: f32) -> [u8; 4] {
+    let x0 = fx.floor().clamp(0.0, (w - 1) as f32) as u32;
+    let y0 = fy.floor().clamp(0.0, (h - 1) as f32) as u32;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+    let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+    let at = |x: u32, y: u32, c: usize| src[((y * w + x) * 4) as usize + c] as f32;
+    let mut out = [0u8; 4];
+    for (c, o) in out.iter_mut().enumerate() {
+        let top = at(x0, y0, c) * (1.0 - tx) + at(x1, y0, c) * tx;
+        let bot = at(x0, y1, c) * (1.0 - tx) + at(x1, y1, c) * tx;
+        *o = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+    }
+    out
 }
 
 fn glyph_path(face: &RustyFace, gid: GlyphId) -> Option<Path> {
@@ -376,6 +613,13 @@ impl<'a, 'b> Painter<'a> for EmojiPainter<'a, 'b> {
         let Some(dev_path) = path.transform(self.clip_tf) else {
             return;
         };
+        // Some COLR layers carry zero-area outlines (degenerate contours / hairlines).
+        // They fill nothing, so skip them rather than hand tiny-skia an unfillable path
+        // it would warn about once per glyph, forever.
+        let b = dev_path.bounds();
+        if b.width() == 0.0 || b.height() == 0.0 {
+            return;
+        }
         let shader = match paint {
             Paint::Solid(c) => Shader::SolidColor(sk_color(c)),
             Paint::LinearGradient(g) => {
@@ -439,5 +683,101 @@ impl<'a, 'b> Painter<'a> for EmojiPainter<'a, 'b> {
         if let Some(t) = self.stack.pop() {
             self.cur = t;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Place-or-touch a synthetic glyph without a font, mirroring `get_or_insert`'s
+    /// bookkeeping (the hit path bumps recency; the miss path allocates a cell).
+    fn put(cache: &mut EmojiCache, glyph: u32, bucket: u32) -> Option<EmojiSlot> {
+        let key = (0u16, glyph, bucket);
+        if let Some(&cached) = cache.slots.get(&key) {
+            if let Some(slot) = cached {
+                if let Some(occ) = cache.cells.get_mut(&(slot.x, slot.y)) {
+                    occ.last_used = cache.frame;
+                }
+            }
+            return cached;
+        }
+        let rgba = vec![255u8; (bucket * bucket * 4) as usize];
+        let slot = cache.place(key, bucket, &rgba);
+        cache.slots.insert(key, slot);
+        cache.revision = cache.revision.wrapping_add(1);
+        slot
+    }
+
+    /// One shelf of the 256px bucket (`2048 / 258 = 7` cells) — the smallest atlas
+    /// that still packs multiple cells, so eviction is easy to force.
+    fn one_shelf() -> EmojiCache {
+        let mut c = EmojiCache::new();
+        c.set_max_height(256 + ATLAS_PAD); // caps at a single 256px shelf
+        c
+    }
+
+    /// Filling past capacity across frames recycles cells: height stays bounded, the
+    /// epoch bumps once per eviction, and nothing is dropped.
+    #[test]
+    fn eviction_recycles_cells_and_stays_bounded() {
+        let mut c = one_shelf();
+        for g in 0..7 {
+            assert!(put(&mut c, g, 256).is_some());
+        }
+        assert_eq!(c.size().1, 256 + ATLAS_PAD, "one shelf allocated");
+        assert_eq!(c.epoch(), 0, "no eviction while filling the first shelf");
+
+        c.begin_frame();
+        let reused = put(&mut c, 100, 256).expect("8th glyph recycles a cell");
+        assert_eq!(c.size().1, 256 + ATLAS_PAD, "atlas did not grow past its cap");
+        assert_eq!(c.epoch(), 1, "exactly one cell recycled");
+        assert_eq!(c.dropped_glyphs(), 0);
+        // The recycled cell's rows are dirty so the GPU re-uploads them.
+        let d = c.take_dirty().expect("recycled cell marked dirty");
+        assert!(d.0 <= reused.y && reused.y + reused.size <= d.1);
+    }
+
+    /// Eviction picks the least-recently-used cell of the bucket, not an arbitrary one.
+    #[test]
+    fn eviction_is_least_recently_used() {
+        let mut c = one_shelf();
+        for g in 0..7 {
+            c.begin_frame();
+            put(&mut c, g, 256); // glyph g's recency strictly increases with g
+        }
+        c.begin_frame();
+        put(&mut c, 3, 256); // touch glyph 3 -> now most-recently-used
+
+        c.begin_frame();
+        put(&mut c, 50, 256).expect("insert recycles a cell");
+        assert!(!c.slots.contains_key(&(0, 0, 256)), "LRU glyph 0 evicted");
+        assert!(c.slots.contains_key(&(0, 3, 256)), "touched glyph 3 survives");
+        assert!(c.slots.contains_key(&(0, 50, 256)), "new glyph is present");
+    }
+
+    /// When a single frame's working set exceeds a bucket's capacity, the overflow is
+    /// dropped (and counted) rather than silently corrupting an in-use cell.
+    #[test]
+    fn over_budget_frame_drops_and_counts() {
+        let mut c = one_shelf();
+        for g in 0..7 {
+            assert!(put(&mut c, g, 256).is_some());
+        }
+        // No begin_frame: all seven cells belong to the current frame, so none can be
+        // evicted. The eighth glyph is dropped.
+        assert!(put(&mut c, 99, 256).is_none());
+        assert_eq!(c.dropped_glyphs(), 1);
+    }
+
+    /// Distinct buckets allocate independently and never collide.
+    #[test]
+    fn buckets_are_independent() {
+        let mut c = EmojiCache::new();
+        let a = put(&mut c, 1, 32).unwrap();
+        let b = put(&mut c, 1, 64).unwrap();
+        assert_eq!(a.size, 32);
+        assert_eq!(b.size, 64);
+        assert_ne!((a.x, a.y), (b.x, b.y));
     }
 }

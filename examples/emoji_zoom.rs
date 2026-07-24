@@ -43,6 +43,8 @@ const INK: [f32; 4] = [0.12, 0.13, 0.16, 1.0];
 const TITLE: [f32; 4] = [0.16, 0.40, 0.82, 1.0];
 
 fn main() {
+    // Surface sanscale's atlas warnings on stderr.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     if std::env::args().any(|a| a == "--dump") {
         dump();
         return;
@@ -140,14 +142,20 @@ struct Viewer {
     layout: Vec<RowLayout>,
     world_h: f32,
     rows: HashMap<i64, (Vec<TextVertex>, Vec<EmojiVertex>)>,
+    /// Last-seen emoji atlas eviction epoch. When it changes, cached rows may hold
+    /// stale atlas UVs (a recycled cell now shows a different glyph) so we drop them.
+    emoji_epoch: u64,
     scratch_text: Vec<TextVertex>,
     scratch_emoji: Vec<EmojiVertex>,
 }
 
 impl Viewer {
     fn new(device: wgpu::Device, queue: wgpu::Queue, config: &wgpu::SurfaceConfiguration) -> Self {
-        let engine =
+        let mut engine =
             TextEngine::from_sources(font_chain(UNICODE_FALLBACK)).expect("no usable fonts");
+        // Give the emoji atlas real headroom (the default cap is a conservative 4096),
+        // bounded by the device limit so it can never silently overflow the texture.
+        engine.set_emoji_atlas_max_height(device.limits().max_texture_dimension_2d.min(8192));
         let text_renderer = TextRenderer::new(&device, config);
         let emoji_renderer = EmojiRenderer::new(&device, config);
         let text_atlas = engine.new_atlas(&device, &queue, &text_renderer.atlas_layout);
@@ -170,6 +178,7 @@ impl Viewer {
             layout,
             world_h,
             rows: HashMap::new(),
+            emoji_epoch: 0,
             scratch_text: Vec::new(),
             scratch_emoji: Vec::new(),
         }
@@ -262,6 +271,14 @@ impl Viewer {
         scale: f32,
         hud: Option<&str>,
     ) {
+        // If the atlas recycled any cell since last frame, cached rows may point at a
+        // reused slot now holding a different glyph — drop the cache and re-shape.
+        let epoch = self.engine.emoji_epoch();
+        if epoch != self.emoji_epoch {
+            self.emoji_epoch = epoch;
+            self.rows.clear();
+        }
+
         let max_row = (self.layout.len() as i64 - 1).max(0);
         let inv = 1.0 / scale;
         let r0 = ((((0.0 - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, max_row);
@@ -580,6 +597,14 @@ impl Gfx {
                 hud = format!("{hud}   ·   copied {s}");
             }
         }
+        // Atlas pressure, so overflow is never invisible: current height and, if the
+        // working set ever exceeds the budget, the count of glyphs it had to drop.
+        let (_, atlas_h) = self.viewer.engine.emoji_atlas_size();
+        hud = format!("{hud}   ·   atlas {atlas_h}px");
+        let dropped = self.viewer.engine.dropped_glyphs();
+        if dropped > 0 {
+            hud = format!("{hud}   ·   DROPPED {dropped}");
+        }
 
         let t0 = Instant::now();
         self.viewer.render(
@@ -643,7 +668,41 @@ fn dump() {
     // Deep zoom on a few cells — big, crisp raster emoji.
     dump_png(&mut viewer, 1000, 620, Vec2::new(10.0 - GUTTER_W * 3.0, 16.0), 3.0, "emoji_board_zoom.png");
 
-    println!("wrote emoji_board.png and emoji_board_zoom.png");
+    // Pan the whole board a viewport at a time (each render() is a frame), filling the
+    // bounded atlas and forcing cross-frame eviction, then dump the Flags category — the
+    // regression the eviction work fixes (flags used to vanish after enough panning).
+    sweep_board(&mut viewer, 920, 0.95);
+    let flags_row = viewer.layout.iter().position(|r| r.title == Some("Flags")).unwrap();
+    let flags_y = 16.0 - flags_row as f32 * CELL_H * 0.95;
+    dump_png(&mut viewer, 1450, 920, Vec2::new(10.0, flags_y), 0.95, "emoji_flags.png");
+
+    let (aw, ah) = viewer.engine.emoji_atlas_size();
+    println!(
+        "wrote emoji_board.png, emoji_board_zoom.png, emoji_flags.png \
+         (emoji atlas {aw}x{ah} after full sweep, dropped {})",
+        viewer.engine.dropped_glyphs()
+    );
+}
+
+/// Render every viewport slice of the board once, off-screen, so the bounded atlas
+/// fills and starts evicting — the churn a real pan produces. No read-back.
+fn sweep_board(viewer: &mut Viewer, vh: u32, scale: f32) {
+    let target = viewer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sweep"),
+        size: wgpu::Extent3d { width: 1450, height: vh, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut y = 0.0;
+    while y > -(viewer.world_h * scale) {
+        viewer.render(&view, 1450.0, vh as f32, Vec2::new(10.0, 16.0 + y), scale, None);
+        y -= vh as f32;
+    }
 }
 
 fn dummy_config() -> wgpu::SurfaceConfiguration {

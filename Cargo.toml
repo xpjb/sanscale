@@ -24,6 +24,10 @@ half = { version = "2", features = ["bytemuck"] }
 unicode-segmentation = "1.12"
 # Color-emoji (COLR v0/v1) rasterizer for the emoji atlas. Pure Rust, no C deps.
 tiny-skia = "0.11"
+# Decode CBDT/sbix bitmap-emoji strikes (always PNG per the OpenType spec).
+png = "0.17"
+# Warn (once) when an atlas hits its cap — overflow must never be silent.
+log = "0.4"
 
 [dev-dependencies]
 # Headless examples/benches: block on the async wgpu device request and dump PNGs.
@@ -39,6 +43,8 @@ bytemuck = "1"
 arboard = "3"
 # Canonical Unicode character names for the unicode_zoom hover.
 unicode_names2 = "3"
+# Surface the library's atlas warnings on stderr during headless smoke tests.
+env_logger = "0.11"
 
 [lints.clippy]
 too_many_arguments = "allow"

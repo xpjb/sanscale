@@ -1186,11 +1186,32 @@ impl TextEngine {
         self.glyph_cache.band_size()
     }
 
-    /// Emoji atlas dimensions `(width, height)` in texels — grows unbounded as
-    /// distinct color glyphs are cached (no eviction), so watch it against the
-    /// device's `max_texture_dimension_2d`.
+    /// Emoji atlas dimensions `(width, height)` in texels. Height is bounded by the
+    /// atlas max height (see [`set_emoji_atlas_max_height`](Self::set_emoji_atlas_max_height));
+    /// once full, cells are recycled by LRU eviction rather than growing.
     pub fn emoji_atlas_size(&self) -> (u32, u32) {
         self.emoji_cache.size()
+    }
+
+    /// Cap the emoji atlas height in texels. Set this to `min(device_limit, budget)`
+    /// once the device's `max_texture_dimension_2d` is known; the default is a
+    /// conservative 4096 that fits any default-limits device without overflow.
+    pub fn set_emoji_atlas_max_height(&mut self, max_height: u32) {
+        self.emoji_cache.set_max_height(max_height);
+    }
+
+    /// Eviction generation — bumps whenever the emoji atlas recycles a cell. Callers
+    /// that cache vertices with baked atlas UVs must drop them when this changes; the
+    /// per-frame `text*` re-emit path needs no action.
+    pub fn emoji_epoch(&self) -> u64 {
+        self.emoji_cache.epoch()
+    }
+
+    /// Color glyphs dropped because the atlas was momentarily full of glyphs already
+    /// needed in the same frame (working set over budget). Stays 0 unless the atlas is
+    /// far too small for the visible set; surface it in a debug HUD.
+    pub fn dropped_glyphs(&self) -> u64 {
+        self.emoji_cache.dropped_glyphs()
     }
 
     pub fn new_atlas(
@@ -1605,6 +1626,9 @@ impl TextEngine {
         self.frame.clear();
         self.emoji_frame.clear();
         self.frame_counter = self.frame_counter.wrapping_add(1);
+        // Advance the emoji atlas's frame clock: glyphs drawn after this point belong
+        // to a new frame and may evict cells drawn in the frame that just ended.
+        self.emoji_cache.begin_frame();
         &self.vertex_scratch
     }
 }

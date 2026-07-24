@@ -69,6 +69,7 @@ const BLOCKS: &[(u32, &str)] = &[
 ];
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     if std::env::args().any(|a| a == "--dump") {
         dump();
         return;
@@ -145,14 +146,18 @@ struct Viewer {
     /// Per-row cached vertices. A cell's world position and glyph are fixed by its
     /// code point, so a row is shaped/emitted once and then just re-gathered.
     rows: HashMap<i64, (Vec<TextVertex>, Vec<EmojiVertex>)>,
+    /// Emoji atlas eviction epoch last seen; a change means a cached row's baked atlas
+    /// UVs may now point at a recycled cell, so the row cache is dropped.
+    emoji_epoch: u64,
     scratch_text: Vec<TextVertex>,
     scratch_emoji: Vec<EmojiVertex>,
 }
 
 impl Viewer {
     fn new(device: wgpu::Device, queue: wgpu::Queue, config: &wgpu::SurfaceConfiguration) -> Self {
-        let engine =
+        let mut engine =
             TextEngine::from_sources(font_chain(UNICODE_FALLBACK)).expect("no usable fonts");
+        engine.set_emoji_atlas_max_height(device.limits().max_texture_dimension_2d.min(8192));
         let text_renderer = TextRenderer::new(&device, config);
         let emoji_renderer = EmojiRenderer::new(&device, config);
         let text_atlas = engine.new_atlas(&device, &queue, &text_renderer.atlas_layout);
@@ -171,6 +176,7 @@ impl Viewer {
             emoji_buf,
             overlay_buf,
             rows: HashMap::new(),
+            emoji_epoch: 0,
             scratch_text: Vec::new(),
             scratch_emoji: Vec::new(),
         }
@@ -288,6 +294,14 @@ impl Viewer {
         scale: f32,
         hud: Option<&str>,
     ) {
+        // Drop cached rows if the atlas recycled a cell since last frame (their baked
+        // atlas UVs could now resolve to a different glyph).
+        let epoch = self.engine.emoji_epoch();
+        if epoch != self.emoji_epoch {
+            self.emoji_epoch = epoch;
+            self.rows.clear();
+        }
+
         // Gather cached vertices for the visible rows (building any not yet seen).
         let inv = 1.0 / scale;
         let r0 = ((((0.0 - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, MAX_ROW);

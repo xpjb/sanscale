@@ -90,6 +90,10 @@ impl TextAtlas {
             self.band_width = band_width;
             self.curve_capacity_height = grow_texture_height(needed_curve_height);
             self.band_capacity_height = grow_texture_height(needed_band_height);
+            // The band/curve atlas is still unbounded (no eviction); surface the point
+            // where wgpu would start silently dropping glyphs instead of failing quietly.
+            warn_if_over_device_limit(device, self.curve_capacity_height, "text curve");
+            warn_if_over_device_limit(device, self.band_capacity_height, "text band");
             let (curve_tex, band_tex, bind_group) = create_atlas_resources(
                 device,
                 layout,
@@ -569,7 +573,6 @@ pub struct EmojiAtlas {
     bind_group: wgpu::BindGroup,
     width: u32,
     capacity_height: u32,
-    uploaded_height: u32,
     synced_revision: u64,
 }
 
@@ -585,17 +588,16 @@ impl EmojiAtlas {
         let capacity_height = grow_texture_height(real_height.max(1));
         let (texture, sampler, bind_group) =
             create_emoji_resources(device, layout, width, capacity_height);
-        let mut atlas = Self {
+        let atlas = Self {
             texture,
             sampler,
             bind_group,
             width,
             capacity_height,
-            uploaded_height: 0,
             synced_revision: cache.revision(),
         };
         upload_emoji_rows(queue, &atlas.texture, width, 0, real_height, cache.pixels());
-        atlas.uploaded_height = real_height;
+        cache.take_dirty(); // consumed by the full upload above
         atlas
     }
 
@@ -612,25 +614,40 @@ impl EmojiAtlas {
         let width = cache.size().0;
         let real_height = data_height(cache, width);
         if width != self.width || real_height > self.capacity_height {
+            // Growth phase: reallocate the texture and re-upload everything. Height is
+            // capped by the cache, so `capacity_height` cannot exceed the device limit.
             self.width = width;
             self.capacity_height = grow_texture_height(real_height.max(1));
+            warn_if_over_device_limit(device, self.capacity_height, "emoji");
             let (texture, sampler, bind_group) =
                 create_emoji_resources(device, layout, self.width, self.capacity_height);
             self.texture = texture;
             self.sampler = sampler;
             self.bind_group = bind_group;
-            self.uploaded_height = 0;
+            upload_emoji_rows(queue, &self.texture, width, 0, real_height, cache.pixels());
+            cache.take_dirty();
+        } else if let Some((from_row, to_row)) = cache.take_dirty() {
+            // Steady state: re-upload only the rows that changed — this covers cells
+            // recycled by eviction, which an append-only upload would miss.
+            upload_emoji_rows(queue, &self.texture, width, from_row, to_row, cache.pixels());
         }
-        upload_emoji_rows(
-            queue,
-            &self.texture,
-            width,
-            self.uploaded_height,
-            real_height,
-            cache.pixels(),
-        );
-        self.uploaded_height = real_height;
         self.synced_revision = cache.revision();
+    }
+}
+
+/// Warn once if an atlas texture would exceed the device's max 2D texture size, past
+/// which wgpu silently drops the overflow. The emoji atlas is capped below this, but
+/// the (still-unbounded) text band/curve atlas can reach it in long sessions.
+fn warn_if_over_device_limit(device: &wgpu::Device, height: u32, which: &str) {
+    if height > device.limits().max_texture_dimension_2d {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            log::warn!(
+                "{which} atlas height {height} exceeds max_texture_dimension_2d {}; \
+                 glyphs may render missing",
+                device.limits().max_texture_dimension_2d
+            );
+        });
     }
 }
 
