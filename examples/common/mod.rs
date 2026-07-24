@@ -86,7 +86,7 @@ pub fn unicode_sections() -> Vec<(&'static str, &'static str)> {
         ("Devanagari", "नमस्ते दुनिया — देवनागरी लिपि।"),
         ("Thai", "ภาษาไทย สวัสดีชาวโลก"),
         ("Symbols & math", "∀x∈ℝ ∃y: x²≥0 ∑∫√∞ ← ↑ → ↓ ↔ ⇒ ✓ ✗ ★ ☆ ♠♥♦♣"),
-        ("Emoji 🎨", "😀 😎 🤖 🎉 🚀 🌍 ❤️ 🔥 ✨ 🐙 🍜 🎧 🏔️ 🌈 👋"),
+        ("Emoji 🎨", "😀 😆 😅 🤣 😍 😎 🤖 🎉 🚀 🌍 ❤️ 🔥 ✨ 🐙 🍜 👋"),
     ]
 }
 

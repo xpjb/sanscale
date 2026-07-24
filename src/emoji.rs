@@ -163,6 +163,8 @@ fn rasterize(face: &RustyFace, glyph_id: u16, size: u32) -> Option<Vec<u8>> {
         max_x: f32::MIN,
         max_y: f32::MIN,
         any: false,
+        cur: IDENTITY_TF,
+        stack: Vec::new(),
     };
     face.paint_color_glyph(gid, 0, RgbaColor::new(0, 0, 0, 255), &mut bb)?;
     let (min_x, min_y, max_x, max_y) = if bb.any {
@@ -267,8 +269,35 @@ fn blend_mode(m: CompositeMode) -> BlendMode {
     }
 }
 
-/// First pass: unions the bounding boxes of a color glyph's layer outlines to
-/// frame it (transforms ignored — layers are near-identity in practice).
+const IDENTITY_TF: Transform = Transform {
+    a: 1.0,
+    b: 0.0,
+    c: 0.0,
+    d: 1.0,
+    e: 0.0,
+    f: 0.0,
+};
+
+fn tf_apply(t: Transform, x: f32, y: f32) -> (f32, f32) {
+    (t.a * x + t.c * y + t.e, t.b * x + t.d * y + t.f)
+}
+
+/// Compose so that `compose(c, t)` applies `t` then `c` (matches `push_transform`).
+fn tf_compose(c: Transform, t: Transform) -> Transform {
+    Transform {
+        a: c.a * t.a + c.c * t.b,
+        b: c.b * t.a + c.d * t.b,
+        c: c.a * t.c + c.c * t.d,
+        d: c.b * t.c + c.d * t.d,
+        e: c.a * t.e + c.c * t.f + c.e,
+        f: c.b * t.e + c.d * t.f + c.f,
+    }
+}
+
+/// First pass: unions the layer outlines' bounding boxes — **under their active
+/// transforms** — so the glyph is framed by its true painted extent. Ignoring
+/// transforms (as before) under-frames glyphs whose layers are translated/scaled,
+/// clipping e.g. the top of `U+1F606`.
 struct BBoxPainter<'a> {
     face: &'a RustyFace<'a>,
     min_x: f32,
@@ -276,16 +305,27 @@ struct BBoxPainter<'a> {
     max_x: f32,
     max_y: f32,
     any: bool,
+    cur: Transform,
+    stack: Vec<Transform>,
+}
+
+impl BBoxPainter<'_> {
+    fn union_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        for (px, py) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+            let (tx, ty) = tf_apply(self.cur, px, py);
+            self.min_x = self.min_x.min(tx);
+            self.min_y = self.min_y.min(ty);
+            self.max_x = self.max_x.max(tx);
+            self.max_y = self.max_y.max(ty);
+        }
+        self.any = true;
+    }
 }
 
 impl<'a> Painter<'a> for BBoxPainter<'a> {
     fn outline_glyph(&mut self, glyph_id: GlyphId) {
         if let Some(r) = self.face.glyph_bounding_box(glyph_id) {
-            self.min_x = self.min_x.min(r.x_min as f32);
-            self.min_y = self.min_y.min(r.y_min as f32);
-            self.max_x = self.max_x.max(r.x_max as f32);
-            self.max_y = self.max_y.max(r.y_max as f32);
-            self.any = true;
+            self.union_rect(r.x_min as f32, r.y_min as f32, r.x_max as f32, r.y_max as f32);
         }
     }
     fn paint(&mut self, _: Paint<'a>) {}
@@ -294,8 +334,15 @@ impl<'a> Painter<'a> for BBoxPainter<'a> {
     fn pop_clip(&mut self) {}
     fn push_layer(&mut self, _: CompositeMode) {}
     fn pop_layer(&mut self) {}
-    fn push_transform(&mut self, _: Transform) {}
-    fn pop_transform(&mut self) {}
+    fn push_transform(&mut self, t: Transform) {
+        self.stack.push(self.cur);
+        self.cur = tf_compose(self.cur, t);
+    }
+    fn pop_transform(&mut self) {
+        if let Some(t) = self.stack.pop() {
+            self.cur = t;
+        }
+    }
 }
 
 /// Walks the `COLR` paint tree into tiny-skia. Each `PaintGlyph` fills its outline

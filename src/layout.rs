@@ -38,25 +38,30 @@ const VS15: char = '\u{FE0E}';
 
 /// The face a grapheme resolves to. Primary (0) for whitespace/control (so runs
 /// don't fragment on spaces) and for characters no face covers (→ `.notdef` tofu).
-/// A trailing variation selector forces presentation: U+FE0F picks a color
-/// (emoji) face, U+FE0E a monochrome one — this is how emoji sequences from a
-/// picker are encoded, so `❤\u{FE0F}` renders red even when a text font would
-/// also cover `❤`. Without a selector, the first covering face wins as before.
+///
+/// Presentation follows Unicode: a trailing U+FE0F forces emoji (color) and
+/// U+FE0E forces text; with no selector, the base character's
+/// `Emoji_Presentation` property decides (so `😀` is color and `❤` is text by
+/// default, while `❤\u{FE0F}` is the red heart). The chosen presentation prefers
+/// a color or monochrome face accordingly, falling back to any covering face.
 fn face_for_grapheme(fonts: &FontSet, grapheme: &str) -> u16 {
     let base = grapheme.chars().next().unwrap_or(' ');
     if base.is_whitespace() || base.is_control() {
         return 0;
     }
-    if grapheme.chars().any(|c| c == VS16) {
-        if let Some(f) = fonts.color_face_for(base) {
-            return f;
-        }
+    let want_color = if grapheme.chars().any(|c| c == VS16) {
+        true
     } else if grapheme.chars().any(|c| c == VS15) {
-        if let Some(f) = fonts.text_face_for(base) {
-            return f;
-        }
-    }
-    fonts.covering_face(base).unwrap_or(0)
+        false
+    } else {
+        crate::emoji_presentation::is_default_emoji(base)
+    };
+    let preferred = if want_color {
+        fonts.color_face_for(base)
+    } else {
+        fonts.text_face_for(base)
+    };
+    preferred.or_else(|| fonts.covering_face(base)).unwrap_or(0)
 }
 
 /// Split `text` into maximal `(byte_start, run_text, face_id)` runs where every

@@ -284,7 +284,7 @@ impl Viewer {
 
         // Screen-space debug line (bottom-left), drawn over the map in a second pass.
         let Some(hud) = hud else { return };
-        self.engine.text(12.0, h - 12.0, hud, &args(16.0, [0.85, 0.15, 0.15, 1.0]));
+        self.engine.text(16.0, h - 16.0, hud, &args(24.0, [1.0, 0.0, 0.0, 1.0]));
         self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
         let ov = self.engine.flush().to_vec();
         let on = self.overlay_buf.upload(&self.device, &self.queue, &ov);

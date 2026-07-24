@@ -16,6 +16,7 @@
 mod bands;
 mod cache;
 mod emoji;
+mod emoji_presentation;
 pub mod engine;
 mod font;
 mod layout;
