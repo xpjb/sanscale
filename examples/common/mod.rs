@@ -48,8 +48,9 @@ pub const FONT_CANDIDATES: &[&str] = &[
 pub const UNICODE_FALLBACK: &[&str] = &[
     // Primary Latin first (keeps digits/letters as text).
     "Segoe UI",
-    // Color emoji, high priority.
-    "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji",
+    // Color emoji, high priority. Twemoji (COLR) is a fallback for sequences the
+    // platform emoji font can't form — notably flags, which Segoe UI Emoji omits.
+    "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", "Twemoji Mozilla",
     // More Latin.
     "Helvetica Neue", "Arial", "Noto Sans", "DejaVu Sans",
     // CJK.

@@ -43,6 +43,39 @@ fn is_emoji_modifier(c: char) -> bool {
     ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
 }
 
+/// A multi-code-point emoji sequence — ZWJ, flag (regional indicators), skin
+/// tone, or keycap — for which cluster-level fallback is worthwhile.
+fn is_emoji_sequence(grapheme: &str) -> bool {
+    grapheme.chars().nth(1).is_some()
+        && grapheme.chars().any(|c| {
+            c == '\u{200D}' // ZWJ
+                || c == VS16
+                || is_emoji_modifier(c)
+                || ('\u{1F1E6}'..='\u{1F1FF}').contains(&c) // regional indicator
+                || c == '\u{20E3}' // combining enclosing keycap
+        })
+}
+
+/// Whether `face` shapes `text` to a single non-`.notdef` glyph — i.e. it can
+/// form the whole sequence (a flag, a ZWJ emoji) rather than falling back to
+/// several pieces.
+fn shapes_single(face: &rustybuzz::Face, text: &str) -> bool {
+    let mut buffer = UnicodeBuffer::new();
+    buffer.push_str(text);
+    buffer.guess_segment_properties();
+    let glyphs = shape(face, &[], buffer);
+    glyphs.len() == 1 && glyphs.glyph_infos()[0].glyph_id != 0
+}
+
+/// First face in the chain that ligates the whole grapheme into one glyph.
+fn single_glyph_face(fonts: &FontSet, grapheme: &str) -> Option<u16> {
+    fonts
+        .faces()
+        .iter()
+        .position(|f| shapes_single(f.face(), grapheme))
+        .map(|i| i as u16)
+}
+
 /// The face a grapheme resolves to. Primary (0) for whitespace/control (so runs
 /// don't fragment on spaces) and for characters no face covers (→ `.notdef` tofu).
 ///
@@ -67,8 +100,23 @@ fn face_for_grapheme(fonts: &FontSet, grapheme: &str) -> u16 {
         fonts.color_face_for(base)
     } else {
         fonts.text_face_for(base)
-    };
-    preferred.or_else(|| fonts.covering_face(base)).unwrap_or(0)
+    }
+    .or_else(|| fonts.covering_face(base));
+
+    // Cluster-level fallback: for an emoji sequence, if the presentation-preferred
+    // face can't render it as a single glyph (e.g. Segoe UI Emoji has the regional
+    // indicators but no flag ligatures), fall back to a face in the chain that can.
+    if is_emoji_sequence(grapheme) {
+        if let Some(p) = preferred {
+            if shapes_single(fonts.face(p).face(), grapheme) {
+                return p;
+            }
+        }
+        if let Some(f) = single_glyph_face(fonts, grapheme) {
+            return f;
+        }
+    }
+    preferred.unwrap_or(0)
 }
 
 /// Split `text` into maximal `(byte_start, run_text, face_id)` runs where every

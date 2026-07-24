@@ -186,4 +186,8 @@ impl FontSet {
     pub fn face(&self, id: u16) -> &Font {
         &self.faces[id as usize]
     }
+
+    pub fn faces(&self) -> &[Font] {
+        &self.faces
+    }
 }
