@@ -56,12 +56,17 @@ renderer.render(&queue, &mut encoder, &view, &atlas, &buffer,
 
 ## Examples
 
-Both are headless — they render to a PNG, no window required.
+```
+cargo run --example hello_png      # one line of text             -> hello.png
+cargo run --example paragraph      # wrapping, alignment, sizes   -> paragraph.png
+cargo run --example unicode        # color emoji + CJK + 12 scripts via fallback -> unicode.png
+cargo run --example unicode_zoom   # interactive: pan/zoom the whole of Unicode
+```
 
-```
-cargo run --example hello_png    # one line of text  -> hello.png
-cargo run --example paragraph    # wrapping, alignment, sizes -> paragraph.png
-```
+The first three are headless (render to a PNG). `unicode_zoom` opens a window —
+scroll to zoom, drag to pan, `R` to reset, `Esc` to quit — and shows the payoff of
+analytic coverage: the vector text stays razor-sharp at any zoom (color emoji,
+being a raster atlas, is the one thing that pixelates).
 
 ## Status
 
