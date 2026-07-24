@@ -36,6 +36,13 @@ pub(crate) struct ShapedRun {
 const VS16: char = '\u{FE0F}';
 const VS15: char = '\u{FE0E}';
 
+/// A Fitzpatrick skin-tone modifier (`Emoji_Modifier`). Its presence forces the
+/// whole sequence to emoji presentation regardless of the base's default — so
+/// e.g. `✌\u{1F3FF}` (a text-default base) still resolves to the color face.
+fn is_emoji_modifier(c: char) -> bool {
+    ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
+}
+
 /// The face a grapheme resolves to. Primary (0) for whitespace/control (so runs
 /// don't fragment on spaces) and for characters no face covers (→ `.notdef` tofu).
 ///
@@ -49,7 +56,7 @@ fn face_for_grapheme(fonts: &FontSet, grapheme: &str) -> u16 {
     if base.is_whitespace() || base.is_control() {
         return 0;
     }
-    let want_color = if grapheme.chars().any(|c| c == VS16) {
+    let want_color = if grapheme.chars().any(|c| c == VS16 || is_emoji_modifier(c)) {
         true
     } else if grapheme.chars().any(|c| c == VS15) {
         false
@@ -236,6 +243,29 @@ mod tests {
         assert!(
             color.glyphs.iter().any(|g| g.is_color),
             "U+2764 U+FE0F should render as a color glyph"
+        );
+    }
+
+    #[test]
+    fn skin_tone_modifier_forces_emoji_presentation() {
+        let sym = "C:\\Windows\\Fonts\\seguisym.ttf";
+        let emoji = "C:\\Windows\\Fonts\\seguiemj.ttf";
+        if !exists(sym) || !exists(emoji) {
+            return;
+        }
+        let fonts =
+            FontSet::load(vec![FontSource::Path(sym), FontSource::Path(emoji)]).unwrap();
+        let mut cache = GlyphCache::new();
+        // Victory hand (text-default base) + a skin-tone modifier must resolve to
+        // the color face — otherwise the modifier lands on a mono font as tofu.
+        let run = shape_text(&fonts, &mut cache, "\u{270C}\u{1F3FF}", 0.0, 0.0);
+        assert!(
+            run.glyphs.iter().any(|g| g.is_color),
+            "U+270C U+1F3FF should render as a color glyph"
+        );
+        assert!(
+            run.glyphs.iter().all(|g| g.glyph_id != 0),
+            "the skin-tone modifier should not fall back to .notdef tofu"
         );
     }
 
