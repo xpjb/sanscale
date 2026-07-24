@@ -1,0 +1,22 @@
+[package]
+name = "text"
+version = "0.1.0"
+edition = "2021"
+description = "GPU font rendering library based on the Slug algorithm"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wgpu = { workspace = true }
+ttf-parser = { workspace = true }
+rustybuzz = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+half = { workspace = true }
+unicode-segmentation = { workspace = true }
+# Color-emoji (COLR v0/v1) rasterizer for the emoji atlas. Pure Rust, no C deps.
+tiny-skia = "0.11"
+
+[lints]
+workspace = true
