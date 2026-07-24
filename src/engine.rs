@@ -1131,6 +1131,13 @@ impl TextEngine {
             .collect()
     }
 
+    /// Whether any face in the fallback chain has a glyph for `c` (i.e. it would
+    /// render as something other than `.notdef` tofu). Useful for enumerating the
+    /// renderable subset of a code range.
+    pub fn covers(&self, c: char) -> bool {
+        self.fonts.covering_face(c).is_some()
+    }
+
     /// Family names of the loaded fallback chain, in fallback order (diagnostics).
     pub fn fallback_family_names(&self) -> Vec<String> {
         self.fonts.family_names()

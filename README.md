@@ -60,13 +60,17 @@ renderer.render(&queue, &mut encoder, &view, &atlas, &buffer,
 cargo run --example hello_png      # one line of text             -> hello.png
 cargo run --example paragraph      # wrapping, alignment, sizes   -> paragraph.png
 cargo run --example unicode        # color emoji + CJK + 12 scripts via fallback -> unicode.png
-cargo run --example unicode_zoom   # interactive: pan/zoom the whole of Unicode
+cargo run --example unicode_zoom   # interactive: a zoomable map of the whole codespace
 ```
 
-The first three are headless (render to a PNG). `unicode_zoom` opens a window —
-scroll to zoom, drag to pan, `R` to reset, `Esc` to quit — and shows the payoff of
-analytic coverage: the vector text stays razor-sharp at any zoom (color emoji,
-being a raster atlas, is the one thing that pixelates).
+The first three are headless (render to a PNG). `unicode_zoom` opens a window: a
+Unifont-style 256-column map of the entire Unicode codespace — code point =
+`row*256 + col`, a glyph where some font covers it and a tofu box where none does,
+block labels down the side. It never enumerates up front; each frame culls to the
+visible cells, skips glyphs below a minimum size (labels only), and stays
+razor-sharp at any zoom. Scroll to zoom, drag to pan, `R` to reset, `Esc` to quit;
+`-- --dump` writes PNG stills instead of opening a window. (Color emoji, a raster
+atlas, is the one thing that pixelates when magnified.)
 
 ## Status
 
