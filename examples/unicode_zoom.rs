@@ -31,7 +31,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use common::{font_chain, UNICODE_FALLBACK};
+use common::{copy_to_clipboard, font_chain, Hover, UNICODE_FALLBACK};
 
 const COLS: i64 = 256;
 const CELL_W: f32 = 20.0;
@@ -73,7 +73,7 @@ fn main() {
         dump();
         return;
     }
-    println!("scroll = zoom · drag (any button) = pan · R = reset · Esc = quit");
+    println!("scroll = zoom · drag = pan · left-click = copy char · right-click = copy code point · R = reset · Esc = quit");
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App::default()).unwrap();
@@ -87,6 +87,13 @@ fn model(offset: Vec2, scale: f32) -> Mat4 {
 }
 fn args(size_px: f32, color: [f32; 4]) -> TextArgs {
     TextArgs { size_px, color, ..Default::default() }
+}
+
+/// Largest size (≤ `GLYPH_PX`) at which a glyph of this em bbox fits its cell.
+fn fit_scale(mnx: f32, mny: f32, mxx: f32, mxy: f32) -> f32 {
+    let gw = (mxx - mnx).max(1e-3);
+    let gh = (mxy - mny).max(1e-3);
+    GLYPH_PX.min((CELL_W - 3.0) / gw).min((CELL_H - 5.0) / gh)
 }
 
 /// A vertex buffer that's written in place each frame and only reallocated when
@@ -175,7 +182,6 @@ impl Viewer {
         if self.rows.contains_key(&r) {
             return;
         }
-        let ink = args(GLYPH_PX, INK);
         let tofu = args(GLYPH_PX, TOFU);
         let mut buf = [0u8; 4];
         let base = r * COLS;
@@ -190,10 +196,25 @@ impl Viewer {
             }
             let x = GUTTER_W + c as f32 * CELL_W + 3.0;
             let y = r as f32 * CELL_H + 16.0;
-            if self.engine.covers(ch) {
-                self.engine.text(x, y, ch.encode_utf8(&mut buf), &ink);
-            } else {
+            if !self.engine.covers(ch) {
                 self.engine.text(x, y, "\u{25A1}", &tofu);
+                continue;
+            }
+            // Some glyphs (PUA icons, Cuneiform, …) extend well past 1em; shrink
+            // and center those to their cell so they don't overflow into
+            // neighbors. Normal glyphs keep the baseline grid.
+            match self.engine.glyph_bbox(ch) {
+                Some((mnx, mny, mxx, mxy)) if fit_scale(mnx, mny, mxx, mxy) < GLYPH_PX => {
+                    let s = fit_scale(mnx, mny, mxx, mxy);
+                    let ccx = GUTTER_W + c as f32 * CELL_W + CELL_W * 0.5;
+                    let ccy = r as f32 * CELL_H + CELL_H * 0.5;
+                    let px = ccx - (mnx + mxx) * 0.5 * s;
+                    let py = ccy + (mny + mxy) * 0.5 * s;
+                    self.engine.text(px, py, ch.encode_utf8(&mut buf), &args(s, INK));
+                }
+                _ => {
+                    self.engine.text(x, y, ch.encode_utf8(&mut buf), &args(GLYPH_PX, INK));
+                }
             }
         }
         self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
@@ -224,6 +245,29 @@ impl Viewer {
                 self.engine.text(10.0, r * CELL_H + TITLE_PX * 0.82, name, &args);
             }
         }
+    }
+
+    /// The code point under the cursor (with its resolved font family), or `None`.
+    fn hovered(&self, cursor: Vec2, offset: Vec2, scale: f32) -> Option<Hover> {
+        let world = (cursor - offset) / scale;
+        let col = ((world.x - GUTTER_W) / CELL_W).floor() as i64;
+        let row = (world.y / CELL_H).floor() as i64;
+        if !(0..COLS).contains(&col) || !(0..=MAX_ROW).contains(&row) {
+            return None;
+        }
+        let cp = (row * COLS + col) as u32;
+        if (0xD800..=0xDFFF).contains(&cp) {
+            return None;
+        }
+        let ch = char::from_u32(cp)?;
+        let block = BLOCKS.iter().rev().find(|(s, _)| *s <= cp).map(|(_, n)| *n).unwrap_or("—");
+        let family = self.engine.family_for(ch).unwrap_or_else(|| "—".into());
+        let shown = if ch.is_control() || ch.is_whitespace() { ' ' } else { ch };
+        Some(Hover {
+            label: format!("U+{cp:04X}  {shown}  ·  {block}  ·  {family}"),
+            text: ch.to_string(),
+            code: format!("U+{cp:04X}"),
+        })
     }
 
     fn render(
@@ -310,24 +354,6 @@ impl Viewer {
     }
 }
 
-/// The code point under the cursor, if it's over a grid cell (`U+XXXX char block`).
-fn hovered(cursor: Vec2, offset: Vec2, scale: f32) -> Option<String> {
-    let world = (cursor - offset) / scale;
-    let col = ((world.x - GUTTER_W) / CELL_W).floor() as i64;
-    let row = (world.y / CELL_H).floor() as i64;
-    if !(0..COLS).contains(&col) || !(0..=MAX_ROW).contains(&row) {
-        return None;
-    }
-    let cp = (row * COLS + col) as u32;
-    if (0xD800..=0xDFFF).contains(&cp) {
-        return None;
-    }
-    let ch = char::from_u32(cp)?;
-    let block = BLOCKS.iter().rev().find(|(s, _)| *s <= cp).map(|(_, n)| *n).unwrap_or("—");
-    let shown = if ch.is_control() || ch.is_whitespace() { ' ' } else { ch };
-    Some(format!("U+{cp:04X}  {shown}  ·  {block}"))
-}
-
 fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
     wgpu::DeviceDescriptor {
         label: Some("unicode_zoom"),
@@ -381,18 +407,32 @@ impl ApplicationHandler for App {
                 gfx.zoom_at_cursor(1.15f32.powf(dy));
                 gfx.window.request_redraw();
             }
-            // Any mouse button drags the camera.
+            // Any button drags to pan; a button *click* (no drag) copies — left
+            // copies the character, right copies the code point.
             WindowEvent::MouseInput {
                 state,
-                button: MouseButton::Left | MouseButton::Right | MouseButton::Middle,
+                button: button @ (MouseButton::Left | MouseButton::Right | MouseButton::Middle),
                 ..
-            } => {
-                gfx.dragging = state == ElementState::Pressed;
-            }
+            } => match state {
+                ElementState::Pressed => {
+                    gfx.dragging = true;
+                    gfx.press_pos = gfx.cursor;
+                    gfx.moved = false;
+                }
+                ElementState::Released => {
+                    gfx.dragging = false;
+                    if !gfx.moved {
+                        gfx.on_click(button);
+                    }
+                }
+            },
             WindowEvent::CursorMoved { position, .. } => {
                 let p = Vec2::new(position.x as f32, position.y as f32);
                 if gfx.dragging {
                     gfx.offset += p - gfx.cursor;
+                    if (p - gfx.press_pos).length() > 4.0 {
+                        gfx.moved = true;
+                    }
                     gfx.clamp_camera();
                     gfx.window.request_redraw();
                 }
@@ -413,6 +453,9 @@ struct Gfx {
     offset: Vec2,
     cursor: Vec2,
     dragging: bool,
+    press_pos: Vec2,
+    moved: bool, // did the cursor move since the button went down (drag vs click)
+    copied: Option<(String, Instant)>, // last copied string, for brief HUD feedback
     samples: Vec<(Instant, f32)>, // (timestamp, render-cost ms) over ~5s
 }
 
@@ -473,6 +516,9 @@ impl Gfx {
             offset: Vec2::ZERO,
             cursor: Vec2::ZERO,
             dragging: false,
+            press_pos: Vec2::ZERO,
+            moved: false,
+            copied: None,
             samples: Vec::new(),
         };
         gfx.reset_view();
@@ -494,6 +540,20 @@ impl Gfx {
         self.config.height = size.height;
         self.surface.configure(&self.viewer.device, &self.config);
         self.clamp_camera();
+    }
+
+    /// Copy the hovered character (left) or its code point (right) to the clipboard.
+    fn on_click(&mut self, button: MouseButton) {
+        let Some(h) = self.viewer.hovered(self.cursor, self.offset, self.scale) else { return };
+        let s = match button {
+            MouseButton::Left => h.text,
+            MouseButton::Right => h.code,
+            _ => return,
+        };
+        copy_to_clipboard(&s);
+        println!("copied: {s}");
+        self.copied = Some((s, Instant::now()));
+        self.window.request_redraw();
     }
 
     fn zoom_at_cursor(&mut self, factor: f32) {
@@ -527,13 +587,18 @@ impl Gfx {
         };
         let view = frame.texture.create_view(&Default::default());
 
-        // Debug line: only what was asked for — p99 of the last ~5s of per-frame
-        // CPU render cost, and the hovered code point.
+        // Debug line: p99 of the last ~5s of per-frame CPU render cost, the hovered
+        // code point (+ its font), and a brief note after a copy.
         let p99 = p99(&self.samples);
-        let hud = match hovered(self.cursor, self.offset, self.scale) {
-            Some(h) => format!("p99 {p99:.2} ms   ·   {h}"),
+        let mut hud = match self.viewer.hovered(self.cursor, self.offset, self.scale) {
+            Some(h) => format!("p99 {p99:.2} ms   ·   {}", h.label),
             None => format!("p99 {p99:.2} ms"),
         };
+        if let Some((s, t)) = &self.copied {
+            if t.elapsed().as_secs_f32() < 2.0 {
+                hud = format!("{hud}   ·   copied {s}");
+            }
+        }
 
         let t0 = Instant::now();
         self.viewer.render(

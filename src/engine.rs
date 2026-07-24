@@ -1138,9 +1138,32 @@ impl TextEngine {
         self.fonts.covering_face(c).is_some()
     }
 
+    /// Em-space ink bounding box `(min_x, min_y, max_x, max_y)` of the glyph `c`
+    /// resolves to through fallback. `None` for whitespace, uncovered characters,
+    /// and color (emoji) glyphs. Handy for fitting a glyph into a fixed cell —
+    /// note some glyphs (Private Use icons, Cuneiform, …) extend well beyond the
+    /// `[0,1]` em box, so a fixed size will overflow unless scaled to this.
+    pub fn glyph_bbox(&mut self, c: char) -> Option<(f32, f32, f32, f32)> {
+        let mut buf = [0u8; 4];
+        let run = shape_text(&self.fonts, &mut self.glyph_cache, c.encode_utf8(&mut buf), 0.0, 0.0);
+        run.glyphs.iter().find_map(|g| g.info.map(|i| i.bbox))
+    }
+
     /// Family names of the loaded fallback chain, in fallback order (diagnostics).
     pub fn fallback_family_names(&self) -> Vec<String> {
         self.fonts.family_names()
+    }
+
+    /// Family name of the face that would render `c`, resolving presentation the
+    /// same way shaping does (emoji-default → a color face). `None` if uncovered.
+    pub fn family_for(&self, c: char) -> Option<String> {
+        let id = if crate::emoji_presentation::is_default_emoji(c) {
+            self.fonts.color_face_for(c)
+        } else {
+            self.fonts.text_face_for(c)
+        }
+        .or_else(|| self.fonts.covering_face(c))?;
+        self.fonts.face(id).family_name()
     }
 
     /// Curve atlas dimensions `(width, height)` for debugging / diagnostics.

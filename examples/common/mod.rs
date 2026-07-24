@@ -6,6 +6,22 @@
 
 pub mod emoji_data;
 
+/// What's under the cursor in the zoomable examples: a human-readable `label` for
+/// the debug line, the `text` to copy on left-click, and the `code` (code points)
+/// to copy on right-click.
+pub struct Hover {
+    pub label: String,
+    pub text: String,
+    pub code: String,
+}
+
+/// Copy `s` to the system clipboard (best-effort; ignores failures).
+pub fn copy_to_clipboard(s: &str) {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(s);
+    }
+}
+
 use glam::Mat4;
 use sanscale::{EmojiAtlas, EmojiRenderer, FontSource, TextAtlas, TextRenderer, TextVertex};
 

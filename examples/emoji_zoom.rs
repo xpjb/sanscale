@@ -29,7 +29,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use common::emoji_data::GROUPS;
-use common::{font_chain, UNICODE_FALLBACK};
+use common::{copy_to_clipboard, font_chain, Hover, UNICODE_FALLBACK};
 
 const COLS: usize = 24; // emoji per row
 const CELL_W: f32 = 44.0;
@@ -47,7 +47,7 @@ fn main() {
         dump();
         return;
     }
-    println!("scroll = zoom · drag (any button) = pan · R = reset · Esc = quit");
+    println!("scroll = zoom · drag = pan · left-click = copy emoji · right-click = copy code points · R = reset · Esc = quit");
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App::default()).unwrap();
@@ -216,8 +216,8 @@ impl Viewer {
         }
     }
 
-    /// Emoji under the cursor (`name · U+… U+…`), if any.
-    fn hovered(&self, cursor: Vec2, offset: Vec2, scale: f32) -> Option<String> {
+    /// Emoji under the cursor: name, its code points, and the resolved font.
+    fn hovered(&self, cursor: Vec2, offset: Vec2, scale: f32) -> Option<Hover> {
         let world = (cursor - offset) / scale;
         let col = ((world.x - GUTTER_W) / CELL_W).floor() as i64;
         let row = (world.y / CELL_H).floor() as i64;
@@ -225,8 +225,23 @@ impl Viewer {
             return None;
         }
         let cell = self.layout.get(row as usize)?.cells.get(col as usize)?;
-        let cps: Vec<String> = cell.emoji.chars().map(|c| format!("U+{:04X}", c as u32)).collect();
-        Some(format!("{}   ·   {}", cell.name, cps.join(" ")))
+        let code = cell
+            .emoji
+            .chars()
+            .map(|c| format!("U+{:04X}", c as u32))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let family = cell
+            .emoji
+            .chars()
+            .next()
+            .and_then(|c| self.engine.family_for(c))
+            .unwrap_or_else(|| "—".into());
+        Some(Hover {
+            label: format!("{}   ·   {code}   ·   {family}", cell.name),
+            text: cell.emoji.to_string(),
+            code,
+        })
     }
 
     fn render(
@@ -364,17 +379,31 @@ impl ApplicationHandler for App {
                 gfx.zoom_at_cursor(1.15f32.powf(dy));
                 gfx.window.request_redraw();
             }
+            // Drag to pan; a click (no drag) copies — left the emoji, right its code points.
             WindowEvent::MouseInput {
                 state,
-                button: MouseButton::Left | MouseButton::Right | MouseButton::Middle,
+                button: button @ (MouseButton::Left | MouseButton::Right | MouseButton::Middle),
                 ..
-            } => {
-                gfx.dragging = state == ElementState::Pressed;
-            }
+            } => match state {
+                ElementState::Pressed => {
+                    gfx.dragging = true;
+                    gfx.press_pos = gfx.cursor;
+                    gfx.moved = false;
+                }
+                ElementState::Released => {
+                    gfx.dragging = false;
+                    if !gfx.moved {
+                        gfx.on_click(button);
+                    }
+                }
+            },
             WindowEvent::CursorMoved { position, .. } => {
                 let p = Vec2::new(position.x as f32, position.y as f32);
                 if gfx.dragging {
                     gfx.offset += p - gfx.cursor;
+                    if (p - gfx.press_pos).length() > 4.0 {
+                        gfx.moved = true;
+                    }
                     gfx.clamp_camera();
                     gfx.window.request_redraw();
                 }
@@ -395,6 +424,9 @@ struct Gfx {
     offset: Vec2,
     cursor: Vec2,
     dragging: bool,
+    press_pos: Vec2,
+    moved: bool,
+    copied: Option<(String, Instant)>,
     samples: Vec<(Instant, f32)>,
 }
 
@@ -453,6 +485,9 @@ impl Gfx {
             offset: Vec2::ZERO,
             cursor: Vec2::ZERO,
             dragging: false,
+            press_pos: Vec2::ZERO,
+            moved: false,
+            copied: None,
             samples: Vec::new(),
         };
         gfx.reset_view();
@@ -474,6 +509,19 @@ impl Gfx {
         self.config.height = size.height;
         self.surface.configure(&self.viewer.device, &self.config);
         self.clamp_camera();
+    }
+
+    fn on_click(&mut self, button: MouseButton) {
+        let Some(h) = self.viewer.hovered(self.cursor, self.offset, self.scale) else { return };
+        let s = match button {
+            MouseButton::Left => h.text,
+            MouseButton::Right => h.code,
+            _ => return,
+        };
+        copy_to_clipboard(&s);
+        println!("copied: {s}");
+        self.copied = Some((s, Instant::now()));
+        self.window.request_redraw();
     }
 
     fn zoom_at_cursor(&mut self, factor: f32) {
@@ -506,10 +554,15 @@ impl Gfx {
         let view = frame.texture.create_view(&Default::default());
 
         let p99 = p99(&self.samples);
-        let hud = match self.viewer.hovered(self.cursor, self.offset, self.scale) {
-            Some(h) => format!("p99 {p99:.2} ms   ·   {h}"),
+        let mut hud = match self.viewer.hovered(self.cursor, self.offset, self.scale) {
+            Some(h) => format!("p99 {p99:.2} ms   ·   {}", h.label),
             None => format!("p99 {p99:.2} ms"),
         };
+        if let Some((s, t)) = &self.copied {
+            if t.elapsed().as_secs_f32() < 2.0 {
+                hud = format!("{hud}   ·   copied {s}");
+            }
+        }
 
         let t0 = Instant::now();
         self.viewer.render(
