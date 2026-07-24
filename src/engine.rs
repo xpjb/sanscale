@@ -1186,6 +1186,13 @@ impl TextEngine {
         self.glyph_cache.band_size()
     }
 
+    /// Emoji atlas dimensions `(width, height)` in texels — grows unbounded as
+    /// distinct color glyphs are cached (no eviction), so watch it against the
+    /// device's `max_texture_dimension_2d`.
+    pub fn emoji_atlas_size(&self) -> (u32, u32) {
+        self.emoji_cache.size()
+    }
+
     pub fn new_atlas(
         &self,
         device: &wgpu::Device,

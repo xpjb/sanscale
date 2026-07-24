@@ -335,11 +335,13 @@ impl Viewer {
     }
 }
 
-fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
+/// Request the adapter's full 2D texture size (default limits cap it at 8192,
+/// which the emoji atlas can exceed) so more color glyphs fit before overflow.
+fn device_descriptor(max_texture_dimension_2d: u32) -> wgpu::DeviceDescriptor<'static> {
     wgpu::DeviceDescriptor {
         label: Some("emoji_zoom"),
         required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::default(),
+        required_limits: wgpu::Limits { max_texture_dimension_2d, ..Default::default() },
         memory_hints: wgpu::MemoryHints::default(),
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         trace: wgpu::Trace::Off,
@@ -462,7 +464,7 @@ impl Gfx {
             })
             .await
             .expect("adapter");
-        let (device, queue) = adapter.request_device(&device_descriptor()).await.expect("device");
+        let (device, queue) = adapter.request_device(&device_descriptor(adapter.limits().max_texture_dimension_2d)).await.expect("device");
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
@@ -630,7 +632,7 @@ fn dump() {
             })
             .await
             .expect("adapter");
-        adapter.request_device(&device_descriptor()).await.expect("device")
+        adapter.request_device(&device_descriptor(adapter.limits().max_texture_dimension_2d)).await.expect("device")
     });
     let mut viewer = Viewer::new(device, queue, &dummy_config());
     println!("{} emoji in {} rows", GROUPS.iter().map(|(_, e)| e.len()).sum::<usize>(), viewer.layout.len());
