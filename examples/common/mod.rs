@@ -4,6 +4,8 @@
 
 #![allow(dead_code)] // each example uses a different subset of these helpers.
 
+pub mod emoji_data;
+
 use glam::Mat4;
 use sanscale::{EmojiAtlas, EmojiRenderer, FontSource, TextAtlas, TextRenderer, TextVertex};
 

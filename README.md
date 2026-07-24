@@ -61,6 +61,7 @@ cargo run --example hello_png      # one line of text             -> hello.png
 cargo run --example paragraph      # wrapping, alignment, sizes   -> paragraph.png
 cargo run --example unicode        # color emoji + CJK + 12 scripts via fallback -> unicode.png
 cargo run --example unicode_zoom   # interactive: a zoomable map of the whole codespace
+cargo run --example emoji_zoom     # interactive: a zoomable board of every RGI emoji
 ```
 
 The first three are headless (render to a PNG). `unicode_zoom` opens a window: a
