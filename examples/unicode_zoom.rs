@@ -265,8 +265,15 @@ impl Viewer {
         // Canonical Unicode name (handles algorithmic CJK/Hangul ranges too).
         let name = unicode_names2::name(ch).map(|n| n.to_string()).unwrap_or_else(|| "—".into());
         let shown = if ch.is_control() || ch.is_whitespace() { ' ' } else { ch };
+        // Stable/short fields first (padded so they hold their columns); the noisy
+        // variable-length name goes last so it never shoves the rest around.
         Some(Hover {
-            label: format!("U+{cp:04X}  {shown}  ·  {name}  ·  {block}  ·  {family}"),
+            label: format!(
+                "{:<9}{shown}   ·   {:<15}   ·   {:<20}   ·   {name}",
+                format!("U+{cp:04X}"),
+                block,
+                family,
+            ),
             text: ch.to_string(),
             code: format!("U+{cp:04X}"),
         })
@@ -593,8 +600,8 @@ impl Gfx {
         // code point (+ its font), and a brief note after a copy.
         let p99 = p99(&self.samples);
         let mut hud = match self.viewer.hovered(self.cursor, self.offset, self.scale) {
-            Some(h) => format!("p99 {p99:.2} ms   ·   {}", h.label),
-            None => format!("p99 {p99:.2} ms"),
+            Some(h) => format!("p99 {p99:6.2} ms   ·   {}", h.label),
+            None => format!("p99 {p99:6.2} ms"),
         };
         if let Some((s, t)) = &self.copied {
             if t.elapsed().as_secs_f32() < 2.0 {

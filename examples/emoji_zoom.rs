@@ -31,7 +31,7 @@ use winit::window::{Window, WindowId};
 use common::emoji_data::GROUPS;
 use common::{copy_to_clipboard, font_chain, Hover, UNICODE_FALLBACK};
 
-const COLS: usize = 24; // emoji per row
+const COLS: usize = 40; // emoji per row
 const CELL_W: f32 = 44.0;
 const CELL_H: f32 = 44.0;
 const GLYPH_PX: f32 = 34.0;
@@ -237,8 +237,9 @@ impl Viewer {
             .next()
             .and_then(|c| self.engine.family_for(c))
             .unwrap_or_else(|| "—".into());
+        // Stable fields first (padded); the noisy variable-length name goes last.
         Some(Hover {
-            label: format!("{}   ·   {code}   ·   {family}", cell.name),
+            label: format!("{:<18}   ·   {:<26}   ·   {}", family, code, cell.name),
             text: cell.emoji.to_string(),
             code,
         })
@@ -524,9 +525,15 @@ impl Gfx {
         self.window.request_redraw();
     }
 
+    /// Minimum zoom: far enough out that the whole board (width *or* height,
+    /// whichever binds) fits — so you can always see the full set.
+    fn min_scale(&self) -> f32 {
+        let (w, h) = (self.config.width as f32, self.config.height as f32);
+        (w / WORLD_W).min(h / self.viewer.world_h)
+    }
+
     fn zoom_at_cursor(&mut self, factor: f32) {
-        let w = self.config.width as f32;
-        let new_scale = (self.scale * factor).clamp(w / WORLD_W, 60.0);
+        let new_scale = (self.scale * factor).clamp(self.min_scale(), 60.0);
         let world = (self.cursor - self.offset) / self.scale;
         self.offset = self.cursor - world * new_scale;
         self.scale = new_scale;
@@ -535,7 +542,7 @@ impl Gfx {
 
     fn clamp_camera(&mut self) {
         let (w, h) = (self.config.width as f32, self.config.height as f32);
-        self.scale = self.scale.clamp(w / WORLD_W, 60.0);
+        self.scale = self.scale.clamp(self.min_scale(), 60.0);
         let s = self.scale;
         let margin = 40.0;
         self.offset.x = clamp_axis(self.offset.x, w - WORLD_W * s - margin, margin);
@@ -555,8 +562,8 @@ impl Gfx {
 
         let p99 = p99(&self.samples);
         let mut hud = match self.viewer.hovered(self.cursor, self.offset, self.scale) {
-            Some(h) => format!("p99 {p99:.2} ms   ·   {}", h.label),
-            None => format!("p99 {p99:.2} ms"),
+            Some(h) => format!("p99 {p99:6.2} ms   ·   {}", h.label),
+            None => format!("p99 {p99:6.2} ms"),
         };
         if let Some((s, t)) = &self.copied {
             if t.elapsed().as_secs_f32() < 2.0 {
