@@ -54,10 +54,18 @@ because it points at an API question rather than an allocator.
 | Skia / Chrome | CPU text-blob cache, invalidated when the matrix moves beyond tolerance | glyph run | rebuild vertices into a bump pool, reset every flush |
 | Dear ImGui, most UI toolkits | nothing | — | rebuild the whole vertex buffer every frame |
 | Zed / GPUI | nothing | — | per-frame primitive list, one upload |
+| cosmic-text + glyphon | CPU shaping/layout per buffer line; **no geometry cache** | per `Buffer` | rebuild the vertex buffer every `prepare()` |
 | Mapbox GL | **GPU, resident** | tile — big, static, few, long-lived | draw only; upload on tile load |
 | Slug (upstream) | caller's problem | per run, if you want one | you choose |
 | sanscale **old** | CPU, **consumer's choice** | row / none | concat + upload |
 | sanscale **now** | CPU, service-owned | **fixed at block** | concat + upload |
+
+cosmic-text is the closest peer, and the comparison is instructive in both
+directions: it takes **more** than we do (its `Buffer` owns the text as
+`Vec<BufferLine>` of `String`s, which `decisions.md` deliberately refused) and
+**less** (no geometry cache at all — glyphon rebuilds the vertex buffer on every
+`prepare`). Two libraries, two different things pulled behind the API. Neither
+took both.
 
 The consensus for *text* is the top group: cache at the glyph and atlas level,
 regenerate vertices per frame into transient bump storage. Resident GPU ranges is
@@ -65,6 +73,42 @@ the Mapbox row, and it works there because tiles are big and static — not beca
 it is generally better. Applying it at glyph granularity would be tile
 architecture at the wrong scale, plus a real allocator, plus a vertex-format and
 shader change.
+
+---
+
+## Was there a halfway point? Yes, and it was written down
+
+`decisions.md` put the geometry pool in **Maybe**, not in the design:
+
+> *We'd add it* because it kills the every-frame re-upload of unchanged paragraphs
+> … and — because `draw` is keyed — it slots in later with **no API change**.
+> *But maybe not*: compendium re-uploads everything every frame today and it's
+> fine, so this is designed-in-shape, deferred-in-fact. **Ship without it, add
+> transparently when power actually matters.**
+
+It shipped *with* it. And the sentence that justified deferring it — "it slots in
+later with no API change" — is the one that turned out to be false in the way that
+mattered. It slotted in with no change of *signature*, which is what that sentence
+literally claimed, while changing the invalidation semantics and removing the
+consumer's choice of grain. Every regression in this document is downstream of a
+pool that the design doc said not to build yet.
+
+The useful generalisation, and the thing to check before doming the next thing:
+
+**Take the pools that have one right answer. Leave the ones that encode a policy.**
+
+- *Has this paragraph changed?* One right answer — its version. Safe to own.
+- *Which face covers this character?* One right answer. Safe to own, and owning it
+  is what fixed the fallback bug.
+- *Is this glyph rasterised at this size?* One right answer. Safe to own.
+- *At what grain should quads be cached, and when should they be thrown away?*
+  **Policy.** `unicode_zoom` wanted rows, compendium wanted nothing at all, and
+  both were right for their workload. Owning it meant picking for them.
+
+The atlas, the shaping cache and the layout cache are facts. Geometry is strategy.
+The API took a strategy and offered no way to override it — which is exactly why
+the fallout was unanticipated: nothing about the *signature* changed, so there was
+nothing to review.
 
 ---
 
