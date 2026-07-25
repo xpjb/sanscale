@@ -1032,36 +1032,13 @@ impl Text {
         let mut emoji_requests: Vec<(u16, u32, f32, f32)> = Vec::new();
         {
             let block = self.blocks[index].block.as_ref().expect("checked by caller");
-            for line in &block.layout.lines {
-                let top = at.y + line.metrics.top_em * size;
-                let bottom = top + line.metrics.height_em * size;
-                if clip.is_some_and(|clip| bottom < clip.y || top > clip.max_y()) {
-                    continue;
-                }
-                let baseline = at.y + line.metrics.baseline_em * size;
-                let origin_x = at.x + line.align_em * size;
-                for glyph in &line.glyphs {
-                    let pen_x = origin_x + glyph.x * size;
-                    let pen_y = baseline - glyph.y * size;
-                    if glyph.is_color {
-                        let outside = clip.is_some_and(|clip| {
-                            pen_y < clip.y
-                                || pen_y - size > clip.max_y()
-                                || pen_x + size < clip.x
-                                || pen_x > clip.max_x()
-                        });
-                        if !outside {
-                            emoji_requests.push((glyph.font_id, glyph.glyph_id, pen_x, pen_y));
-                        }
-                        continue;
-                    }
-                    let Some(info) = glyph.info else { continue };
-                    if clip.is_some_and(|clip| !glyph_intersects(&info, pen_x, pen_y, size, clip)) {
-                        continue;
-                    }
+            for_each_visible_glyph(&block.layout, at, size, clip, |glyph, pen_x, pen_y| {
+                if glyph.is_color {
+                    emoji_requests.push((glyph.font_id, glyph.glyph_id, pen_x, pen_y));
+                } else if let Some(info) = glyph.info {
                     push_glyph_quad_pixels(&mut text_verts, &info, pen_x, pen_y, size, color.0);
                 }
-            }
+            });
         }
 
         for (font_id, glyph_id, pen_x, pen_y) in emoji_requests {
@@ -1304,6 +1281,55 @@ fn chain_view<'a>(
         .unwrap_or_default()
 }
 
+/// Walk the glyphs of `layout` that survive `clip`, with their pen positions in
+/// the transform's source space.
+///
+/// Split out of `rebuild_geometry` so the cull is reachable without a device.
+/// It previously lived inline in the one function that needs a GPU to call, which
+/// is why the three clip tests the old engine had could not be carried over — and
+/// then the half of the clip contract that was never built went unnoticed for a
+/// release. Culling is pure geometry; it should not need a GPU to test.
+fn for_each_visible_glyph(
+    layout: &Layout,
+    at: Vec2,
+    size: f32,
+    clip: Option<Rect>,
+    mut f: impl FnMut(&ShapedGlyph, f32, f32),
+) {
+    for line in &layout.lines {
+        let top = at.y + line.metrics.top_em * size;
+        let bottom = top + line.metrics.height_em * size;
+        if clip.is_some_and(|clip| bottom < clip.y || top > clip.max_y()) {
+            continue;
+        }
+        let baseline = at.y + line.metrics.baseline_em * size;
+        let origin_x = at.x + line.align_em * size;
+        for glyph in &line.glyphs {
+            let pen_x = origin_x + glyph.x * size;
+            let pen_y = baseline - glyph.y * size;
+            if glyph.is_color {
+                // A colour glyph is a size x size box hanging from the baseline;
+                // it has no outline to measure, so the box is the bound.
+                let outside = clip.is_some_and(|clip| {
+                    pen_y < clip.y
+                        || pen_y - size > clip.max_y()
+                        || pen_x + size < clip.x
+                        || pen_x > clip.max_x()
+                });
+                if !outside {
+                    f(glyph, pen_x, pen_y);
+                }
+                continue;
+            }
+            let Some(info) = glyph.info else { continue };
+            if clip.is_some_and(|clip| !glyph_intersects(&info, pen_x, pen_y, size, clip)) {
+                continue;
+            }
+            f(glyph, pen_x, pen_y);
+        }
+    }
+}
+
 fn glyph_intersects(info: &GlyphInfo, pen_x: f32, pen_y: f32, size: f32, clip: Rect) -> bool {
     let (min_x, min_y, max_x, max_y) = info.bbox;
     let left = pen_x + min_x * size;
@@ -1522,6 +1548,146 @@ mod tests {
         let l = text.map_font(latin, 0).ok()?;
         let chain = text.register_chain(&[e, l]);
         Some((text, chain))
+    }
+
+    fn latin_chain() -> Option<(Text, FontChainHandle)> {
+        let latin = font(&["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"])?;
+        let mut text = Text::new();
+        let h = text.map_font(latin, 0).ok()?;
+        let chain = text.register_chain(&[h]);
+        Some((text, chain))
+    }
+
+    fn style_of(chain: FontChainHandle, wrap_em: Option<f32>) -> Style {
+        Style { chain, wrap_em, align: Align::Left, line_spacing: 1.0 }
+    }
+
+    /// Counts how often the service asks for a paragraph's bytes.
+    struct CountingSource<'a> {
+        text: &'a str,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ParagraphSource for CountingSource<'_> {
+        fn paragraph_text(&self, _index: usize, _key: ParagraphKey) -> Option<Cow<'_, str>> {
+            self.calls.set(self.calls.get() + 1);
+            Some(Cow::Borrowed(self.text))
+        }
+    }
+
+    /// Text is pulled from the consumer **only on a miss**.
+    ///
+    /// This is the escape-hatch contract that makes a 10k-paragraph document
+    /// affordable: for a body where nothing changed, the text is never
+    /// materialised. Restored from `engine.rs`, which the redesign deleted along
+    /// with the module.
+    #[test]
+    fn a_cache_hit_never_asks_for_the_text() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let style = style_of(chain, Some(12.0));
+        let key = ParagraphKey { namespace: 7, slot: 11, generation: 13 };
+        let src = CountingSource {
+            text: "cached paragraph should only ever be fetched once",
+            calls: std::cell::Cell::new(0),
+        };
+
+        assert!(text.shape(BlockKey(1), &style, &[key], &src).is_some());
+        assert_eq!(src.calls.get(), 1, "the first shape must fetch");
+
+        // Same block, same parts: the block-level comparison short-circuits.
+        text.shape(BlockKey(1), &style, &[key], &src);
+        assert_eq!(src.calls.get(), 1, "re-shaping an unchanged block must not fetch");
+
+        // A *different* block over the same paragraph: the block is new, so this
+        // reaches the paragraph pool — which must still hit.
+        text.shape(BlockKey(2), &style, &[key], &src);
+        assert_eq!(src.calls.get(), 1, "a paragraph-cache hit must not fetch");
+
+        // Bumping the generation is what invalidation looks like, and must fetch.
+        let edited = ParagraphKey { generation: 14, ..key };
+        text.shape(BlockKey(3), &style, &[edited], &src);
+        assert_eq!(src.calls.get(), 2, "a new generation must fetch");
+    }
+
+    /// Restored from `engine.rs`. `is_single_glyph` is what a grid consumer uses
+    /// to decide between drawing a sequence and drawing tofu.
+    #[test]
+    fn single_glyph_detection() {
+        let Some((text, chain)) = latin_chain() else {
+            return;
+        };
+        let d = text.diagnostics();
+        assert!(d.is_single_glyph(chain, "A"), "one letter is one glyph");
+        assert!(!d.is_single_glyph(chain, "AB"), "two letters shape to two glyphs");
+    }
+
+    fn visible_count(text: &Text, h: ShapedHandle, clip: Option<Rect>) -> usize {
+        let mut n = 0;
+        for_each_visible_glyph(text.measure(h), Vec2::new(0.0, 0.0), 16.0, clip, |_, _, _| n += 1);
+        n
+    }
+
+    /// The three clip tests `engine.rs` had, restored against the extracted cull.
+    /// `clip` culls on the CPU before anything is emitted — a scrolled body must
+    /// not emit every paragraph's quads and lean on the GPU to discard them.
+    ///
+    /// **What these do and do not guard**, checked by mutation rather than assumed:
+    /// deleting the per-glyph `glyph_intersects` test fails
+    /// `clip_culls_glyphs_outside_it_horizontally`. Deleting the *line-level* cull
+    /// fails nothing — the per-glyph test produces identical output without it, so
+    /// the line cull is a pure performance fast path with no observable effect.
+    /// Nothing here can guard it; only a benchmark can. Recorded so the next reader
+    /// does not infer coverage that is not here.
+    #[test]
+    fn clip_culls_lines_outside_it() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let style = style_of(chain, None);
+        let Some(h) = text.shape_transient(
+            "alpha bravo\ncharlie delta\necho foxtrot\ngolf hotel",
+            &style,
+        ) else {
+            return;
+        };
+        let all = visible_count(&text, h, None);
+        assert!(all > 0, "unclipped must emit something");
+
+        let first = text.measure(h).line(0).expect("a first line");
+        let one_line = Rect::new(0.0, 0.0, 10_000.0, first.height_em * 16.0 * 0.9);
+        let clipped = visible_count(&text, h, Some(one_line));
+        assert!(clipped > 0, "the first line is inside the clip");
+        assert!(clipped < all, "later lines must be culled, got {clipped} of {all}");
+    }
+
+    #[test]
+    fn clip_culls_glyphs_outside_it_horizontally() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let style = style_of(chain, None);
+        let Some(h) = text.shape_transient("the quick brown fox jumps over it", &style) else {
+            return;
+        };
+        let all = visible_count(&text, h, None);
+        let narrow = Rect::new(0.0, 0.0, 20.0, 10_000.0);
+        let clipped = visible_count(&text, h, Some(narrow));
+        assert!(clipped < all, "a narrow clip must drop trailing glyphs");
+    }
+
+    #[test]
+    fn a_clip_outside_the_block_emits_nothing() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let style = style_of(chain, None);
+        let Some(h) = text.shape_transient("alpha bravo charlie", &style) else {
+            return;
+        };
+        let far_away = Rect::new(50_000.0, 50_000.0, 100.0, 100.0);
+        assert_eq!(visible_count(&text, h, Some(far_away)), 0);
     }
 
     /// The family a diagnostic reports must be the family *shaping* actually
