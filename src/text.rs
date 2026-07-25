@@ -521,10 +521,11 @@ struct Block {
 /// uniform would reduce this to the clip alone.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GeomKey {
-    size: u32,
     color: [u32; 4],
-    /// Held **relative to `at`**, because the quads are too. An absolute clip
-    /// would reintroduce the position dependence this key exists without.
+    /// Normalised into the block's own space, `(clip - at) / size`, because the
+    /// quads are. An absolute clip would reintroduce exactly the position and
+    /// scale dependence this key exists without: under a camera move `at`, `size`
+    /// and the scissor all change together, and this ratio does not.
     clip: Option<[u32; 4]>,
 }
 
@@ -546,6 +547,12 @@ struct Geometry {
     /// cell was recycled and the cached quads may now point at another glyph —
     /// the invalidation the old public `emoji_epoch` made the *consumer* do.
     epoch: u64,
+    /// Raster bucket the color glyphs were baked against. Held here rather than
+    /// in [`GeomKey`] for the same reason as `epoch`: it is the one thing a size
+    /// change still decides, and it decides nothing for a block with no color
+    /// glyphs. Keying on it would rebuild every text block in the frame each time
+    /// a zoom crossed a bucket boundary, for nothing.
+    bucket: u32,
     text: Vec<TextVertex>,
     emoji: Vec<EmojiVertex>,
 }
@@ -942,26 +949,26 @@ impl Text {
             let Some(index) = self.block_index(item.block) else {
                 continue;
             };
+            let bucket = bucket_for(item.size);
             let key = GeomKey {
-                size: item.size.to_bits(),
                 color: item.color.0.map(f32::to_bits),
-                clip: item
-                    .clip
-                    .map(|c| [c.x - item.at.x, c.y - item.at.y, c.width, c.height].map(f32::to_bits)),
+                clip: normalized_clip(item).map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
             };
             // Fast path: one dense-array probe, then straight into the batch.
             if let Some(geom) = self.geometry[index].as_ref() {
                 // The epoch only matters if this block actually baked emoji UVs;
                 // an atlas eviction cannot disturb a text-only block, and
                 // invalidating those too rebuilds the whole frame for nothing.
-                if geom.key == key && (geom.emoji.is_empty() || geom.epoch == epoch) {
-                    place(&mut text_verts, &mut emoji_verts, geom, item.at);
+                let emoji_still_valid =
+                    geom.emoji.is_empty() || (geom.epoch == epoch && geom.bucket == bucket);
+                if geom.key == key && emoji_still_valid {
+                    place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
                     continue;
                 }
             }
-            self.rebuild_geometry(index, item, key, epoch);
+            self.rebuild_geometry(index, item, key, epoch, bucket);
             if let Some(geom) = self.geometry[index].as_ref() {
-                place(&mut text_verts, &mut emoji_verts, geom, item.at);
+                place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
             }
         }
 
@@ -1002,14 +1009,21 @@ impl Text {
 
     /// Build one block's quads into its geometry cache. CPU only — no device and
     /// no upload; `draw_batch` does that once for the whole batch.
-    fn rebuild_geometry(&mut self, index: usize, item: &Draw, key: GeomKey, epoch: u64) {
-        let (size, color) = (item.size, item.color);
-        // Bake at the origin and shift the clip to match, so the build depends on
-        // everything about this draw *except* where it lands.
+    fn rebuild_geometry(
+        &mut self,
+        index: usize,
+        item: &Draw,
+        key: GeomKey,
+        epoch: u64,
+        bucket: u32,
+    ) {
+        let color = item.color;
+        // Bake at the origin *and* at unit size, with the clip normalised to
+        // match, so the build depends on everything about this draw except where
+        // it lands and how big it is. `place` applies both on the way out.
         let at = Vec2::new(0.0, 0.0);
-        let clip = item
-            .clip
-            .map(|c| Rect::new(c.x - item.at.x, c.y - item.at.y, c.width, c.height));
+        let size = 1.0f32;
+        let clip = normalized_clip(item);
         let mut text_verts = Vec::new();
         let mut emoji_verts = Vec::new();
 
@@ -1050,7 +1064,6 @@ impl Text {
             }
         }
 
-        let bucket = bucket_for(size);
         for (font_id, glyph_id, pen_x, pen_y) in emoji_requests {
             let Some(font) = self.fonts.get(font_id as usize) else {
                 continue;
@@ -1068,6 +1081,7 @@ impl Text {
         self.geometry[index] = Some(Geometry {
             key,
             epoch,
+            bucket,
             text: text_verts,
             emoji: emoji_verts,
         });
@@ -1418,19 +1432,64 @@ impl Diagnostics<'_> {
 /// Concatenate one block's origin-baked quads into the batch, translated to
 /// `at`. The copy is a memcpy plus a linear add — orders of magnitude cheaper
 /// than the rebuild that baking `at` into the cache key would have forced.
-fn place(text: &mut Vec<TextVertex>, emoji: &mut Vec<EmojiVertex>, geom: &Geometry, at: Vec2) {
+fn place(
+    text: &mut Vec<TextVertex>,
+    emoji: &mut Vec<EmojiVertex>,
+    geom: &Geometry,
+    at: Vec2,
+    size: f32,
+) {
     let base = text.len();
     text.extend_from_slice(&geom.text);
     for v in &mut text[base..] {
-        v.pos[0] += at.x;
-        v.pos[1] += at.y;
+        v.pos[0] = v.pos[0] * size + at.x;
+        v.pos[1] = v.pos[1] * size + at.y;
     }
     if !geom.emoji.is_empty() {
         let base = emoji.len();
         emoji.extend_from_slice(&geom.emoji);
         for v in &mut emoji[base..] {
-            v.pos[0] += at.x;
-            v.pos[1] += at.y;
+            v.pos[0] = v.pos[0] * size + at.x;
+            v.pos[1] = v.pos[1] * size + at.y;
         }
     }
+}
+
+/// Grid the normalised clip snaps to, in em. Coarse enough to absorb rounding,
+/// far finer than a glyph.
+const CLIP_QUANTUM: f32 = 1.0 / 16.0;
+
+/// A draw's clip in the block's own space: origin at the block's top-left, one
+/// unit per em. This is the form that survives a camera move.
+///
+/// **Quantised outward, and it has to be.** `(clip - at) / size` is invariant
+/// under a camera move only *analytically*: recomputed from a different zoom each
+/// frame it lands a few ulps away, and a key compared by exact bits then misses
+/// every single frame — which is precisely the bug this key was introduced to
+/// fix, reintroduced one level down. Snapping to a power-of-two grid makes the
+/// bits stable. Rounding *outward* keeps it safe: the clip only culls, so a
+/// fractionally generous one emits a few extra quads the consumer's scissor
+/// discards, where a tight one could clip a glyph that belonged on screen.
+fn normalized_clip(item: &Draw) -> Option<Rect> {
+    let q = CLIP_QUANTUM as f64;
+    let inv = 1.0 / item.size as f64;
+    // Nudge off the grid line before rounding. A clip that lands *exactly* on a
+    // multiple of the quantum — the common case, since consumers use round
+    // numbers — otherwise has `floor` flipping between two cells on a 1-ulp
+    // wobble, which defeats the quantisation entirely. Both nudges push outward,
+    // so the clip stays conservative.
+    let bias = 1e-3;
+    let snap_down = |v: f64| ((v * inv / q) - bias).floor() * q;
+    let snap_up = |v: f64| ((v * inv / q) + bias).ceil() * q;
+    item.clip.map(|c| {
+        // Widen in f64: `clip - at` is a difference of similar magnitudes once the
+        // camera is far from the origin, and doing it in f32 loses the precision
+        // the ratio depends on.
+        let (ax, ay) = (item.at.x as f64, item.at.y as f64);
+        let x0 = snap_down(c.x as f64 - ax);
+        let y0 = snap_down(c.y as f64 - ay);
+        let x1 = snap_up((c.x + c.width) as f64 - ax);
+        let y1 = snap_up((c.y + c.height) as f64 - ay);
+        Rect::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
+    })
 }
