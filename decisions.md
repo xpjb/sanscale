@@ -21,15 +21,24 @@ first; everything below assumes it.
    font.
 4. **Line** — what flow emits. One paragraph produces 1..N.
 5. **Paragraph** — the unit of **invalidation**. The consumer owns its identity and
-   version (`ParagraphKey`); it is flowed independently and cached at
-   `(ParagraphKey, Style)`, which is why an edit reshapes one paragraph and not the
+   version (`ParagraphKey`); it is shaped and reflowed independently and cached at
+   `(ParagraphKey, Style)`, which is why an edit costs one paragraph and not the
    document.
 6. **Block** — the unit of **coordinate space**. 1..N paragraphs at one `Style`,
-   concatenated — *not* reflowed — into one byte range, one line list, one `Layout`.
-   `BlockKey` names it; `ShapedHandle` resolves it. The reason it exists is that its
-   paragraphs want to be **measured together**: one hit-test, one caret space, a
-   selection that spans paragraph boundaries. Sharing a `Style` (so they would
-   reflow together if it changed) is a consequence, not the point.
+   concatenated into one byte range, one line list, one `Layout`. `BlockKey` names
+   it; `ShapedHandle` resolves it. The reason it exists is that its paragraphs want
+   to be **measured together**: one hit-test, one caret space, a selection that
+   spans paragraph boundaries.
+
+   Note what it is *not*: a reflow unit. Its paragraphs share reflow *inputs* — one
+   `Style`, so one `wrap_em`, so a wrap change reflows all of them — but not the
+   reflow *computation*, which runs per paragraph and caches per paragraph. Going
+   greedy → Knuth-Plass does not change that, since Knuth-Plass optimises badness
+   *within* a paragraph. **What would** is cross-paragraph breaking:
+   widow/orphan control, keep-with-next, column or page breaks. Those cannot be
+   decided one paragraph at a time, and the day one arrives `assemble` stops being
+   concatenation and becomes a real block-level flow. That is the live constraint on
+   this noun.
 7. **Glyph** — a rasterized atlas cell. Keyed `(face, glyph_id)` for text,
    `(face, glyph_id, bucket)` for emoji. Distinct from a *run*: rasterization and
    shaping are different arrows in the pipeline.
@@ -455,7 +464,12 @@ worth litigating, just parked.
 - **Line breaking: greedy now, Knuth-Plass / justification later.** Reflow is cheap precisely
   because it's greedy first-fit over already-shaped glyph advances — no reshape. A future
   optimal-breaking or justified pass is a pure swap of the Level-2 flow step; same inputs
-  (glyph runs + `wrap_em`), same outputs (lines), no surface change.
+  (glyph runs + `wrap_em`), same outputs (lines), no surface change. It stays *per
+  paragraph* either way — Knuth-Plass optimises badness within a paragraph, so the
+  per-paragraph flow cache survives it untouched. The thing that would not survive is
+  **cross-paragraph** breaking (widow/orphan, keep-with-next, column/page breaks): that
+  makes reflow block-level and turns `assemble` from concatenation into a real flow.
+  Worth keeping apart from this item, because they read as the same feature and aren't.
 
 - **Chunked (intra-run) shaping.** The *build* is parked here; its one live constraint —
   keeping a run's shaped value segment-structured, not an opaque blob — stays in litigation so
