@@ -152,9 +152,12 @@ impl Text {
 
     // wgpu passed in directly (no bundle). `at`/`size` are in the transform's source space —
     // screen pixels under `pixel_ortho`, world units under an MVP. `size` scales em→space and
-    // picks the emoji raster bucket. `clip` (same space) culls on the CPU *and*, when the
-    // transform is a pixel ortho, sets the scissor. shape/measure don't take wgpu, so leaving
-    // draw uncalled = device-free.
+    // picks the emoji raster bucket. `clip` (same space) culls whole lines and glyphs on the
+    // CPU — it does **not** set a scissor (the crate contains no scissor call), so cutting a
+    // glyph that straddles the boundary is still the consumer's, via its own scissor. That is
+    // also what caps a consumer's batch size at one when its items have differing clips; see
+    // `rfc-batch-cache.md`. shape/measure don't take wgpu, so leaving draw uncalled =
+    // device-free.
     fn draw(&mut self, device: &Device, queue: &Queue, pass: &mut RenderPass,
             h: ShapedHandle, at: Vec2, size: f32, color: Color, clip: Option<Rect>);
 }
@@ -207,10 +210,21 @@ Things we're certain about, and why.
   a unit vector through the transform (Slug glyphs need no bucket at all). Genuine 3D would also
   want depth state on the pipeline — `set_target` grows a `depth_format` — noted, not built.
 
-- **`clip` culls, it doesn't just scissor.** One `Rect` on `draw` does both: drop whole lines and
-  individual glyphs on the CPU before emitting (what `intersects_y` / `intersects_glyph` do
-  today), then set the scissor for the remainder. A scrolled 10k-paragraph body must not emit
+- **`clip` culls, it doesn't just scissor.** One `Rect` on `draw` drops whole lines and
+  individual glyphs on the CPU before emitting. A scrolled 10k-paragraph body must not emit
   10k paragraphs' quads and lean on the GPU to throw them away.
+
+  **Half-built, and the missing half has a cost.** This lock also said `draw` would "set the
+  scissor for the remainder". It does not — the crate contains **no** scissor call anywhere.
+  Only the CPU cull exists, so cutting a glyph that *straddles* the clip boundary is still the
+  consumer's job via its own `set_scissor_rect`. compendium does exactly that, before and after
+  the migration alike (7 call sites in both).
+  The consequence is not cosmetic: a scissor is *pass state*, so one draw call carries one
+  scissor, so items with differing clips can never share a draw call. compendium's title and
+  body have different clips, which caps its batch size at **one** — structurally, no matter how
+  batching is cached. Moving the cut into the fragment shader as a per-block clip rect is what
+  lifts that; see `rfc-batch-cache.md`. Recorded here because the design reads as though
+  clipping is handled end-to-end, which is why batching looks like it should already work.
 
 - **Scrolling is `at.y`.** Scroll offset is subtracted from the draw position; `clip` does the
   rest. The block stores its paragraphs' cumulative line offsets, so `draw` binary-searches the
