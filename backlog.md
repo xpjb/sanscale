@@ -57,42 +57,16 @@ correctness bug is fixed — but the shape is unresolved.
 
 ---
 
-## Geometry lives on the CPU as a `Vec` per block
+## Geometry storage and batch grain → see `rfc-batch-cache.md`
 
-See the note in `decisions.md` on why it is CPU-side and batched rather than one
-GPU buffer per block: per-block buffers and draw calls measured 267 ms on a 41k
-block frame against 6.5 ms batched. That reasoning still holds and is not in
-question.
+Moved out. The short version: each block owns two independently heap-allocated
+`Vec`s, so `draw_batch` chases a pointer per block and re-concatenates 41k of them
+every frame — 2.04 ms of a 4.2 ms frame at `unicode_zoom`'s density, and roughly
+nothing for a consumer drawing hundreds of items.
 
-What is now open is the *storage*, which is a separate question from the batching.
-Each block owns two independently heap-allocated `Vec`s, so `draw_batch` chases a
-pointer per block into 41k scattered allocations and re-concatenates all of them
-every frame. Measured at 2.04 ms of a 4.2 ms frame at 41 472 blocks — and roughly
-nothing for a consumer drawing hundreds of items, which is why it is parked rather
-than fixed.
+It turned into a design question rather than a backlog item once it became clear
+the regression is *who chooses the grain*, and that a batch unit is pinned by
+sharing a scissor and a z-slot. The RFC carries the prior art, the constraint, why
+compendium can't batch today, and the proposed order of work.
 
-Two steps, in increasing order of ambition:
-
-1. **Arena + ranges.** One `Vec<TextVertex>` and one `Vec<EmojiVertex>`, with
-   `Geometry` holding `Range<u32>` into each. Halves the metadata array (so the
-   per-block probe touches fewer cache lines — the guaranteed win, since that
-   access is dense) and makes the payload one allocation. Reuse is nearly free
-   because a rebuild almost never changes the vertex *count*: rebuilds fire on
-   color/clip/bucket changes, and a text change goes through `shape()`, which
-   discards the geometry anyway. So: same length, overwrite in place; different
-   length, size-classed free list that is rarely touched.
-
-2. **Make the cache GPU-resident.** The vertex data is now frame-invariant —
-   `at` and `size` came out of `GeomKey` and are applied as an affine transform
-   during concatenation — so it no longer *has* to be rebuilt when the camera
-   moves. That was the constraint that forced host-side staging in the first
-   place. With a block id on each vertex indexing a per-block transform buffer,
-   the vertices could be uploaded once per geometry change and never again, and a
-   camera move would touch a small transform array (~16 B/block) instead of the
-   full vertex stream (~336 B/block). That removes the per-frame gather *and* most
-   of the upload, not just the allocation.
-
-Step 2 changes the vertex format and both shaders, so it is a major-version shape,
-not a cleanup. Step 1 is self-contained. Neither is worth doing on the strength of
-the argument alone — the last three predictions in this area were wrong until
-measured, so measure first.
+---
