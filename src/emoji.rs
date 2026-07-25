@@ -32,10 +32,11 @@ pub const EMOJI_ATLAS_WIDTH: u32 = 2048;
 const SIZE_BUCKETS: [u32; 4] = [32, 64, 128, 256];
 const ATLAS_PAD: u32 = 2;
 
-/// Default cap on atlas height. Kept ≤ the wgpu default `max_texture_dimension_2d`
-/// (8192) so the atlas can never silently overflow even on a default-limits device;
-/// callers with a known device limit raise it via
-/// [`TextEngine::set_emoji_atlas_max_height`](crate::TextEngine::set_emoji_atlas_max_height).
+/// Default cap on atlas height, in force until a device is known. Kept ≤ the wgpu
+/// default `max_texture_dimension_2d` (8192) so the atlas can never silently
+/// overflow even on a default-limits device; once `Text` builds its GPU resources
+/// it replaces this with the device's real `max_texture_dimension_2d` via
+/// [`EmojiCache::set_max_height`].
 pub(crate) const DEFAULT_EMOJI_ATLAS_MAX_HEIGHT: u32 = 4096;
 
 /// Bucket (raster resolution) for an on-screen pixel size.

@@ -33,25 +33,36 @@ sanscale = { git = "https://github.com/xpjb/sanscale" }
 ## Quick start
 
 ```rust
-use sanscale::{TextArgs, TextEngine, TextRenderer};
+use sanscale::{Align, BlockKey, Color, ParagraphKey, Paragraphs, Style, Text, Vec2};
 
-// 1. Load a font (from a path, bytes, or an ordered fallback chain).
-let mut engine = TextEngine::load("/path/to/font.ttf")?;
+// 1. One service holds every pool, every cache, and (lazily) the GPU resources.
+//    You hold `Copy` handles into it.
+let mut text = Text::new();
+let font = text.map_font(sanscale::read_font_file("/path/to/font.ttf")?, 0)?;
+let chain = text.register_chain(&[font]);   // ordered fallback chain
 
-// 2. Create the pipeline and a GPU glyph atlas.
-let renderer = TextRenderer::new(&device, &surface_config);
-let mut atlas = engine.new_atlas(&device, &queue, &renderer.atlas_layout);
+// 2. Shape a block. A style carries no pixel size and no color, so the layout
+//    cache is zoom-invariant; a paragraph key carries your own version, so an
+//    edit reshapes the paragraph you touched and nothing else.
+let style = Style { chain, wrap_em: Some(20.0), align: Align::Left, line_spacing: 1.2 };
+let key = ParagraphKey { namespace: 0, slot: 0, generation: 0 };
+let block = text
+    .shape(BlockKey(0), &style, &[key], &Paragraphs(&["Hello, sanscale!"]))
+    .expect("shaped");
 
-// 3. Each frame: queue text, upload any newly-cached glyphs, flush vertices.
-let args = TextArgs { size_px: 32.0, ..Default::default() };
-engine.text(40.0, 80.0, "Hello, sanscale!", &args);      // pixel baseline
-engine.sync_atlas(&mut atlas, &device, &queue, &renderer.atlas_layout);
-let vertices = engine.flush();
+// 3. Measure, hit-test and lay out with no GPU in sight. Geometry is em —
+//    multiply by the size you will draw at.
+let height_px = text.measure(block).height_em() * 32.0;
 
-// 4. Draw with a pixel-space orthographic matrix (0,0 = top-left).
-let buffer = TextRenderer::build_vertices(&device, vertices);
-renderer.render(&queue, &mut encoder, &view, &atlas, &buffer,
-    vertices.len() as u32, ortho, (width, height), Some(wgpu::Color::WHITE));
+// 4. Once per target format, then once per pass. Screen space is `pixel_ortho`
+//    (0,0 = top-left); world or 3D text is an MVP through the same call.
+text.set_target(&device, surface_format);
+text.set_transform(&queue, Text::pixel_ortho(width, height));
+
+// 5. Draw into a render pass you own. Size and color enter here, not at shape
+//    time; `draw_batch` takes a `&[Draw]` for many blocks in one go.
+text.draw(&device, &queue, &mut pass, block, Vec2::new(40.0, 80.0), 32.0,
+    Color([0.10, 0.11, 0.13, 1.0]), None);
 ```
 
 ## Examples
@@ -76,35 +87,39 @@ atlas, is the one thing that pixelates when magnified.)
 ## Status
 
 Extracted from a shipping infinite-canvas app, where it renders live editable
-text across a zooming viewport. The public API in `engine` is the stable
-surface; the pipeline internals may change. Not yet published to crates.io —
+text across a zooming viewport. The crate-root re-exports (the `Text` service and
+its handles) are the stable surface; the pipeline internals may change. Not yet
+published to crates.io —
 depend on it via git.
 
 ## Pipeline
 
 ```
-font bytes ──► shape (rustybuzz) ──► outlines ──► bands ──► GlyphCache ──► TextAtlas (GPU)
-   FontSet        layout.rs           outline.rs   bands.rs    cache.rs        renderer.rs
-                                                                                   │
-   text() / layout() build PushedGlyphs ──► flush() emits TextVertex ──► shader ◄──┘
-                         engine.rs                    vertex.rs        shaders/*.wgsl
+font bytes ──► itemize + shape ──► flow into lines ──► outlines ──► bands ──► GlyphCache ──► TextAtlas (GPU)
+   font.rs      layout.rs           flow.rs             outline.rs   bands.rs    cache.rs       renderer.rs
+  (rustybuzz)                                                                                        │
+   shape() caches a block ──► draw() / draw_batch() emit TextVertex ──► shader ◄─────────────────────┘
+            text.rs                       vertex.rs                  shaders/*.wgsl
 ```
 
-The engine is the surface; everything else is internal. `TextEngine::text*`
-queues glyphs, `flush()` returns vertices, and `sync_atlas()` uploads any newly
-cached glyphs before drawing.
+`Text` is the surface; everything else is internal. `shape()` caches a block's
+em-space layout, `measure()` and the caret/selection queries read it without
+touching a device, and `draw()` (or `draw_batch()`) rasterizes any newly needed
+glyphs into the atlas and records quads into your pass.
 
 | Module | Role |
 |---|---|
-| `engine` | Public API: layout, wrapping, caret/selection geometry, per-frame glyph buffer |
+| `text` | Public API (re-exported at the crate root): the `Text` service, handles, shaping, caret/selection geometry, draw |
 | `font` | Face loading + fallback chain; metrics |
 | `layout` | Itemization (script/face runs) and shaping into positioned glyphs |
+| `flow` | Line breaking over shaped advances; caret stops. Em-space, so reflow never reshapes |
 | `outline` | Glyph outlines as quadratic Bézier contours |
 | `bands` | Band division + curve sorting → per-glyph `BandData` (Slug layout) |
 | `cache` | Packs `BandData` into the shared curve/band atlas; assigns `GlyphInfo` |
 | `renderer` | wgpu pipelines, atlas textures, incremental upload, draw |
 | `vertex` | Vertex format + quad generation |
 | `emoji` | Color-glyph rasterization + atlas |
+| `emoji_presentation` | Generated `Emoji_Presentation` ranges — which code points default to color |
 | `shaders/` | WGSL: Slug coverage (`pixel.wgsl`), quad transform (`vertex.wgsl`), emoji |
 
 ## The Slug atlas invariant

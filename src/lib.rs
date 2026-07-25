@@ -60,7 +60,7 @@
 //!
 //! # Compatibility
 //!
-//! - **wgpu 29** — [`Text::draw`] borrows `wgpu::Device`, `Queue` and
+//! - **wgpu 30** — [`Text::draw`] borrows `wgpu::Device`, `Queue` and
 //!   `RenderPass` directly, so your application must use the same wgpu major
 //!   version. Bumping it here is a breaking change.
 //! - **MSRV: Rust 1.82.**
