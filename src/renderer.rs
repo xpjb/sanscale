@@ -32,39 +32,25 @@ pub struct TextAtlas {
 }
 
 impl TextAtlas {
-    pub(crate) fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        layout: &wgpu::BindGroupLayout,
-        cache: &GlyphCache,
-    ) -> Self {
-        let (curve_width, curve_height) = cache.curve_size();
-        let (band_width, band_height) = cache.band_size();
-        let curve_capacity_height = grow_texture_height(curve_height);
-        let band_capacity_height = grow_texture_height(band_height);
-        let (curve_tex, band_tex, bind_group) = create_atlas_resources(
-            device,
-            layout,
-            curve_width,
-            curve_capacity_height,
-            band_width,
-            band_capacity_height,
-        );
-        let mut atlas = Self {
+
+    /// A minimal atlas with no glyphs yet. The service creates this when it first
+    /// learns a target format — before any text exists — and the first `sync`
+    /// sizes it to whatever the glyph cache actually holds.
+    pub(crate) fn empty(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> Self {
+        let (curve_tex, band_tex, bind_group) = create_atlas_resources(device, layout, 1, 1, 1, 1);
+        Self {
             curve_tex,
             band_tex,
             bind_group,
-            curve_width,
-            curve_capacity_height,
-            band_width,
-            band_capacity_height,
+            curve_width: 1,
+            curve_capacity_height: 1,
+            band_width: 1,
+            band_capacity_height: 1,
             uploaded_curve_len: 0,
             uploaded_band_len: 0,
-            synced_revision: 0,
-        };
-        atlas.upload_full(queue, cache);
-        atlas.synced_revision = cache.revision();
-        atlas
+            // Forces the first sync to run, whatever the cache's revision is.
+            synced_revision: u64::MAX,
+        }
     }
 
     pub(crate) fn sync(
@@ -250,7 +236,9 @@ pub struct TextRenderer {
 }
 
 impl TextRenderer {
-    pub fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
+    /// A pipeline for one target format. The service builds one per format it is
+    /// asked to draw into; there is no surface and no configuration here.
+    pub(crate) fn for_format(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -365,7 +353,7 @@ impl TextRenderer {
                 module: &frag,
                 entry_point: Some("main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -390,7 +378,7 @@ impl TextRenderer {
     }
 
     /// Build a vertex buffer from a vertex slice.
-    pub fn build_vertices(device: &wgpu::Device, vertices: &[TextVertex]) -> wgpu::Buffer {
+    pub(crate) fn build_vertices(device: &wgpu::Device, vertices: &[TextVertex]) -> wgpu::Buffer {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("text vertex buffer"),
             contents: bytemuck::cast_slice(vertices),
@@ -398,18 +386,22 @@ impl TextRenderer {
         })
     }
 
-    pub fn write_matrix(&self, queue: &wgpu::Queue, matrix: Mat4) {
+    pub(crate) fn write_matrix(&self, queue: &wgpu::Queue, matrix: Mat4) {
         let params = Params {
             matrix: matrix.to_cols_array_2d(),
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&params));
     }
 
-    pub fn draw_vertices<'a>(
-        &'a self,
-        pass: &mut wgpu::RenderPass<'a>,
-        atlas: &'a TextAtlas,
-        vertex_buffer: &'a wgpu::Buffer,
+    /// Record a text draw. Nothing here needs to outlive the call: wgpu
+    /// ref-counts resources bound into a pass, so a vertex buffer built for this
+    /// draw alone can be dropped immediately. (The old signature tied every
+    /// argument to the pass lifetime — a holdover from when wgpu borrowed them.)
+    pub(crate) fn draw_vertices(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        atlas: &TextAtlas,
+        vertex_buffer: &wgpu::Buffer,
         vertices: Range<u32>,
     ) {
         if vertices.is_empty() {
@@ -420,46 +412,6 @@ impl TextRenderer {
         pass.set_bind_group(1, &atlas.bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.draw(vertices, 0..1);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn render(
-        &self,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        view: &wgpu::TextureView,
-        atlas: &TextAtlas,
-        vertex_buffer: &wgpu::Buffer,
-        vertex_count: u32,
-        matrix: Mat4,
-        _viewport: (u32, u32),
-        clear: Option<wgpu::Color>,
-    ) {
-        self.write_matrix(queue, matrix);
-
-        let load_op = match clear {
-            Some(c) => wgpu::LoadOp::Clear(c),
-            None => wgpu::LoadOp::Load,
-        };
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("text render pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: load_op,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        if vertex_count > 0 {
-            self.draw_vertices(&mut rpass, atlas, vertex_buffer, 0..vertex_count);
-        }
     }
 }
 
@@ -577,28 +529,24 @@ pub struct EmojiAtlas {
 }
 
 impl EmojiAtlas {
-    pub(crate) fn new(
+
+    /// An emoji atlas at the cache's fixed width with no rows uploaded yet; the
+    /// first `sync` fills it.
+    pub(crate) fn empty(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
         cache: &EmojiCache,
     ) -> Self {
-        let width = cache.size().0;
-        let real_height = data_height(cache, width);
-        let capacity_height = grow_texture_height(real_height.max(1));
-        let (texture, sampler, bind_group) =
-            create_emoji_resources(device, layout, width, capacity_height);
-        let atlas = Self {
+        let width = cache.size().0.max(1);
+        let (texture, sampler, bind_group) = create_emoji_resources(device, layout, width, 1);
+        Self {
             texture,
             sampler,
             bind_group,
             width,
-            capacity_height,
-            synced_revision: cache.revision(),
-        };
-        upload_emoji_rows(queue, &atlas.texture, width, 0, real_height, cache.pixels());
-        cache.take_dirty(); // consumed by the full upload above
-        atlas
+            capacity_height: 1,
+            synced_revision: u64::MAX,
+        }
     }
 
     pub(crate) fn sync(
@@ -660,7 +608,9 @@ pub struct EmojiRenderer {
 }
 
 impl EmojiRenderer {
-    pub fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
+    /// A pipeline for one target format. The service builds one per format it is
+    /// asked to draw into; there is no surface and no configuration here.
+    pub(crate) fn for_format(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -756,7 +706,7 @@ impl EmojiRenderer {
                 module: &frag,
                 entry_point: Some("main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format,
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent {
                             src_factor: wgpu::BlendFactor::One,
@@ -791,7 +741,7 @@ impl EmojiRenderer {
         }
     }
 
-    pub fn build_vertices(device: &wgpu::Device, vertices: &[EmojiVertex]) -> wgpu::Buffer {
+    pub(crate) fn build_vertices(device: &wgpu::Device, vertices: &[EmojiVertex]) -> wgpu::Buffer {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("emoji vertex buffer"),
             contents: bytemuck::cast_slice(vertices),
@@ -799,7 +749,7 @@ impl EmojiRenderer {
         })
     }
 
-    pub fn write_matrix(&self, queue: &wgpu::Queue, matrix: Mat4) {
+    pub(crate) fn write_matrix(&self, queue: &wgpu::Queue, matrix: Mat4) {
         let params = Params {
             matrix: matrix.to_cols_array_2d(),
         };
@@ -807,11 +757,11 @@ impl EmojiRenderer {
     }
 
     /// Draw emoji quads into an existing render pass (call after the text pass).
-    pub fn draw<'a>(
-        &'a self,
-        pass: &mut wgpu::RenderPass<'a>,
-        atlas: &'a EmojiAtlas,
-        vertex_buffer: &'a wgpu::Buffer,
+    pub(crate) fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        atlas: &EmojiAtlas,
+        vertex_buffer: &wgpu::Buffer,
         vertices: Range<u32>,
     ) {
         if vertices.is_empty() {

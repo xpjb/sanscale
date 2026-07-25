@@ -4,28 +4,8 @@
 
 #![allow(dead_code)] // each example uses a different subset of these helpers.
 
-pub mod emoji_data;
+use sanscale::{FontChainHandle, FontData, Text};
 
-/// What's under the cursor in the zoomable examples: a human-readable `label` for
-/// the debug line, the `text` to copy on left-click, and the `code` (code points)
-/// to copy on right-click.
-pub struct Hover {
-    pub label: String,
-    pub text: String,
-    pub code: String,
-}
-
-/// Copy `s` to the system clipboard (best-effort; ignores failures).
-pub fn copy_to_clipboard(s: &str) {
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(s);
-    }
-}
-
-use glam::Mat4;
-use sanscale::{EmojiAtlas, EmojiRenderer, FontSource, TextAtlas, TextRenderer, TextVertex};
-
-// Common system fonts, tried in order so the single-font examples run anywhere.
 pub const FONT_CANDIDATES: &[&str] = &[
     "C:/Windows/Fonts/segoeui.ttf",
     "C:/Windows/Fonts/arial.ttf",
@@ -62,33 +42,39 @@ pub const UNICODE_FALLBACK: &[&str] = &[
     "Segoe UI Symbol", "Noto Sans Symbols 2", "Cambria Math", "Segoe UI Historic", "Sylfaen",
 ];
 
-/// Resolve family names (or explicit file paths) into loadable font sources via
-/// fontdb. Mirrors how a real app builds its fallback chain.
-pub fn font_chain(families: &[&str]) -> Vec<FontSource<'static>> {
+/// Resolve family names (or explicit file paths) into a registered fallback
+/// chain. Mirrors how a real app does it: **one** long-lived `Database`, and
+/// `make_shared_face_data` so a face used by two chains is the same `Arc` and
+/// the service dedups it into one font and one glyph cache.
+pub fn font_chain(text: &mut Text, families: &[&str]) -> FontChainHandle {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
-    let mut sources = Vec::new();
+    let mut handles = Vec::new();
     for name in families {
-        if name.contains(['/', '\\']) || name.ends_with(".ttf") || name.ends_with(".ttc") {
-            if let Ok(bytes) = std::fs::read(name) {
-                sources.push(FontSource::Bytes(bytes, 0));
-            }
-            continue;
-        }
-        let families = [fontdb::Family::Name(name)];
-        let query = fontdb::Query {
-            families: &families,
-            ..Default::default()
+        let is_path = name.contains('/')
+            || name.contains(std::path::MAIN_SEPARATOR)
+            || name.ends_with(".ttf")
+            || name.ends_with(".ttc");
+        let shared: Option<(FontData, u32)> = if is_path {
+            sanscale::read_font_file(name).ok().map(|data| (data, 0))
+        } else {
+            let families = [fontdb::Family::Name(name)];
+            let query = fontdb::Query {
+                families: &families,
+                ..Default::default()
+            };
+            // SAFETY: fontdb mmaps the file; the process must not have the font
+            // replaced underneath it. The same contract every mmap font stack takes.
+            db.query(&query)
+                .and_then(|id| unsafe { db.make_shared_face_data(id) })
         };
-        if let Some(id) = db.query(&query) {
-            if let Some(src) =
-                db.with_face_data(id, |data, index| FontSource::Bytes(data.to_vec(), index))
-            {
-                sources.push(src);
+        if let Some((data, index)) = shared {
+            if let Ok(handle) = text.map_font(data, index) {
+                handles.push(handle);
             }
         }
     }
-    sources
+    text.register_chain(&handles)
 }
 
 /// Labelled multilingual samples, shared by the Unicode examples.
@@ -155,68 +141,28 @@ impl Harness {
         (target, view)
     }
 
-    fn matrix(&self) -> Mat4 {
-        Mat4::orthographic_rh(
-            0.0,
-            self.config.width as f32,
-            self.config.height as f32,
-            0.0,
-            -1.0,
-            1.0,
-        )
-    }
-
-    /// Draw a flushed text vertex slice to a PNG (no emoji).
+    /// Render one frame through the service and write it to a PNG.
+    ///
+    /// The service owns its atlases and pipelines, so the harness only supplies
+    /// a pass — exactly the seam a real consumer sits on.
     pub fn save_png(
         &self,
-        renderer: &TextRenderer,
-        atlas: &TextAtlas,
-        vertices: &[TextVertex],
+        text: &mut Text,
         clear: wgpu::Color,
         path: &str,
+        draw: impl FnOnce(&mut Text, &wgpu::Device, &wgpu::Queue, &mut wgpu::RenderPass<'_>),
     ) {
         let (target, view) = self.offscreen();
-        let buffer = TextRenderer::build_vertices(&self.device, vertices);
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        renderer.render(
+        text.set_target(&self.device, self.config.format);
+        text.set_transform(
             &self.queue,
-            &mut encoder,
-            &view,
-            atlas,
-            &buffer,
-            vertices.len() as u32,
-            self.matrix(),
-            (self.config.width, self.config.height),
-            Some(clear),
+            Text::pixel_ortho(self.config.width, self.config.height),
         );
-        self.queue.submit([encoder.finish()]);
-        self.write_png(&target, path);
-    }
-
-    /// Draw text and color-emoji vertices in one pass (emoji over text), to a PNG.
-    #[allow(clippy::too_many_arguments)]
-    pub fn save_png_with_emoji(
-        &self,
-        text_renderer: &TextRenderer,
-        text_atlas: &TextAtlas,
-        text_vertices: &[TextVertex],
-        emoji_renderer: &EmojiRenderer,
-        emoji_atlas: &EmojiAtlas,
-        emoji_vertices: &[sanscale::EmojiVertex],
-        clear: wgpu::Color,
-        path: &str,
-    ) {
-        let (target, view) = self.offscreen();
-        let matrix = self.matrix();
-        text_renderer.write_matrix(&self.queue, matrix);
-        emoji_renderer.write_matrix(&self.queue, matrix);
-        let text_buf = TextRenderer::build_vertices(&self.device, text_vertices);
-        let emoji_buf = EmojiRenderer::build_vertices(&self.device, emoji_vertices);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("text+emoji"),
+                label: Some("text"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -231,8 +177,7 @@ impl Harness {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            text_renderer.draw_vertices(&mut pass, text_atlas, &text_buf, 0..text_vertices.len() as u32);
-            emoji_renderer.draw(&mut pass, emoji_atlas, &emoji_buf, 0..emoji_vertices.len() as u32);
+            draw(text, &self.device, &self.queue, &mut pass);
         }
         self.queue.submit([encoder.finish()]);
         self.write_png(&target, path);

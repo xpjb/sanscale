@@ -508,6 +508,39 @@ Two things the port added to the API that were not in the sketch:
 
 ---
 
+# Implementation notes (the surface is now real)
+
+`src/text.rs` is the implementation, not a skeleton: `lib.rs` exposes only it, the old
+`TextEngine` surface is deleted, and the three headless examples render through it.
+
+Learned while building it:
+- **Per-draw vertex buffers are correct and simple.** wgpu 29's
+  `RenderPass::set_vertex_buffer` takes a `BufferSlice<'_>` with *no* lifetime tie —
+  resources bound into a pass are ref-counted internally. So each `draw` builds its own
+  buffer, binds it and drops it. That removes the shared-region clobber hazard entirely
+  rather than managing around it, and it means the old `draw_vertices<'a>(&'a self, pass:
+  &mut RenderPass<'a>, …, &'a Buffer)` signature was over-constrained — a holdover from
+  when wgpu borrowed its resources. The geometry pool remains the optimization that
+  removes the per-draw allocation, exactly as designed.
+- **Glyphs must carry the *global* font id, not the chain position.** Otherwise two chains
+  sharing a face key into two glyph-cache entries and the dedup buys nothing. `ShapedGlyph`
+  carries `font_id`; the chain is a borrow of `(id, &Font)` pairs out of the pool.
+- **`Layout::from_lines` and `diagnostics()` are load-bearing, not conveniences.** Without
+  the first, an editor's caret logic is untestable; without the second, a consumer can't
+  diagnose tofu. Both came out of the migration, not the design.
+- **Line flow assumes LTR visual order.** `wrap` takes a token's extent from its first and
+  last glyph by cluster, which for an RTL run gives a negative width and pushes the line
+  left of its origin — visible as Arabic and Hebrew rendering off the left edge in the
+  `unicode` example. This is inherited unchanged from the old engine, not new, and it is
+  the concrete symptom of the parked bidi item: bidi needs reordering *before* flow, not a
+  patch inside it.
+
+Still stubbed, deliberately: the Level-1 run cache (pool 5) is not built — shaping caches
+per paragraph, as it did before. It slots under `ensure_paragraph` without touching the
+surface.
+
+---
+
 # Implications for consumers
 
 ## compendium (the real one)

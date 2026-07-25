@@ -1,5 +1,10 @@
-//! Text shaping and layout. Itemizes text into per-face runs (font fallback),
-//! shapes each run with rustybuzz, and flattens to a `ShapedRun`.
+//! Text shaping. Itemizes text into per-face runs (font fallback), shapes each
+//! run with rustybuzz, and flattens to a `ShapedRun` in em-space.
+//!
+//! Fallback resolution walks a *chain* — an ordered borrow of fonts out of the
+//! service's global pool. Glyphs carry the **global** font id, not the position
+//! within the chain, so two chains sharing a face (typically the emoji font) key
+//! into one glyph cache entry instead of two.
 
 use rustybuzz::{shape, UnicodeBuffer};
 use ttf_parser::GlyphId;
@@ -7,16 +12,23 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::bands::{process_bands_with, BandsScratch};
 use crate::cache::{GlyphCache, GlyphInfo};
-use crate::font::FontSet;
+use crate::font::Font;
+
+/// One font of a chain: its global pool id plus a borrow of the font itself.
+#[derive(Clone, Copy)]
+pub(crate) struct ChainFont<'a> {
+    pub id: u16,
+    pub font: &'a Font,
+}
 
 /// One positioned glyph along a baseline (`x`/`y` are em-space pen positions).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ShapedGlyph {
     pub glyph_id: u32,
-    /// Which face in the [`FontSet`] this glyph came from (fallback resolution).
-    pub face_id: u16,
-    /// Color glyph (`COLR`): rendered via the emoji atlas, not Slug — `info` is
-    /// `None` for these.
+    /// Global font-pool id, so the glyph cache is shared across chains.
+    pub font_id: u16,
+    /// Color glyph (`COLR`/`CBDT`/`sbix`): rendered via the emoji atlas, not
+    /// Slug — `info` is `None` for these.
     pub is_color: bool,
     pub cluster: usize,
     pub x: f32,
@@ -26,7 +38,7 @@ pub(crate) struct ShapedGlyph {
 }
 
 /// A shaped run of glyphs along a single baseline.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ShapedRun {
     pub glyphs: Vec<ShapedGlyph>,
 }
@@ -60,7 +72,7 @@ fn is_emoji_sequence(grapheme: &str) -> bool {
 /// the whole emoji sequence (a flag, a ZWJ emoji) into one color glyph rather
 /// than several pieces. Requiring color avoids a monochrome text font hijacking
 /// a non-ligating sequence (which would render a mono base instead of a tofu).
-fn shapes_single_color(font: &crate::font::Font, text: &str) -> bool {
+fn shapes_single_color(font: &Font, text: &str) -> bool {
     let mut buffer = UnicodeBuffer::new();
     buffer.push_str(text);
     buffer.guess_segment_properties();
@@ -72,24 +84,40 @@ fn shapes_single_color(font: &crate::font::Font, text: &str) -> bool {
     gid != 0 && font.is_color_glyph(gid as u16)
 }
 
-/// First face in the chain that ligates the whole grapheme into one color glyph.
-fn single_glyph_face(fonts: &FontSet, grapheme: &str) -> Option<u16> {
-    fonts
-        .faces()
+/// First chain position whose font ligates the whole grapheme into one color glyph.
+fn single_glyph_face(chain: &[ChainFont<'_>], grapheme: &str) -> Option<usize> {
+    chain
         .iter()
-        .position(|f| shapes_single_color(f, grapheme))
-        .map(|i| i as u16)
+        .position(|entry| shapes_single_color(entry.font, grapheme))
 }
 
-/// The face a grapheme resolves to. Primary (0) for whitespace/control (so runs
-/// don't fragment on spaces) and for characters no face covers (→ `.notdef` tofu).
+/// First chain position covering `c`, or `None` if nothing does (→ tofu).
+fn covering_face(chain: &[ChainFont<'_>], c: char) -> Option<usize> {
+    chain.iter().position(|entry| entry.font.has_glyph(c))
+}
+
+/// First chain position rendering `c` as a color glyph — honors U+FE0F.
+fn color_face_for(chain: &[ChainFont<'_>], c: char) -> Option<usize> {
+    chain.iter().position(|entry| entry.font.color_glyph(c))
+}
+
+/// First chain position covering `c` with a monochrome glyph — honors U+FE0E.
+fn text_face_for(chain: &[ChainFont<'_>], c: char) -> Option<usize> {
+    chain
+        .iter()
+        .position(|entry| entry.font.has_glyph(c) && !entry.font.color_glyph(c))
+}
+
+/// The chain position a grapheme resolves to. Primary (0) for whitespace/control
+/// (so runs don't fragment on spaces) and for characters no face covers (→
+/// `.notdef` tofu).
 ///
 /// Presentation follows Unicode: a trailing U+FE0F forces emoji (color) and
 /// U+FE0E forces text; with no selector, the base character's
 /// `Emoji_Presentation` property decides (so `😀` is color and `❤` is text by
 /// default, while `❤\u{FE0F}` is the red heart). The chosen presentation prefers
 /// a color or monochrome face accordingly, falling back to any covering face.
-fn face_for_grapheme(fonts: &FontSet, grapheme: &str) -> u16 {
+fn face_for_grapheme(chain: &[ChainFont<'_>], grapheme: &str) -> usize {
     let base = grapheme.chars().next().unwrap_or(' ');
     if base.is_whitespace() || base.is_control() {
         return 0;
@@ -102,38 +130,38 @@ fn face_for_grapheme(fonts: &FontSet, grapheme: &str) -> u16 {
         crate::emoji_presentation::is_default_emoji(base)
     };
     let preferred = if want_color {
-        fonts.color_face_for(base)
+        color_face_for(chain, base)
     } else {
-        fonts.text_face_for(base)
+        text_face_for(chain, base)
     }
-    .or_else(|| fonts.covering_face(base));
+    .or_else(|| covering_face(chain, base));
 
     // Cluster-level fallback: for an emoji sequence, if the presentation-preferred
     // face can't render it as a single glyph (e.g. Segoe UI Emoji has the regional
     // indicators but no flag ligatures), fall back to a face in the chain that can.
     if is_emoji_sequence(grapheme) {
         if let Some(p) = preferred {
-            if shapes_single_color(fonts.face(p), grapheme) {
+            if shapes_single_color(chain[p].font, grapheme) {
                 return p;
             }
         }
-        if let Some(f) = single_glyph_face(fonts, grapheme) {
+        if let Some(f) = single_glyph_face(chain, grapheme) {
             return f;
         }
     }
     preferred.unwrap_or(0)
 }
 
-/// Split `text` into maximal `(byte_start, run_text, face_id)` runs where every
-/// grapheme resolves to the same face. Grapheme-based so combining sequences stay
-/// with their base in one face.
-fn itemize<'a>(fonts: &FontSet, text: &'a str) -> Vec<(usize, &'a str, u16)> {
+/// Split `text` into maximal `(byte_start, run_text, chain_position)` runs where
+/// every grapheme resolves to the same face. Grapheme-based so combining
+/// sequences stay with their base in one face.
+fn itemize<'a>(chain: &[ChainFont<'_>], text: &'a str) -> Vec<(usize, &'a str, usize)> {
     let mut runs = Vec::new();
     let mut run_start = 0usize;
-    let mut run_face: Option<u16> = None;
+    let mut run_face: Option<usize> = None;
 
     for (idx, grapheme) in text.grapheme_indices(true) {
-        let face = face_for_grapheme(fonts, grapheme);
+        let face = face_for_grapheme(chain, grapheme);
         match run_face {
             Some(f) if f == face => {}
             Some(f) => {
@@ -150,23 +178,25 @@ fn itemize<'a>(fonts: &FontSet, text: &'a str) -> Vec<(usize, &'a str, u16)> {
     runs
 }
 
-/// Shape `text` across the fallback chain, ensuring every glyph is populated in
-/// `cache` (keyed by `(face_id, glyph_id)`). Pen positions are em-space relative
-/// to (`start_x`, `start_y`); clusters are byte offsets into `text`.
+/// Shape `text` across the fallback chain, ensuring every non-color glyph is
+/// populated in `cache` (keyed by `(font_id, glyph_id)`). Pen positions are
+/// em-space starting at the origin; clusters are byte offsets into `text`.
 pub(crate) fn shape_text(
-    fonts: &FontSet,
+    chain: &[ChainFont<'_>],
     cache: &mut GlyphCache,
     text: &str,
-    start_x: f32,
-    start_y: f32,
 ) -> ShapedRun {
+    if chain.is_empty() {
+        return ShapedRun::default();
+    }
     let mut glyphs = Vec::new();
-    let mut x = start_x;
-    let mut y = start_y;
+    let mut x = 0.0f32;
+    let mut y = 0.0f32;
     let mut scratch = BandsScratch::default();
 
-    for (run_start, run_text, face_id) in itemize(fonts, text) {
-        let font = fonts.face(face_id);
+    for (run_start, run_text, position) in itemize(chain, text) {
+        let entry = chain[position];
+        let font = entry.font;
         let upem = font.units_per_em() as f32;
 
         let mut buffer = UnicodeBuffer::new();
@@ -188,20 +218,19 @@ pub(crate) fn shape_text(
             // Color glyphs render through the emoji atlas, so skip Slug band
             // generation (`info` stays `None`); the emission step routes them.
             let is_color = font.is_color_glyph(glyph_id as u16);
-            let key = (face_id, glyph_id);
             let cached = if is_color {
                 None
             } else {
-                cache.get(key).or_else(|| {
+                cache.get((entry.id, glyph_id)).or_else(|| {
                     let outlines = font.load_glyph(GlyphId(glyph_id as u16))?;
                     let band = process_bands_with(&outlines, &mut scratch);
-                    Some(cache.insert(key, band))
+                    Some(cache.insert((entry.id, glyph_id), band))
                 })
             };
 
             glyphs.push(ShapedGlyph {
                 glyph_id,
-                face_id,
+                font_id: entry.id,
                 is_color,
                 cluster: run_start + info.cluster as usize,
                 x: gx,
@@ -221,7 +250,7 @@ pub(crate) fn shape_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::font::{FontSet, FontSource};
+    use crate::font::read_font_file;
 
     fn exists(p: &str) -> bool {
         std::path::Path::new(p).exists()
@@ -242,11 +271,32 @@ mod tests {
         .find(|p| exists(p))
     }
 
+    fn load(paths: &[&str]) -> Vec<Font> {
+        paths
+            .iter()
+            .filter_map(|p| Font::from_shared(read_font_file(p).ok()?, 0).ok())
+            .collect()
+    }
+
+    fn chain(fonts: &[Font]) -> Vec<ChainFont<'_>> {
+        fonts
+            .iter()
+            .enumerate()
+            .map(|(i, font)| ChainFont {
+                id: i as u16,
+                font,
+            })
+            .collect()
+    }
+
     #[test]
     fn single_font_is_one_run() {
         let Some(latin) = latin_path() else { return };
-        let fonts = FontSet::load(vec![FontSource::Path(latin)]).unwrap();
-        assert_eq!(itemize(&fonts, "hello world 123").len(), 1);
+        let fonts = load(&[latin]);
+        if fonts.is_empty() {
+            return;
+        }
+        assert_eq!(itemize(&chain(&fonts), "hello world 123").len(), 1);
     }
 
     #[test]
@@ -254,17 +304,21 @@ mod tests {
         let (Some(latin), Some(cjk)) = (latin_path(), cjk_path()) else {
             return;
         };
-        let fonts = FontSet::load(vec![FontSource::Path(latin), FontSource::Path(cjk)]).unwrap();
+        let fonts = load(&[latin, cjk]);
+        if fonts.len() < 2 {
+            return;
+        }
+        let chain = chain(&fonts);
         let mut cache = GlyphCache::new();
         let text = "A日";
-        let run = shape_text(&fonts, &mut cache, text, 0.0, 0.0);
+        let run = shape_text(&chain, &mut cache, text);
 
         // Every glyph is real (no `.notdef` tofu) and band-cached.
         assert!(run.glyphs.iter().all(|g| g.glyph_id != 0));
         assert!(run.glyphs.iter().all(|g| g.info.is_some()));
         // The CJK ideograph resolved to the fallback face, not the Latin primary.
         assert!(
-            run.glyphs.iter().any(|g| g.face_id == 1),
+            run.glyphs.iter().any(|g| g.font_id == 1),
             "日 should resolve to the CJK fallback face"
         );
         // Clusters stay valid byte offsets into the source.
@@ -280,19 +334,22 @@ mod tests {
         if !exists(sym) || !exists(emoji) {
             return;
         }
-        let fonts =
-            FontSet::load(vec![FontSource::Path(sym), FontSource::Path(emoji)]).unwrap();
+        let fonts = load(&[sym, emoji]);
+        if fonts.len() < 2 {
+            return;
+        }
+        let chain = chain(&fonts);
         let mut cache = GlyphCache::new();
 
         // A monochrome symbol font precedes the emoji font, so a bare heart is
         // text (its first covering face is the mono one)…
-        let mono = shape_text(&fonts, &mut cache, "\u{2764}", 0.0, 0.0);
+        let mono = shape_text(&chain, &mut cache, "\u{2764}");
         assert!(
             mono.glyphs.iter().all(|g| !g.is_color),
             "bare U+2764 should render as text"
         );
         // …but U+2764 U+FE0F forces the color face despite the ordering.
-        let color = shape_text(&fonts, &mut cache, "\u{2764}\u{FE0F}", 0.0, 0.0);
+        let color = shape_text(&chain, &mut cache, "\u{2764}\u{FE0F}");
         assert!(
             color.glyphs.iter().any(|g| g.is_color),
             "U+2764 U+FE0F should render as a color glyph"
@@ -306,12 +363,15 @@ mod tests {
         if !exists(sym) || !exists(emoji) {
             return;
         }
-        let fonts =
-            FontSet::load(vec![FontSource::Path(sym), FontSource::Path(emoji)]).unwrap();
+        let fonts = load(&[sym, emoji]);
+        if fonts.len() < 2 {
+            return;
+        }
+        let chain = chain(&fonts);
         let mut cache = GlyphCache::new();
         // Victory hand (text-default base) + a skin-tone modifier must resolve to
         // the color face — otherwise the modifier lands on a mono font as tofu.
-        let run = shape_text(&fonts, &mut cache, "\u{270C}\u{1F3FF}", 0.0, 0.0);
+        let run = shape_text(&chain, &mut cache, "\u{270C}\u{1F3FF}");
         assert!(
             run.glyphs.iter().any(|g| g.is_color),
             "U+270C U+1F3FF should render as a color glyph"
@@ -327,8 +387,11 @@ mod tests {
         let (Some(latin), Some(cjk)) = (latin_path(), cjk_path()) else {
             return;
         };
-        let fonts = FontSet::load(vec![FontSource::Path(latin), FontSource::Path(cjk)]).unwrap();
-        let runs = itemize(&fonts, "Hi 日本");
+        let fonts = load(&[latin, cjk]);
+        if fonts.len() < 2 {
+            return;
+        }
+        let runs = itemize(&chain(&fonts), "Hi 日本");
         // "Hi " on the primary, "日本" on the fallback.
         assert!(runs.len() >= 2);
         assert_eq!(runs[0].2, 0);

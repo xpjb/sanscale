@@ -132,6 +132,7 @@ impl EmojiCache {
     }
 
     /// Bumped whenever a cell is recycled under eviction; see the type docs.
+    #[allow(dead_code)] // kept for a future geometry-pool invalidation hook
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -144,6 +145,7 @@ impl EmojiCache {
 
     /// Advance the frame clock. Cells drawn in the current frame are never evicted, so
     /// this must be called once per rendered frame (the engine does so in `flush`).
+    #[allow(dead_code)] // per-frame budget hook, unused until the service tracks frames
     pub fn begin_frame(&mut self) {
         self.frame = self.frame.wrapping_add(1);
     }
