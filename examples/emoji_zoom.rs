@@ -34,7 +34,6 @@ const COLS: usize = 40; // emoji per row
 const CELL_W: f32 = 44.0;
 const CELL_H: f32 = 44.0;
 const GLYPH_PX: f32 = 34.0;
-const CELL_PAD: f32 = 5.0;
 const GUTTER_W: f32 = 560.0; // world-space column reserved on the left for titles
 const TITLE_PX: f32 = 52.0; // world-space title height (scales with zoom)
 const WORLD_W: f32 = GUTTER_W + COLS as f32 * CELL_W;
@@ -95,7 +94,9 @@ fn build_layout() -> Vec<RowLayout> {
             let mut cells = Vec::new();
             for ci in 0..COLS {
                 let Some(&(emoji, name)) = items.get(ri * COLS + ci) else { break };
-                cells.push(Cell { x: GUTTER_W + ci as f32 * CELL_W + CELL_PAD, emoji, name });
+                // The cell's origin. Centring within it is done at placement time,
+                // off the shaped block's measured box.
+                cells.push(Cell { x: GUTTER_W + ci as f32 * CELL_W, emoji, name });
             }
             layout.push(RowLayout { cells, title: (ri == 0).then_some(group) });
         }
@@ -157,16 +158,41 @@ impl Viewer {
             for (x, emoji) in row {
                 // Sequences the fonts can't ligate (a missing ZWJ/flag component)
                 // shape to several glyphs that overflow the cell — show one tofu
-                // box instead of the overlapping pieces.
+                // box instead of the overlapping pieces. `is_single_glyph` asks
+                // the face the shaper will actually pick, so this agrees with what
+                // gets drawn.
                 let single = self.text.diagnostics().is_single_glyph(self.chain, emoji);
-                let (content, at, size, color) = if single {
-                    (emoji, Vec2::new(x, y), GLYPH_PX, INK)
+                let (content, size, color) = if single {
+                    (emoji, GLYPH_PX, INK)
                 } else {
-                    (TOFU_BOX, Vec2::new(x + 3.0, y + 5.0), GLYPH_PX * 0.72, [0.72, 0.73, 0.77, 1.0])
+                    (TOFU_BOX, GLYPH_PX * 0.72, [0.72, 0.73, 0.77, 1.0])
                 };
-                if let Some(glyph) = self.text.shape_transient(content, &style) {
-                    cells.push(PlacedCell { glyph, at, size, color });
-                }
+                let Some(glyph) = self.text.shape_transient(content, &style) else {
+                    continue;
+                };
+                // Centre the glyph's `size`x`size` em box in the cell. Not the
+                // measured *advance*: that varies per emoji, and centring on it
+                // makes the columns ragged — the grid wants every cell on the same
+                // x, which is what the old fixed pad was doing.
+                //
+                // Vertically the service owns the baseline, so ask it where the
+                // baseline sits within the block (`baseline_em`) and place `at` so
+                // the glyph box lands centred. This is the compensation the port
+                // dropped when `at` became the block's top-left instead of a
+                // baseline — recovered from metrics rather than a tuned constant,
+                // so the smaller tofu box centres by the same rule.
+                let inset = (CELL_H - size) * 0.5;
+                let baseline_em = self
+                    .text
+                    .measure(glyph)
+                    .line(0)
+                    .map(|m| m.baseline_em)
+                    .unwrap_or(1.0);
+                let at = Vec2::new(
+                    x + (CELL_W - size) * 0.5,
+                    y + inset + size - baseline_em * size,
+                );
+                cells.push(PlacedCell { glyph, at, size, color });
             }
         }
         self.rows.insert(r, cells);
