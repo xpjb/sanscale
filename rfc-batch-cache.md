@@ -180,6 +180,60 @@ concatenation rather than baked. The batch cache would not survive it, because t
 
 ---
 
+## The grain rule: a batch is content, not visibility
+
+The obvious way to use a batch cache is the broken one: gather what's on screen this
+frame, hand it over, draw it. Scroll one line and the slice differs, so it misses,
+so you rebuild everything *and* paid for the comparison. Worse than no cache.
+
+**A batch must be keyed to content that doesn't move: a row, a note, a chunk of N
+lines.** Then scrolling changes *which batches you draw*, not *what is in* one, and
+a batch never invalidates from camera movement at all. Items entering and leaving
+the viewport stop being an update problem and become a selection problem — which is
+just `if visible { draw(batch) }`, and cheap.
+
+This is exactly how tile renderers avoid the same trap, and it is why Mapbox can
+hold resident buffers while a browser cannot: a tile is content-shaped and
+long-lived, a display list is visibility-shaped and rebuilt.
+
+It also dissolves the incremental-update question. If batches are content-keyed
+they change only when the *content* changes — an edit dirties one chunk and the
+rest are untouched — so there is never a need to patch ranges inside a live batch,
+which is the allocator/fragmentation problem in disguise. Choosing the grain well
+removes the need for the machinery; choosing it badly means building the machinery
+and still losing.
+
+The API should make the good usage the natural one. `prepare_batch` returning a
+handle the consumer is expected to **keep** does that; a call that takes a slice
+every frame invites exactly the mistake above.
+
+Corollary for the two consumers:
+
+- `unicode_zoom` — a batch per row. Stable forever; the camera never touches it.
+  This is precisely the per-row cache the old code hand-rolled.
+- compendium — a batch per note. Stable until that note is edited. Does *not*
+  reduce its draw calls (still one per note, as today) but removes the per-frame
+  concatenate and upload entirely. Getting below one call per note needs the shader
+  clip; the two changes are complementary, not alternatives.
+
+## Where the VBO lives
+
+A batch is already one contiguous vertex range with a consumer-chosen grain and a
+consumer-held lifetime. That is a VBO handle — there is nothing further to invent.
+So `BatchHandle` is the natural owner of a GPU buffer, and "keep this resident or
+rebuild it" becomes a per-batch decision made by the consumer that knows.
+
+This is what makes the editor case work, and it is the case `decisions.md` had in
+mind when it justified the geometry pool by **battery** rather than framerate: a
+viewport of a few thousand glyphs is cheap to rebuild, but during a smooth-scroll
+animation it is rebuilt every frame with identical content. Resident geometry plus
+a per-batch transform uploads nothing at all.
+
+Note this is a per-*batch* VBO, not a per-*block* one. Per-block resident buffers at
+glyph granularity is the thing rejected above — 41k tiny allocations and a real
+allocator. Per-batch is a handful of large, stable, long-lived buffers, which is the
+shape that works everywhere it has been tried.
+
 ## Proposal
 
 | | Do it | Why |
@@ -188,7 +242,8 @@ concatenation rather than baked. The batch cache would not survive it, because t
 | **Cached batch** — `prepare_batch(&[Draw]) -> BatchHandle`, reusing the concatenated buffer while the slice is unchanged | **yes, design** | Restores the grain choice as a *draw* concept rather than a third identity type. Worth ~2 ms on the dense examples immediately. Worth nothing to compendium until the two items below. |
 | **Per-block clip in the shader**, retiring the per-item scissor | **yes, but major** | The only thing that makes batching reachable for compendium. Vertex format + shaders + per-block array. |
 | **compendium to world-space `at` + MVP** | **yes, consumer-side** | Needed regardless. Unlocks the batch cache; also the honest use of the transform. |
-| **GPU-resident per-block ranges** | **no** | Tile architecture at glyph granularity, against consensus for text, and buys little once the batch is cached. |
+| **GPU-resident per-*block* ranges** | **no** | Tile architecture at glyph granularity: 41k tiny allocations and a real allocator. |
+| **GPU-resident per-*batch* buffer** | **yes, once batches exist** | A batch is already a contiguous range with a consumer-chosen grain and lifetime — it *is* a VBO handle. Handful of large stable buffers, the shape that works. This is the editor/battery case. |
 | **Colour out of the vertex** | **no** | The `decisions.md` lock is stale — written when each geometry entry was its own VBO, where a colour change meant reuploading a buffer. With host-side quads a colour change rebuilds one block's `Vec`, and the per-frame case (selection highlight) is one block, not all. Leaving `col` in the vertex costs 16 bytes and buys simplicity. |
 
 Order: arena → compendium coordinate space → cached batch → shader clip. Each is
@@ -204,7 +259,9 @@ useful alone, and each earlier one makes the next easier to evaluate.
 - Per-block clip in the shader means a dependent read per vertex. On a dense frame
   that is 250k reads; needs measuring against the scissor changes it removes.
 - Does `BatchHandle` need eviction, and against what bound? It holds a
-  concatenated vertex buffer, which is far larger than a `Geometry`.
+  concatenated vertex buffer, which is far larger than a `Geometry`. Content-keyed
+  grain helps — the live set is bounded by content in play, not by camera — but a
+  consumer that mints one per note in a 10k-note document still needs a bound.
 - Is z-contiguity something the service should verify, or the consumer's
   responsibility to get right? Silently drawing in the wrong order is a bad
   failure mode.
