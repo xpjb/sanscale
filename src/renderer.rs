@@ -377,15 +377,6 @@ impl TextRenderer {
         }
     }
 
-    /// Build a vertex buffer from a vertex slice.
-    pub(crate) fn build_vertices(device: &wgpu::Device, vertices: &[TextVertex]) -> wgpu::Buffer {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("text vertex buffer"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        })
-    }
-
     pub(crate) fn write_matrix(&self, queue: &wgpu::Queue, matrix: Mat4) {
         let params = Params {
             matrix: matrix.to_cols_array_2d(),
@@ -402,6 +393,7 @@ impl TextRenderer {
         pass: &mut wgpu::RenderPass<'_>,
         atlas: &TextAtlas,
         vertex_buffer: &wgpu::Buffer,
+        range: Range<u64>,
         vertices: Range<u32>,
     ) {
         if vertices.is_empty() {
@@ -410,8 +402,89 @@ impl TextRenderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         pass.set_bind_group(1, &atlas.bind_group, &[]);
-        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.set_vertex_buffer(0, vertex_buffer.slice(range.clone()));
         pass.draw(vertices, 0..1);
+    }
+}
+
+/// A bump-allocating GPU vertex arena.
+///
+/// Replaces a fresh `create_buffer_init` per draw. That allocation is not
+/// incidental: on a dense frame it is a multi-megabyte buffer created, mapped,
+/// copied and dropped *every frame*, and it measured as the single largest cost
+/// in the batch path — larger than emitting the geometry it carries.
+///
+/// **The invariant that makes reuse safe.** A `queue.write_buffer` lands before
+/// any command in the next submission executes, so rewriting a region that an
+/// already-recorded draw points at would make that draw sample the *new*
+/// vertices. A consumer records many draws into one pass before submitting
+/// (per-item scissor rects force this), so a single shared buffer written in
+/// place is not an option. Instead this bump-allocates: every allocation gets a
+/// fresh region, and the pointer only wraps after a full cycle of an arena sized
+/// to several frames of traffic — well beyond any pipeline's frames in flight.
+/// Growing allocates a *new* buffer and leaves the old one to wgpu's refcount,
+/// so draws already recorded against it stay valid.
+pub(crate) struct VertexArena {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    offset: u64,
+}
+
+/// Slack over the largest single allocation. A region is only rewritten after
+/// this many frames' worth of traffic, versus the 2–3 frames a pipeline keeps in
+/// flight.
+const ARENA_SLACK: u64 = 4;
+/// Keeps every suballocation legally aligned for `set_vertex_buffer`.
+const ARENA_ALIGN: u64 = 256;
+
+impl VertexArena {
+    pub(crate) fn new(device: &wgpu::Device) -> Self {
+        let capacity = 64 * 1024;
+        Self {
+            buffer: Self::alloc(device, capacity),
+            capacity,
+            offset: 0,
+        }
+    }
+
+    fn alloc(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sanscale vertex arena"),
+            size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Write `data` into a fresh region and return the slice bounds to bind.
+    pub(crate) fn push<T: bytemuck::Pod>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &[T],
+    ) -> (u64, u64) {
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        let len = bytes.len() as u64;
+        let needed = len.next_multiple_of(ARENA_ALIGN);
+
+        if needed * ARENA_SLACK > self.capacity {
+            // Grow to hold several frames of the new high-water mark. The old
+            // buffer stays alive for any draw already recorded against it.
+            self.capacity = (needed * ARENA_SLACK).max(self.capacity * 2);
+            self.buffer = Self::alloc(device, self.capacity);
+            self.offset = 0;
+        } else if self.offset + needed > self.capacity {
+            self.offset = 0;
+        }
+
+        let start = self.offset;
+        self.offset += needed;
+        queue.write_buffer(&self.buffer, start, bytes);
+        (start, start + len)
+    }
+
+    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
     }
 }
 
@@ -741,14 +814,6 @@ impl EmojiRenderer {
         }
     }
 
-    pub(crate) fn build_vertices(device: &wgpu::Device, vertices: &[EmojiVertex]) -> wgpu::Buffer {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("emoji vertex buffer"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        })
-    }
-
     pub(crate) fn write_matrix(&self, queue: &wgpu::Queue, matrix: Mat4) {
         let params = Params {
             matrix: matrix.to_cols_array_2d(),
@@ -762,6 +827,7 @@ impl EmojiRenderer {
         pass: &mut wgpu::RenderPass<'_>,
         atlas: &EmojiAtlas,
         vertex_buffer: &wgpu::Buffer,
+        range: Range<u64>,
         vertices: Range<u32>,
     ) {
         if vertices.is_empty() {
@@ -770,7 +836,7 @@ impl EmojiRenderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         pass.set_bind_group(1, &atlas.bind_group, &[]);
-        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.set_vertex_buffer(0, vertex_buffer.slice(range.clone()));
         pass.draw(vertices, 0..1);
     }
 }

@@ -22,7 +22,7 @@ use crate::emoji::{bucket_for, EmojiCache};
 use crate::flow::{flow_paragraph, FlowLine};
 use crate::font::Font;
 use crate::layout::{shape_text, ChainFont, ShapedGlyph};
-use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer};
+use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer, VertexArena};
 use crate::vertex::{push_emoji_quad, push_glyph_quad_pixels, EmojiVertex, TextVertex};
 
 /// Shared font bytes. Deliberately fontdb's `make_shared_face_data` return type,
@@ -521,11 +521,11 @@ struct Block {
 /// uniform would reduce this to the clip alone.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GeomKey {
-    size: u32,
-    /// Quads are position-baked, so placement is part of the key. Pan and zoom
-    /// move the *transform*, not `at`, so a scrolling canvas still hits.
-    at: [u32; 2],
     color: [u32; 4],
+    /// Normalised into the block's own space, `(clip - at) / size`, because the
+    /// quads are. An absolute clip would reintroduce exactly the position and
+    /// scale dependence this key exists without: under a camera move `at`, `size`
+    /// and the scissor all change together, and this ratio does not.
     clip: Option<[u32; 4]>,
 }
 
@@ -535,12 +535,24 @@ struct GeomKey {
 /// space, so they survive pan and zoom, and keeping them host-side lets many
 /// blocks concatenate into one upload and one draw call. A buffer per block
 /// means a draw call per block, which is ruinous on a dense canvas.
+/// Quads are baked with the block's top-left at the **origin**; `draw_batch`
+/// adds `at` as it concatenates. This is what lets one shaped block be drawn at
+/// many positions — a repeated label, a glyph reused across a grid, or a body
+/// scrolling under a fixed clip — from a single build. Baking `at` in instead
+/// means a block drawn at N positions rebuilds N times per frame, each rebuild
+/// discarding the last.
 struct Geometry {
     key: GeomKey,
     /// Emoji atlas eviction epoch the UVs were baked against. A change means a
     /// cell was recycled and the cached quads may now point at another glyph —
     /// the invalidation the old public `emoji_epoch` made the *consumer* do.
     epoch: u64,
+    /// Raster bucket the color glyphs were baked against. Held here rather than
+    /// in [`GeomKey`] for the same reason as `epoch`: it is the one thing a size
+    /// change still decides, and it decides nothing for a block with no color
+    /// glyphs. Keying on it would rebuild every text block in the frame each time
+    /// a zoom crossed a bucket boundary, for nothing.
+    bucket: u32,
     text: Vec<TextVertex>,
     emoji: Vec<EmojiVertex>,
 }
@@ -562,6 +574,9 @@ struct Gpu {
     emoji: EmojiRenderer,
     text_atlas: TextAtlas,
     emoji_atlas: EmojiAtlas,
+    /// One arena for both pipelines: suballocation is bump-only, so sharing it
+    /// costs nothing and halves the number of buffers to grow.
+    arena: VertexArena,
 }
 
 /// Cache bounds. Eviction is capacity-based rather than time-based on purpose:
@@ -934,31 +949,26 @@ impl Text {
             let Some(index) = self.block_index(item.block) else {
                 continue;
             };
+            let bucket = bucket_for(item.size);
             let key = GeomKey {
-                size: item.size.to_bits(),
-                at: [item.at.x, item.at.y].map(f32::to_bits),
                 color: item.color.0.map(f32::to_bits),
-                clip: item.clip.map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
+                clip: normalized_clip(item).map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
             };
             // Fast path: one dense-array probe, then straight into the batch.
             if let Some(geom) = self.geometry[index].as_ref() {
                 // The epoch only matters if this block actually baked emoji UVs;
                 // an atlas eviction cannot disturb a text-only block, and
                 // invalidating those too rebuilds the whole frame for nothing.
-                if geom.key == key && (geom.emoji.is_empty() || geom.epoch == epoch) {
-                    text_verts.extend_from_slice(&geom.text);
-                    if !geom.emoji.is_empty() {
-                        emoji_verts.extend_from_slice(&geom.emoji);
-                    }
+                let emoji_still_valid =
+                    geom.emoji.is_empty() || (geom.epoch == epoch && geom.bucket == bucket);
+                if geom.key == key && emoji_still_valid {
+                    place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
                     continue;
                 }
             }
-            self.rebuild_geometry(index, item, key, epoch);
+            self.rebuild_geometry(index, item, key, epoch, bucket);
             if let Some(geom) = self.geometry[index].as_ref() {
-                text_verts.extend_from_slice(&geom.text);
-                if !geom.emoji.is_empty() {
-                    emoji_verts.extend_from_slice(&geom.emoji);
-                }
+                place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
             }
         }
 
@@ -973,14 +983,24 @@ impl Text {
             .sync(device, queue, &gpu.emoji.atlas_layout, &self.emoji);
 
         if !text_verts.is_empty() {
-            let buffer = TextRenderer::build_vertices(device, &text_verts);
-            gpu.text
-                .draw_vertices(pass, &gpu.text_atlas, &buffer, 0..text_verts.len() as u32);
+            let range = gpu.arena.push(device, queue, &text_verts);
+            gpu.text.draw_vertices(
+                pass,
+                &gpu.text_atlas,
+                gpu.arena.buffer(),
+                range.0..range.1,
+                0..text_verts.len() as u32,
+            );
         }
         if !emoji_verts.is_empty() {
-            let buffer = EmojiRenderer::build_vertices(device, &emoji_verts);
-            gpu.emoji
-                .draw(pass, &gpu.emoji_atlas, &buffer, 0..emoji_verts.len() as u32);
+            let range = gpu.arena.push(device, queue, &emoji_verts);
+            gpu.emoji.draw(
+                pass,
+                &gpu.emoji_atlas,
+                gpu.arena.buffer(),
+                range.0..range.1,
+                0..emoji_verts.len() as u32,
+            );
         }
 
         self.batch_text = text_verts;
@@ -989,8 +1009,21 @@ impl Text {
 
     /// Build one block's quads into its geometry cache. CPU only — no device and
     /// no upload; `draw_batch` does that once for the whole batch.
-    fn rebuild_geometry(&mut self, index: usize, item: &Draw, key: GeomKey, epoch: u64) {
-        let (at, size, color, clip) = (item.at, item.size, item.color, item.clip);
+    fn rebuild_geometry(
+        &mut self,
+        index: usize,
+        item: &Draw,
+        key: GeomKey,
+        epoch: u64,
+        bucket: u32,
+    ) {
+        let color = item.color;
+        // Bake at the origin *and* at unit size, with the clip normalised to
+        // match, so the build depends on everything about this draw except where
+        // it lands and how big it is. `place` applies both on the way out.
+        let at = Vec2::new(0.0, 0.0);
+        let size = 1.0f32;
+        let clip = normalized_clip(item);
         let mut text_verts = Vec::new();
         let mut emoji_verts = Vec::new();
 
@@ -999,39 +1032,15 @@ impl Text {
         let mut emoji_requests: Vec<(u16, u32, f32, f32)> = Vec::new();
         {
             let block = self.blocks[index].block.as_ref().expect("checked by caller");
-            for line in &block.layout.lines {
-                let top = at.y + line.metrics.top_em * size;
-                let bottom = top + line.metrics.height_em * size;
-                if clip.is_some_and(|clip| bottom < clip.y || top > clip.max_y()) {
-                    continue;
-                }
-                let baseline = at.y + line.metrics.baseline_em * size;
-                let origin_x = at.x + line.align_em * size;
-                for glyph in &line.glyphs {
-                    let pen_x = origin_x + glyph.x * size;
-                    let pen_y = baseline - glyph.y * size;
-                    if glyph.is_color {
-                        let outside = clip.is_some_and(|clip| {
-                            pen_y < clip.y
-                                || pen_y - size > clip.max_y()
-                                || pen_x + size < clip.x
-                                || pen_x > clip.max_x()
-                        });
-                        if !outside {
-                            emoji_requests.push((glyph.font_id, glyph.glyph_id, pen_x, pen_y));
-                        }
-                        continue;
-                    }
-                    let Some(info) = glyph.info else { continue };
-                    if clip.is_some_and(|clip| !glyph_intersects(&info, pen_x, pen_y, size, clip)) {
-                        continue;
-                    }
+            for_each_visible_glyph(&block.layout, at, size, clip, |glyph, pen_x, pen_y| {
+                if glyph.is_color {
+                    emoji_requests.push((glyph.font_id, glyph.glyph_id, pen_x, pen_y));
+                } else if let Some(info) = glyph.info {
                     push_glyph_quad_pixels(&mut text_verts, &info, pen_x, pen_y, size, color.0);
                 }
-            }
+            });
         }
 
-        let bucket = bucket_for(size);
         for (font_id, glyph_id, pen_x, pen_y) in emoji_requests {
             let Some(font) = self.fonts.get(font_id as usize) else {
                 continue;
@@ -1049,6 +1058,7 @@ impl Text {
         self.geometry[index] = Some(Geometry {
             key,
             epoch,
+            bucket,
             text: text_verts,
             emoji: emoji_verts,
         });
@@ -1077,6 +1087,7 @@ impl Text {
             emoji,
             text_atlas,
             emoji_atlas,
+            arena: VertexArena::new(device),
         });
     }
 
@@ -1270,6 +1281,55 @@ fn chain_view<'a>(
         .unwrap_or_default()
 }
 
+/// Walk the glyphs of `layout` that survive `clip`, with their pen positions in
+/// the transform's source space.
+///
+/// Split out of `rebuild_geometry` so the cull is reachable without a device.
+/// It previously lived inline in the one function that needs a GPU to call, which
+/// is why the three clip tests the old engine had could not be carried over — and
+/// then the half of the clip contract that was never built went unnoticed for a
+/// release. Culling is pure geometry; it should not need a GPU to test.
+fn for_each_visible_glyph(
+    layout: &Layout,
+    at: Vec2,
+    size: f32,
+    clip: Option<Rect>,
+    mut f: impl FnMut(&ShapedGlyph, f32, f32),
+) {
+    for line in &layout.lines {
+        let top = at.y + line.metrics.top_em * size;
+        let bottom = top + line.metrics.height_em * size;
+        if clip.is_some_and(|clip| bottom < clip.y || top > clip.max_y()) {
+            continue;
+        }
+        let baseline = at.y + line.metrics.baseline_em * size;
+        let origin_x = at.x + line.align_em * size;
+        for glyph in &line.glyphs {
+            let pen_x = origin_x + glyph.x * size;
+            let pen_y = baseline - glyph.y * size;
+            if glyph.is_color {
+                // A colour glyph is a size x size box hanging from the baseline;
+                // it has no outline to measure, so the box is the bound.
+                let outside = clip.is_some_and(|clip| {
+                    pen_y < clip.y
+                        || pen_y - size > clip.max_y()
+                        || pen_x + size < clip.x
+                        || pen_x > clip.max_x()
+                });
+                if !outside {
+                    f(glyph, pen_x, pen_y);
+                }
+                continue;
+            }
+            let Some(info) = glyph.info else { continue };
+            if clip.is_some_and(|clip| !glyph_intersects(&info, pen_x, pen_y, size, clip)) {
+                continue;
+            }
+            f(glyph, pen_x, pen_y);
+        }
+    }
+}
+
 fn glyph_intersects(info: &GlyphInfo, pen_x: f32, pen_y: f32, size: f32, clip: Rect) -> bool {
     let (min_x, min_y, max_x, max_y) = info.bbox;
     let left = pen_x + min_x * size;
@@ -1329,10 +1389,17 @@ impl Diagnostics<'_> {
     }
 
     /// Family name of the face `c` would actually resolve to.
+    ///
+    /// Routed through the same [`face_for_grapheme`](crate::layout::face_for_grapheme)
+    /// the shaper uses, so this cannot disagree with what gets drawn. Resolving
+    /// it here independently — "first face with a glyph" — silently ignores
+    /// emoji presentation and reports the color font for every text-presentation
+    /// character it happens to cover.
     pub fn family_for(&self, chain: FontChainHandle, c: char) -> Option<String> {
         let view = self.text.chain_view(chain);
-        let entry = view.iter().find(|entry| entry.font.has_glyph(c))?;
-        entry.font.family_name()
+        let mut buf = [0u8; 4];
+        let entry = view.get(crate::layout::face_for_grapheme(&view, c.encode_utf8(&mut buf)))?;
+        entry.font.has_glyph(c).then(|| entry.font.family_name())?
     }
 
     /// Em-space bounding box `(min_x, min_y, max_x, max_y)` of `c`'s outline, for
@@ -1340,8 +1407,17 @@ impl Diagnostics<'_> {
     /// character nothing covers.
     pub fn glyph_bbox(&self, chain: FontChainHandle, c: char) -> Option<(f32, f32, f32, f32)> {
         let view = self.text.chain_view(chain);
-        let entry = view.iter().find(|entry| entry.font.has_glyph(c))?;
+        let mut buf = [0u8; 4];
+        // The face the shaper picks, not the first one holding a glyph — this
+        // feeds cell fit-scaling, so a wrong face moves geometry, not just text.
+        let entry = view.get(crate::layout::face_for_grapheme(&view, c.encode_utf8(&mut buf)))?;
         let id = entry.font.face().glyph_index(c)?;
+        // A colour glyph reports nothing, as documented. COLR faces layer real
+        // outlines under the colour, so asking for an outline *succeeds* and hands
+        // back a box for something that will never be drawn that way.
+        if entry.font.is_color_glyph(id.0) {
+            return None;
+        }
         let outlines = entry.font.load_glyph(id)?;
         Some(outlines.bounding_box())
     }
@@ -1349,10 +1425,13 @@ impl Diagnostics<'_> {
     /// Whether `text` shapes to exactly one glyph in this chain — i.e. the font
     /// ligates the whole sequence (a flag, a ZWJ emoji) rather than rendering it
     /// as pieces.
+    /// Asks the *resolved* face, not any face in the chain. "Some face could
+    /// ligate this" accepts a monochrome ligation the fallback walk rejects, so
+    /// a caller drawing on that answer gets overlapping pieces instead of the
+    /// one glyph — or the tofu — it was promised.
     pub fn is_single_glyph(&self, chain: FontChainHandle, text: &str) -> bool {
         let view = self.text.chain_view(chain);
-        view.iter()
-            .any(|entry| crate::layout::shapes_to_single_glyph(entry.font, text))
+        crate::layout::resolves_to_single_glyph(&view, text)
     }
 
     /// Curve, band and emoji atlas sizes, in texels.
@@ -1379,5 +1458,301 @@ impl Diagnostics<'_> {
                 .filter(|slot| slot.block.is_some())
                 .count(),
         )
+    }
+}
+
+/// Concatenate one block's origin-baked quads into the batch, translated to
+/// `at`. The copy is a memcpy plus a linear add — orders of magnitude cheaper
+/// than the rebuild that baking `at` into the cache key would have forced.
+fn place(
+    text: &mut Vec<TextVertex>,
+    emoji: &mut Vec<EmojiVertex>,
+    geom: &Geometry,
+    at: Vec2,
+    size: f32,
+) {
+    let base = text.len();
+    text.extend_from_slice(&geom.text);
+    for v in &mut text[base..] {
+        v.pos[0] = v.pos[0] * size + at.x;
+        v.pos[1] = v.pos[1] * size + at.y;
+    }
+    if !geom.emoji.is_empty() {
+        let base = emoji.len();
+        emoji.extend_from_slice(&geom.emoji);
+        for v in &mut emoji[base..] {
+            v.pos[0] = v.pos[0] * size + at.x;
+            v.pos[1] = v.pos[1] * size + at.y;
+        }
+    }
+}
+
+/// Grid the normalised clip snaps to, in em. Coarse enough to absorb rounding,
+/// far finer than a glyph.
+const CLIP_QUANTUM: f32 = 1.0 / 16.0;
+
+/// A draw's clip in the block's own space: origin at the block's top-left, one
+/// unit per em. This is the form that survives a camera move.
+///
+/// **Quantised outward, and it has to be.** `(clip - at) / size` is invariant
+/// under a camera move only *analytically*: recomputed from a different zoom each
+/// frame it lands a few ulps away, and a key compared by exact bits then misses
+/// every single frame — which is precisely the bug this key was introduced to
+/// fix, reintroduced one level down. Snapping to a power-of-two grid makes the
+/// bits stable. Rounding *outward* keeps it safe: the clip only culls, so a
+/// fractionally generous one emits a few extra quads the consumer's scissor
+/// discards, where a tight one could clip a glyph that belonged on screen.
+fn normalized_clip(item: &Draw) -> Option<Rect> {
+    let q = CLIP_QUANTUM as f64;
+    let inv = 1.0 / item.size as f64;
+    // Nudge off the grid line before rounding. A clip that lands *exactly* on a
+    // multiple of the quantum — the common case, since consumers use round
+    // numbers — otherwise has `floor` flipping between two cells on a 1-ulp
+    // wobble, which defeats the quantisation entirely. Both nudges push outward,
+    // so the clip stays conservative.
+    let bias = 1e-3;
+    let snap_down = |v: f64| ((v * inv / q) - bias).floor() * q;
+    let snap_up = |v: f64| ((v * inv / q) + bias).ceil() * q;
+    item.clip.map(|c| {
+        // Widen in f64: `clip - at` is a difference of similar magnitudes once the
+        // camera is far from the origin, and doing it in f32 loses the precision
+        // the ratio depends on.
+        let (ax, ay) = (item.at.x as f64, item.at.y as f64);
+        let x0 = snap_down(c.x as f64 - ax);
+        let y0 = snap_down(c.y as f64 - ay);
+        let x1 = snap_up((c.x + c.width) as f64 - ax);
+        let y1 = snap_up((c.y + c.height) as f64 - ay);
+        Rect::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::font::read_font_file;
+
+    fn font(paths: &[&str]) -> Option<FontData> {
+        paths
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .and_then(|p| read_font_file(p).ok())
+    }
+
+    /// Build a chain with the colour font **first**, which is how a real fallback
+    /// chain is ordered (emoji high-priority, Latin primary before it).
+    fn emoji_first_chain() -> Option<(Text, FontChainHandle)> {
+        let emoji = font(&["C:/Windows/Fonts/seguiemj.ttf"])?;
+        let latin = font(&["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"])?;
+        let mut text = Text::new();
+        let e = text.map_font(emoji, 0).ok()?;
+        let l = text.map_font(latin, 0).ok()?;
+        let chain = text.register_chain(&[e, l]);
+        Some((text, chain))
+    }
+
+    fn latin_chain() -> Option<(Text, FontChainHandle)> {
+        let latin = font(&["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"])?;
+        let mut text = Text::new();
+        let h = text.map_font(latin, 0).ok()?;
+        let chain = text.register_chain(&[h]);
+        Some((text, chain))
+    }
+
+    fn style_of(chain: FontChainHandle, wrap_em: Option<f32>) -> Style {
+        Style { chain, wrap_em, align: Align::Left, line_spacing: 1.0 }
+    }
+
+    /// Counts how often the service asks for a paragraph's bytes.
+    struct CountingSource<'a> {
+        text: &'a str,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ParagraphSource for CountingSource<'_> {
+        fn paragraph_text(&self, _index: usize, _key: ParagraphKey) -> Option<Cow<'_, str>> {
+            self.calls.set(self.calls.get() + 1);
+            Some(Cow::Borrowed(self.text))
+        }
+    }
+
+    /// Text is pulled from the consumer **only on a miss**.
+    ///
+    /// This is the escape-hatch contract that makes a 10k-paragraph document
+    /// affordable: for a body where nothing changed, the text is never
+    /// materialised. Restored from `engine.rs`, which the redesign deleted along
+    /// with the module.
+    #[test]
+    fn a_cache_hit_never_asks_for_the_text() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let style = style_of(chain, Some(12.0));
+        let key = ParagraphKey { namespace: 7, slot: 11, generation: 13 };
+        let src = CountingSource {
+            text: "cached paragraph should only ever be fetched once",
+            calls: std::cell::Cell::new(0),
+        };
+
+        assert!(text.shape(BlockKey(1), &style, &[key], &src).is_some());
+        assert_eq!(src.calls.get(), 1, "the first shape must fetch");
+
+        // Same block, same parts: the block-level comparison short-circuits.
+        text.shape(BlockKey(1), &style, &[key], &src);
+        assert_eq!(src.calls.get(), 1, "re-shaping an unchanged block must not fetch");
+
+        // A *different* block over the same paragraph: the block is new, so this
+        // reaches the paragraph pool — which must still hit.
+        text.shape(BlockKey(2), &style, &[key], &src);
+        assert_eq!(src.calls.get(), 1, "a paragraph-cache hit must not fetch");
+
+        // Bumping the generation is what invalidation looks like, and must fetch.
+        let edited = ParagraphKey { generation: 14, ..key };
+        text.shape(BlockKey(3), &style, &[edited], &src);
+        assert_eq!(src.calls.get(), 2, "a new generation must fetch");
+    }
+
+    /// Restored from `engine.rs`. `is_single_glyph` is what a grid consumer uses
+    /// to decide between drawing a sequence and drawing tofu.
+    #[test]
+    fn single_glyph_detection() {
+        let Some((text, chain)) = latin_chain() else {
+            return;
+        };
+        let d = text.diagnostics();
+        assert!(d.is_single_glyph(chain, "A"), "one letter is one glyph");
+        assert!(!d.is_single_glyph(chain, "AB"), "two letters shape to two glyphs");
+    }
+
+    fn visible_count(text: &Text, h: ShapedHandle, clip: Option<Rect>) -> usize {
+        let mut n = 0;
+        for_each_visible_glyph(text.measure(h), Vec2::new(0.0, 0.0), 16.0, clip, |_, _, _| n += 1);
+        n
+    }
+
+    /// The three clip tests `engine.rs` had, restored against the extracted cull.
+    /// `clip` culls on the CPU before anything is emitted — a scrolled body must
+    /// not emit every paragraph's quads and lean on the GPU to discard them.
+    ///
+    /// **What these do and do not guard**, checked by mutation rather than assumed:
+    /// deleting the per-glyph `glyph_intersects` test fails
+    /// `clip_culls_glyphs_outside_it_horizontally`. Deleting the *line-level* cull
+    /// fails nothing — the per-glyph test produces identical output without it, so
+    /// the line cull is a pure performance fast path with no observable effect.
+    /// Nothing here can guard it; only a benchmark can. Recorded so the next reader
+    /// does not infer coverage that is not here.
+    #[test]
+    fn clip_culls_lines_outside_it() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let style = style_of(chain, None);
+        let Some(h) = text.shape_transient(
+            "alpha bravo\ncharlie delta\necho foxtrot\ngolf hotel",
+            &style,
+        ) else {
+            return;
+        };
+        let all = visible_count(&text, h, None);
+        assert!(all > 0, "unclipped must emit something");
+
+        let first = text.measure(h).line(0).expect("a first line");
+        let one_line = Rect::new(0.0, 0.0, 10_000.0, first.height_em * 16.0 * 0.9);
+        let clipped = visible_count(&text, h, Some(one_line));
+        assert!(clipped > 0, "the first line is inside the clip");
+        assert!(clipped < all, "later lines must be culled, got {clipped} of {all}");
+    }
+
+    #[test]
+    fn clip_culls_glyphs_outside_it_horizontally() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let style = style_of(chain, None);
+        let Some(h) = text.shape_transient("the quick brown fox jumps over it", &style) else {
+            return;
+        };
+        let all = visible_count(&text, h, None);
+        let narrow = Rect::new(0.0, 0.0, 20.0, 10_000.0);
+        let clipped = visible_count(&text, h, Some(narrow));
+        assert!(clipped < all, "a narrow clip must drop trailing glyphs");
+    }
+
+    #[test]
+    fn a_clip_outside_the_block_emits_nothing() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let style = style_of(chain, None);
+        let Some(h) = text.shape_transient("alpha bravo charlie", &style) else {
+            return;
+        };
+        let far_away = Rect::new(50_000.0, 50_000.0, 100.0, 100.0);
+        assert_eq!(visible_count(&text, h, Some(far_away)), 0);
+    }
+
+    /// The family a diagnostic reports must be the family *shaping* actually
+    /// uses. Asserted against the shaper rather than a hardcoded font name, so
+    /// the invariant holds whatever chain the box happens to have installed.
+    ///
+    /// Regression: `family_for` was "first face in the chain holding a glyph",
+    /// which ignores emoji presentation entirely. With a colour font early in the
+    /// chain that reported the colour face for every text-presentation character
+    /// it happened to cover - 220 code points across planes 0-2, and because
+    /// `glyph_bbox` took the same shortcut it moved geometry, not just labels.
+    #[test]
+    fn diagnostics_resolve_the_face_shaping_uses() {
+        let Some((text, chain)) = emoji_first_chain() else {
+            return;
+        };
+        let mut buf = [0u8; 4];
+        for c in [
+            '\u{2600}', '\u{263A}', '\u{2640}', '\u{2328}', // text presentation
+            '\u{1F600}', '\u{1F308}', // emoji presentation
+            'A', '1', '\u{00E9}', // plain text
+        ] {
+            let s = c.encode_utf8(&mut buf);
+            let view = chain_view(&text.fonts, &text.chains, chain);
+            let mut cache = GlyphCache::new();
+            let run = shape_text(&view, &mut cache, s);
+            let Some(glyph) = run.glyphs.first() else { continue };
+            if glyph.glyph_id == 0 {
+                continue; // tofu; nothing to agree about
+            }
+            let shaped_family = text.fonts[glyph.font_id as usize].family_name();
+            assert_eq!(
+                text.diagnostics().family_for(chain, c),
+                shaped_family,
+                "U+{:04X}: the diagnostic disagrees with the face shaping picked",
+                c as u32,
+            );
+        }
+    }
+
+    /// `glyph_bbox` reports the outline of the face that will actually be used,
+    /// and reports nothing for a glyph that resolves to colour. It feeds cell
+    /// fit-scaling in grid layouts, so resolving through a different face than
+    /// shaping silently moves glyphs.
+    #[test]
+    fn glyph_bbox_follows_the_resolved_face() {
+        let Some((text, chain)) = emoji_first_chain() else {
+            return;
+        };
+        let mut buf = [0u8; 4];
+        for c in ['\u{2600}', '\u{1F600}', 'A'] {
+            let s = c.encode_utf8(&mut buf);
+            let view = chain_view(&text.fonts, &text.chains, chain);
+            let mut cache = GlyphCache::new();
+            let run = shape_text(&view, &mut cache, s);
+            let Some(glyph) = run.glyphs.first() else { continue };
+            if glyph.glyph_id == 0 {
+                continue;
+            }
+            let bbox = text.diagnostics().glyph_bbox(chain, c);
+            if glyph.is_color {
+                assert!(bbox.is_none(), "U+{:04X} resolves to colour: no outline", c as u32);
+            } else {
+                assert!(bbox.is_some(), "U+{:04X} resolves to an outline face", c as u32);
+            }
+        }
     }
 }

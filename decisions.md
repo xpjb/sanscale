@@ -5,6 +5,61 @@ machinery (Slug pipeline, glyph/emoji caches, eviction, rasterization) is **not*
 changing — this is a public-surface rework. Pressure-tested against the only real
 consumer, `compendium` (which aliases the crate as `text`), plus our own examples.
 
+---
+
+# Nouns
+
+The vocabulary, because it has accreted and most of it is one-per-pool. Read this
+first; everything below assumes it.
+
+1. **Font** — one mapped concrete face, deduped by data identity. `FontHandle`.
+2. **Chain** — an ordered fallback list of fonts. `FontChainHandle`. *Discovery*
+   (family name → bytes) is the consumer's; the *fallback walk* (chain → per-grapheme
+   face) is ours.
+3. **Run** — a maximal span of text resolving to a single face; what `itemize`
+   emits. Purely internal: the consumer never sees one, and never breaks text by
+   font.
+4. **Line** — what flow emits. One paragraph produces 1..N.
+5. **Paragraph** — the unit of **invalidation**. The consumer owns its identity and
+   version (`ParagraphKey`); it is shaped and reflowed independently and cached at
+   `(ParagraphKey, Style)`, which is why an edit costs one paragraph and not the
+   document.
+6. **Block** — the unit of **coordinate space**. 1..N paragraphs at one `Style`,
+   concatenated into one byte range, one line list, one `Layout`. `BlockKey` names
+   it; `ShapedHandle` resolves it. The reason it exists is that its paragraphs want
+   to be **measured together**: one hit-test, one caret space, a selection that
+   spans paragraph boundaries.
+
+   Note what it is *not*: a reflow unit. Its paragraphs share reflow *inputs* — one
+   `Style`, so one `wrap_em`, so a wrap change reflows all of them — but not the
+   reflow *computation*, which runs per paragraph and caches per paragraph. Going
+   greedy → Knuth-Plass does not change that, since Knuth-Plass optimises badness
+   *within* a paragraph. **What would** is cross-paragraph breaking:
+   widow/orphan control, keep-with-next, column or page breaks. Those cannot be
+   decided one paragraph at a time, and the day one arrives `assemble` stops being
+   concatenation and becomes a real block-level flow. That is the live constraint on
+   this noun.
+7. **Glyph** — a rasterized atlas cell. Keyed `(face, glyph_id)` for text,
+   `(face, glyph_id, bucket)` for emoji. Distinct from a *run*: rasterization and
+   shaping are different arrows in the pipeline.
+8. **Geometry** — one block's quads at a given set of draw parameters, cached
+   host-side. Position- and scale-independent, so a camera move re-runs none of it.
+9. **Batch** — *(proposed, see `rfc-batch-cache.md`)* the unit of **pass state**:
+   blocks sharing a scissor and a contiguous z-slot, concatenated into one draw
+   call. The only noun here that belongs to **rendering** rather than to text, which
+   is why it is a slice of `Draw` and not a key.
+
+Three of these are the load-bearing consumer-facing axes, and each has a different
+owner — confusing them is how the design goes wrong:
+
+| noun | unit of | owned by |
+|---|---|---|
+| paragraph | invalidation | consumer (identity + version) |
+| block | coordinate space | consumer composes, service flows |
+| batch | pass state | consumer (z-order, scissor) |
+
+---
+
 Mental model: **there is one `Text` service that holds ~7 keyed pools with eviction.**
 Only the atlas is hard, and it's already built. Everything else is a HashMap + a version.
 
@@ -97,9 +152,12 @@ impl Text {
 
     // wgpu passed in directly (no bundle). `at`/`size` are in the transform's source space —
     // screen pixels under `pixel_ortho`, world units under an MVP. `size` scales em→space and
-    // picks the emoji raster bucket. `clip` (same space) culls on the CPU *and*, when the
-    // transform is a pixel ortho, sets the scissor. shape/measure don't take wgpu, so leaving
-    // draw uncalled = device-free.
+    // picks the emoji raster bucket. `clip` (same space) culls whole lines and glyphs on the
+    // CPU — it does **not** set a scissor (the crate contains no scissor call), so cutting a
+    // glyph that straddles the boundary is still the consumer's, via its own scissor. That is
+    // also what caps a consumer's batch size at one when its items have differing clips; see
+    // `rfc-batch-cache.md`. shape/measure don't take wgpu, so leaving draw uncalled =
+    // device-free.
     fn draw(&mut self, device: &Device, queue: &Queue, pass: &mut RenderPass,
             h: ShapedHandle, at: Vec2, size: f32, color: Color, clip: Option<Rect>);
 }
@@ -152,10 +210,21 @@ Things we're certain about, and why.
   a unit vector through the transform (Slug glyphs need no bucket at all). Genuine 3D would also
   want depth state on the pipeline — `set_target` grows a `depth_format` — noted, not built.
 
-- **`clip` culls, it doesn't just scissor.** One `Rect` on `draw` does both: drop whole lines and
-  individual glyphs on the CPU before emitting (what `intersects_y` / `intersects_glyph` do
-  today), then set the scissor for the remainder. A scrolled 10k-paragraph body must not emit
+- **`clip` culls, it doesn't just scissor.** One `Rect` on `draw` drops whole lines and
+  individual glyphs on the CPU before emitting. A scrolled 10k-paragraph body must not emit
   10k paragraphs' quads and lean on the GPU to throw them away.
+
+  **Half-built, and the missing half has a cost.** This lock also said `draw` would "set the
+  scissor for the remainder". It does not — the crate contains **no** scissor call anywhere.
+  Only the CPU cull exists, so cutting a glyph that *straddles* the clip boundary is still the
+  consumer's job via its own `set_scissor_rect`. compendium does exactly that, before and after
+  the migration alike (7 call sites in both).
+  The consequence is not cosmetic: a scissor is *pass state*, so one draw call carries one
+  scissor, so items with differing clips can never share a draw call. compendium's title and
+  body have different clips, which caps its batch size at **one** — structurally, no matter how
+  batching is cached. Moving the cut into the fragment shader as a per-block clip rect is what
+  lifts that; see `rfc-batch-cache.md`. Recorded here because the design reads as though
+  clipping is handled end-to-end, which is why batching looks like it should already work.
 
 - **Scrolling is `at.y`.** Scroll offset is subtracted from the draw position; `clip` does the
   rest. The block stores its paragraphs' cumulative line offsets, so `draw` binary-searches the
@@ -409,7 +478,12 @@ worth litigating, just parked.
 - **Line breaking: greedy now, Knuth-Plass / justification later.** Reflow is cheap precisely
   because it's greedy first-fit over already-shaped glyph advances — no reshape. A future
   optimal-breaking or justified pass is a pure swap of the Level-2 flow step; same inputs
-  (glyph runs + `wrap_em`), same outputs (lines), no surface change.
+  (glyph runs + `wrap_em`), same outputs (lines), no surface change. It stays *per
+  paragraph* either way — Knuth-Plass optimises badness within a paragraph, so the
+  per-paragraph flow cache survives it untouched. The thing that would not survive is
+  **cross-paragraph** breaking (widow/orphan, keep-with-next, column/page breaks): that
+  makes reflow block-level and turns `assemble` from concatenation into a real flow.
+  Worth keeping apart from this item, because they read as the same feature and aren't.
 
 - **Chunked (intra-run) shaping.** The *build* is parked here; its one live constraint —
   keeping a run's shaped value segment-structured, not an opaque blob — stays in litigation so
