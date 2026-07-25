@@ -203,10 +203,11 @@ pub struct LineMetrics {
     pub width_em: f32,
 }
 
-#[derive(Clone, Debug)]
-struct CaretStop {
-    byte_index: usize,
-    x_em: f32,
+/// One caret position on a line: a byte offset and where it sits, in em.
+#[derive(Clone, Copy, Debug)]
+pub struct CaretStop {
+    pub byte_index: usize,
+    pub x_em: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +215,14 @@ struct LayoutLine {
     byte_range: Range<usize>,
     metrics: LineMetrics,
     carets: Vec<CaretStop>,
+}
+
+/// One line's worth of synthetic layout, for [`Layout::from_lines`].
+#[derive(Clone, Debug)]
+pub struct LayoutLineSpec {
+    pub byte_range: Range<usize>,
+    pub metrics: LineMetrics,
+    pub carets: Vec<CaretStop>,
 }
 
 /// Laid-out geometry for one block, in em space, with document-global byte
@@ -230,6 +239,36 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Build a layout directly from line geometry, with no font and no shaping.
+    ///
+    /// This exists because caret motion, selection and hit-testing are pure
+    /// geometry, and a consumer should be able to unit-test its editor against a
+    /// synthetic layout without loading a font or touching a GPU. Without it the
+    /// opaque `Layout` would make that logic untestable — which is exactly what
+    /// happened to compendium's caret tests during the migration.
+    pub fn from_lines(lines: Vec<LayoutLineSpec>) -> Self {
+        let width_em = lines
+            .iter()
+            .map(|line| line.metrics.width_em)
+            .fold(0.0f32, f32::max);
+        let height_em = lines
+            .last()
+            .map(|line| line.metrics.top_em + line.metrics.height_em)
+            .unwrap_or(0.0);
+        Self {
+            lines: lines
+                .into_iter()
+                .map(|line| LayoutLine {
+                    byte_range: line.byte_range,
+                    metrics: line.metrics,
+                    carets: line.carets,
+                })
+                .collect(),
+            width_em,
+            height_em,
+        }
+    }
+
     pub fn size_em(&self) -> Vec2 {
         Vec2::new(self.width_em, self.height_em)
     }
@@ -283,6 +322,37 @@ impl Layout {
     pub fn selection(&self, range: Range<usize>) -> Vec<SelectionSpan> {
         let _ = range;
         todo!("selection")
+    }
+}
+
+/// Read-only introspection: font coverage and cache occupancy.
+pub struct Diagnostics<'a> {
+    #[allow(dead_code)]
+    text: &'a Text,
+}
+
+impl Diagnostics<'_> {
+    /// Family names of every face in a chain, in fallback order.
+    pub fn chain_families(&self, chain: FontChainHandle) -> Vec<String> {
+        let _ = chain;
+        todo!("chain_families")
+    }
+
+    /// Characters in `text` that no face in `chain` covers — i.e. what will
+    /// render as tofu.
+    pub fn uncovered_chars(&self, chain: FontChainHandle, text: &str) -> Vec<char> {
+        let _ = (chain, text);
+        todo!("uncovered_chars")
+    }
+
+    /// `(width, height)` of the glyph and emoji atlas textures.
+    pub fn atlas_sizes(&self) -> ((u32, u32), (u32, u32)) {
+        todo!("atlas_sizes")
+    }
+
+    /// Glyphs dropped because an atlas was full.
+    pub fn dropped_glyphs(&self) -> u64 {
+        todo!("dropped_glyphs")
     }
 }
 
@@ -404,6 +474,16 @@ impl Text {
         source: &dyn ParagraphSource,
     ) -> Option<ShapedHandle> {
         self.shape(BlockKey(key.namespace ^ u64::from(key.slot)), style, &[key], source)
+    }
+
+    /// Coverage and cache diagnostics.
+    ///
+    /// These were example-only escape hatches (`fallback_family_names`,
+    /// `uncovered_chars`, the atlas sizes) that the redesign planned to inline
+    /// into the examples — but compendium's headless smoke test uses them to pin
+    /// down tofu, so they are a supported accessor rather than a private hatch.
+    pub fn diagnostics(&self) -> Diagnostics<'_> {
+        Diagnostics { text: self }
     }
 
     /// Em-space geometry for a block. Borrow it for the length of the call; hold

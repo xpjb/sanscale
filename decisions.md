@@ -422,11 +422,16 @@ worth litigating, just parked.
 
 # Migration test (compendium, branch `text-api-migration`)
 
-The API skeleton is real code (`src/text.rs`, signatures and borrows only, bodies
-`todo!()`), and compendium was ported against it far enough to answer the open
-questions. **Zero borrow or lifetime errors** across the whole port; the 8 remaining
-compile errors are all one unresolved design question (last item below) plus its
-mechanical fallout. Net **−172 lines** across 15 consumer files.
+The API skeleton is real code (`src/text.rs`) with real types, signatures and borrow
+semantics; the bodies are `todo!()`, so this proves the shape compiles, not that it
+renders. compendium is ported against it: **`cargo check --lib --tests` is clean**,
+with **zero borrow or lifetime errors** anywhere in the port. Compendium's own two
+examples (`unicode_smoke`, `perf_scenarios`) are not ported — sanscale's examples
+cover that ground.
+
+Net **−92 lines** across 21 consumer files. Worth being honest about that number: the
+deletions are much larger than the net, and the offset is parameter threading from
+making the service a sibling (below). That is a real cost, paid for a real property.
 
 Confirmed:
 - **`&mut self.text` inside a live render pass is fine.** `draw` borrows `&self.device`,
@@ -477,19 +482,29 @@ Resolved — where the service lives:
   renderer, so bail without one" path. In the port this is a `TextSystem { text, ui_chain,
   mono_chain, font_db }` sitting next to `Renderer` in `App`.
 
-Further collapse the port found but did not take:
-- **`paragraph_snapshots()` materializes the whole body's text, ~4× per frame** in the editor
-  path, allocating a fresh `String` per rope-backed paragraph. Fetch-on-miss exists to delete
-  this: the editor path needs identities only. Biggest remaining win.
-- **`body_content_h` / `BodyLayoutKey` / `measure_visible_bodies` — 26 references** across
-  6 files, caching a measurement that is now an O(1) read off `measure`.
-- **`local_text_clip`** — dead once `draw` takes the clip; deleted in the port.
-- **`TextParagraphCacheKey.id`** — near-vestigial; the cache key is the other three fields.
+Also collapsed:
+- **`paragraph_snapshots()` is out of the hot path.** It materialized the whole body's text
+  (a fresh `String` per rope-backed paragraph) ~4× per frame in the editor path. The view now
+  *is* the `ParagraphSource`, so text is pulled only for paragraphs that actually miss.
+- **`local_text_clip`** — dead once `draw` takes the clip; deleted.
+- **`TextParagraphIdentity`'s `byte_start`/`byte_len`** — block-global offsets are derived
+  from the parts by the service, so the consumer no longer computes or carries them. The
+  document test asserting them was deleted along with the fields.
 - **`TextSpecText::Owned { keys: Some(..) }` should not exist.** Its only site is command-runner
   output, which materializes a `String` purely to satisfy the old API despite being
-  document-backed. It becomes `Document { parts }`, and that materialization goes too — which
-  is also why no `&[&str]` source adapter is needed: every remaining `Owned` has no identity
-  and takes `shape_transient`.
+  document-backed. It becomes `Document { parts }` — which is also why no `&[&str]` source
+  adapter is needed: every remaining `Owned` has no identity and takes `shape_transient`.
+- Still on the list, not taken: **`body_content_h` / `BodyLayoutKey` / `measure_visible_bodies`**,
+  26 references across 6 files caching a measurement that is now an O(1) read off `measure`.
+
+Two things the port added to the API that were not in the sketch:
+- **`Layout::from_lines`** — a synthetic layout built from line geometry, no font, no GPU.
+  Caret motion, selection and hit-testing are pure geometry and a consumer must be able to
+  unit-test them against a fake layout; the opaque `Layout` otherwise makes that logic
+  untestable, which is exactly what happened to compendium's caret tests mid-migration.
+- **`diagnostics()`** — `chain_families`, `uncovered_chars`, atlas sizes, dropped glyphs.
+  Planned as "inline it into the examples", but a *consumer's* headless smoke test uses the
+  coverage queries to pin down tofu, so it wants a supported accessor. Low-cost either way.
 
 ---
 
