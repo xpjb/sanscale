@@ -67,7 +67,7 @@ struct Style { chain: FontChainHandle, wrap_em: Option<f32>, align: Align, line_
 impl Text {
     // takes nothing: pipelines are per-target and lazy (see set_target), and the atlas
     // self-bounds to the device limit at first draw (width is fixed 2048 internally).
-    fn new() -> Self;
+    fn new() -> Self;   // lives beside the consumer's renderer, never inside it
 
     // discovery is the consumer's (fontdb → bytes). map dedups; "map" leaves mmap open.
     fn map_font(&mut self, src: FontSource) -> Result<FontHandle, FontError>;
@@ -76,12 +76,15 @@ impl Text {
     fn clear(&mut self);
 
     // one block = 1..N paragraphs flowed together, with document-global byte offsets.
-    // `fetch` runs only for parts that miss; `None` from it = stale identity, block skipped.
-    // Re-calling with an unchanged `parts` slice is a memcmp, not a reflow. GPU-free.
+    // `source` is consulted only for parts that miss; `None` = stale identity, block
+    // skipped. Re-calling with an unchanged `parts` slice is a memcmp, not a reflow.
+    // GPU-free. The Cow borrows from `&self`, so no lifetime is threaded anywhere.
     fn shape(&mut self, block: BlockKey, style: &Style, parts: &[ParagraphKey],
-             fetch: impl FnMut(ParagraphKey) -> Option<Cow<str>>) -> Option<ShapedHandle>;
+             source: &dyn ParagraphSource) -> Option<ShapedHandle>;
     fn shape_one(&mut self, key: ParagraphKey, style: &Style,
-                 fetch: impl FnOnce() -> Cow<str>) -> Option<ShapedHandle>;
+                 source: &dyn ParagraphSource) -> Option<ShapedHandle>;
+    // text with no stable consumer identity (tooltips, labels): content-keyed
+    fn shape_transient(&mut self, text: &str, style: &Style) -> Option<ShapedHandle>;
 
     // em-space queries over the whole block: box size, hit-test, carets, selection.
     // Transient — hold the handle, never the `&Layout` (see the lock). GPU-free.
@@ -444,32 +447,49 @@ Confirmed:
   the zoom fast path and `desired_x *= scale` all deleted.
 
 Changed by the test:
-- **`fetch` takes `(usize, ParagraphKey)`, not just the key.** A consumer holding
-  already-materialized text (a title, runner output) can only find the substring
-  positionally — and since `fetch` runs on *misses only*, it cannot assume it is called once
-  per part in order. Found by writing the `TextSpecText::Owned` arm; the index-free version
-  is silently wrong, not a compile error.
-- **`shape_transient(&str, &Style)` added.** compendium has text with no stable identity
-  (`paragraph_keys: None`). Without a content-keyed path every consumer has to invent a key
-  for "just draw this string", which reintroduces exactly the collision risk `namespace` was
-  added to avoid.
-- **The fetch's text lifetime must be its own parameter.** `RenderPane<'a, 't>`: with one
-  lifetime, `Cow<'a, str>` unifies with the pane's other borrows and every one of them is
-  required to outlive the document.
+- **Text is supplied by a `&dyn ParagraphSource`, not a closure.** One method,
+  `paragraph_text(&self, index, key) -> Option<Cow<'_, str>>`. A closure forces its text
+  lifetime to be a parameter of `shape` *and* of anything storing it, which then unifies
+  with the caller's other borrows (`RenderPane<'a, 't>`, and every borrow in the pane
+  required to outlive the document). Tying the `Cow` to `&self` removes the lifetime
+  entirely at zero cost — verified by compiling both. Note this is **not** the old provider
+  trait: `&self` not `&mut self`, used as `&dyn` not as a generic parameter, so the
+  five-signature threading and the `BoxParagraphProvider` double-box still go away.
+- **The source takes `(index, key)`, not just the key.** `shape` calls it for *misses only*,
+  so an implementor cannot assume one in-order call per part; one holding text positionally
+  needs the index. The index-free version is silently wrong, not a compile error.
+- **`shape_transient(&str, &Style)` added.** compendium has text with no stable identity.
+  Without a content-keyed path every consumer must invent a key for "just draw this string",
+  reintroducing the collision risk `namespace` exists to avoid.
 - **`fontdb::make_shared_face_data` is `unsafe`** (it mmaps). Fine — same contract as any
   mmap font stack — but the "just take the Arc" answer has an `unsafe` in it.
 
-Still open — the one real cost:
-- **Model-side editor operations now need the renderer.** Caret motion, edit actions and
-  hit-testing read the layout, which lives in the service, so `text_editor_motion_with_active_view`
-  and friends grow a `&Renderer` parameter — and that cascades into the keyboard input path,
-  which is exactly what compendium's architecture keeps GPU-free on purpose ("model logic
-  can't reach the GPU except where it's handed the renderer explicitly"). Today this is free
-  because the editor owns a cloned `TextLayout`. Options: thread the renderer (spreads GPU
-  reach), split the layout pool out of the service (breaks "one object"), or have the editor
-  keep the small line table motion actually needs — byte ranges plus em tops/heights,
-  refreshed at `prepare_layout`. The third is much smaller than today's owned layout and
-  keeps motion GPU-free; it is the likely answer but it is not designed yet.
+Resolved — where the service lives:
+- **`Text` is a sibling of the consumer's renderer, not a field of it.** The migration
+  surfaced this as caret motion and edit actions needing a `&Renderer`, cascading into the
+  keyboard input path — exactly what compendium keeps GPU-free on purpose. The fix is not to
+  hand the editor a copy of the layout (a "small line table" supporting `caret_on_line` needs
+  per-line caret stops, i.e. most of `Layout` — that is just today's clone again). It is that
+  **nothing in `Text` needs a renderer**: `shape`/`measure` are device-free and `draw` takes
+  `device`/`queue`/`pass` as parameters. So model code borrows `&Text` — a shaping cache, no
+  GPU handles — and the rule is respected rather than bent. Bonus: it makes shaping and
+  measuring work headless, deleting compendium's existing "the layout below needs the
+  renderer, so bail without one" path. In the port this is a `TextSystem { text, ui_chain,
+  mono_chain, font_db }` sitting next to `Renderer` in `App`.
+
+Further collapse the port found but did not take:
+- **`paragraph_snapshots()` materializes the whole body's text, ~4× per frame** in the editor
+  path, allocating a fresh `String` per rope-backed paragraph. Fetch-on-miss exists to delete
+  this: the editor path needs identities only. Biggest remaining win.
+- **`body_content_h` / `BodyLayoutKey` / `measure_visible_bodies` — 26 references** across
+  6 files, caching a measurement that is now an O(1) read off `measure`.
+- **`local_text_clip`** — dead once `draw` takes the clip; deleted in the port.
+- **`TextParagraphCacheKey.id`** — near-vestigial; the cache key is the other three fields.
+- **`TextSpecText::Owned { keys: Some(..) }` should not exist.** Its only site is command-runner
+  output, which materializes a `String` purely to satisfy the old API despite being
+  document-backed. It becomes `Document { parts }`, and that materialization goes too — which
+  is also why no `&[&str]` source adapter is needed: every remaining `Owned` has no identity
+  and takes `shape_transient`.
 
 ---
 

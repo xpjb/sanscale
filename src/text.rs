@@ -287,6 +287,26 @@ impl Layout {
 }
 
 // ---------------------------------------------------------------------------
+// text source
+// ---------------------------------------------------------------------------
+
+/// Supplies a paragraph's text, by identity, on a shaping cache miss.
+///
+/// A trait rather than a closure for one concrete reason: the returned `Cow`
+/// borrows from `&self`, so no lifetime has to be threaded through the caller's
+/// own structures. A closure would force its text lifetime to be a parameter of
+/// `shape` and of anything that stores it, which unifies with the caller's other
+/// borrows. This is *not* the old provider trait — it takes `&self`, it is used
+/// as `&dyn`, and it is never a generic parameter.
+///
+/// `index` is supplied alongside the key because `shape` calls this only for
+/// parts that miss, so an implementor cannot assume it is called once per part in
+/// order; one holding text positionally needs the index to find it.
+pub trait ParagraphSource {
+    fn paragraph_text(&self, index: usize, key: ParagraphKey) -> Option<Cow<'_, str>>;
+}
+
+// ---------------------------------------------------------------------------
 // the service
 // ---------------------------------------------------------------------------
 
@@ -351,23 +371,18 @@ impl Text {
     /// offsets. `fetch` runs only for parts that miss the cache; `None` from it
     /// means a stale identity and the whole block is skipped. Re-calling with an
     /// unchanged `parts` slice is a comparison, not a reflow.
-    /// `fetch` receives the part's **index as well as its key**. Only the key is
-    /// needed by a consumer that stores paragraphs by identity, but one holding an
-    /// already-materialized string (a title, runner output) can only find the
-    /// substring positionally — and since `fetch` runs on misses only, it cannot
-    /// assume it is called once per part in order.
-    ///
-    /// The `'t` on the fetched text is deliberately independent of `&mut self`: the
-    /// text is borrowed from the *consumer's* document, which must be free to be
-    /// borrowed while the service is mutably borrowed.
-    pub fn shape<'t>(
+    /// Shape a block: 1..N paragraphs flowed together, with document-global byte
+    /// offsets. `source` is consulted only for parts that miss the cache; `None`
+    /// from it means a stale identity and the whole block is skipped. Re-calling
+    /// with an unchanged `parts` slice is a comparison, not a reflow.
+    pub fn shape(
         &mut self,
         block: BlockKey,
         style: &Style,
         parts: &[ParagraphKey],
-        fetch: impl FnMut(usize, ParagraphKey) -> Option<Cow<'t, str>>,
+        source: &dyn ParagraphSource,
     ) -> Option<ShapedHandle> {
-        let _ = (block, style, parts, fetch);
+        let _ = (block, style, parts, source);
         todo!("shape")
     }
 
@@ -381,14 +396,14 @@ impl Text {
     }
 
     /// One-paragraph convenience over [`Text::shape`] — titles, labels, fields.
-    pub fn shape_one<'t>(
+    /// One-paragraph convenience over [`Text::shape`] — a title, a field.
+    pub fn shape_one(
         &mut self,
         key: ParagraphKey,
         style: &Style,
-        fetch: impl FnOnce() -> Cow<'t, str>,
+        source: &dyn ParagraphSource,
     ) -> Option<ShapedHandle> {
-        let _ = (key, style, fetch);
-        todo!("shape_one")
+        self.shape(BlockKey(key.namespace ^ u64::from(key.slot)), style, &[key], source)
     }
 
     /// Em-space geometry for a block. Borrow it for the length of the call; hold
