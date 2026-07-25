@@ -70,3 +70,23 @@ sharing a scissor and a z-slot. The RFC carries the prior art, the constraint, w
 compendium can't batch today, and the proposed order of work.
 
 ---
+
+---
+
+## No measurement of reflow itself
+
+`flow_paragraph` — greedy first-fit line breaking — has no benchmark. compendium's
+`layout.slug.width_cycle_cache_hit` looks like one and is not: `wrap_em` is part of
+the shaping key, so each width gets its own cache entry and after warmup the
+scenario measures hits. It was renamed to say so.
+
+This is fine today. Reflow runs only when a node or pane is genuinely resized —
+zoom does not trigger it, because `wrap_em` derives from world units and the zoom
+cancels — so the live path is dragging a resize handle, and nothing suggests it is
+slow.
+
+It stops being fine the moment line breaking is touched. The Knuth-Plass item in
+`decisions.md` swaps the Level-2 step wholesale for an optimal-breaking pass that is
+categorically more expensive, and there is no number it could regress against.
+Whoever picks that up should add a reflow scenario that defeats the cache *first*,
+and take a baseline before changing anything.
