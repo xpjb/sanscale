@@ -180,6 +180,37 @@ concatenation rather than baked. The batch cache would not survive it, because t
 
 ---
 
+## First: which frames actually exist
+
+Any argument that a cache "wins when nothing is changing" is worthless, because an
+app that isn't changing **doesn't draw the frame at all**. That deletes the idle
+case from consideration entirely, and with it the battery justification
+`decisions.md` gave for the geometry pool — there is no every-frame re-upload of
+unchanged paragraphs if there is no every-frame.
+
+Only two kinds of frame have to exist:
+
+| frame | content-keyed cache | visibility-keyed cache |
+|---|---|---|
+| camera moving (pan / zoom / scroll) | **hits** — content is unchanged, only the transform moves | **misses every frame** |
+| edit, selection, hover, caret | **hits** for everything untouched | misses |
+| idle | *no frame is drawn* | *no frame is drawn* |
+
+Two consequences:
+
+- **Visibility-keyed batching is dead.** Its only win is in the frame you skip.
+- The workload to optimise for is **camera movement**, which is also the one that
+  forces a redraw every frame for a sustained period.
+
+Our own probe has this baked in — both zoom examples call `request_redraw()`
+unconditionally, so they render continuously by construction. That happens to be the
+right thing to measure (a pan really does redraw every frame) for slightly the wrong
+reason.
+
+Note what this says about work already done: taking `at` and `size` out of `GeomKey`
+made the existing per-block cache hit **during camera movement**, which is the case
+that matters most. That was the load-bearing fix, and it has landed.
+
 ## The grain rule: a batch is content, not visibility
 
 The obvious way to use a batch cache is the broken one: gather what's on screen this
@@ -238,16 +269,41 @@ shape that works everywhere it has been tried.
 
 | | Do it | Why |
 |---|---|---|
-| **Arena + `Range<u32>`** replacing the `Vec`-per-block | **yes, first** | Self-contained, no format change. Needs no real allocator: rebuilds fire on colour/clip/bucket changes, which do not alter the vertex *count*, so same-length overwrites in place and the rare length change goes on a size-classed free list. Halves the metadata array too, which is the guaranteed win since that probe is dense. |
-| **Cached batch** — `prepare_batch(&[Draw]) -> BatchHandle`, reusing the concatenated buffer while the slice is unchanged | **yes, design** | Restores the grain choice as a *draw* concept rather than a third identity type. Worth ~2 ms on the dense examples immediately. Worth nothing to compendium until the two items below. |
+| **Arena + `Range<u32>`** replacing the `Vec`-per-block | **only if batching never happens** | Self-contained, no format change. Needs no real allocator: rebuilds fire on colour/clip/bucket changes, which do not alter the vertex *count*, so same-length overwrites in place and the rare length change goes on a size-classed free list. Halves the metadata array too, which is the guaranteed win since that probe is dense. |
+| **Cached batch** — `prepare_batch(&[Draw]) -> BatchHandle`, content-keyed, owning its buffer | **yes, and it subsumes the arena** | Restores the grain choice as a *draw* concept rather than a third identity type. Worth ~2 ms on the dense examples immediately. Worth nothing to compendium until the two items below. |
 | **Per-block clip in the shader**, retiring the per-item scissor | **yes, but major** | The only thing that makes batching reachable for compendium. Vertex format + shaders + per-block array. |
 | **compendium to world-space `at` + MVP** | **yes, consumer-side** | Needed regardless. Unlocks the batch cache; also the honest use of the transform. |
 | **GPU-resident per-*block* ranges** | **no** | Tile architecture at glyph granularity: 41k tiny allocations and a real allocator. |
 | **GPU-resident per-*batch* buffer** | **yes, once batches exist** | A batch is already a contiguous range with a consumer-chosen grain and lifetime — it *is* a VBO handle. Handful of large stable buffers, the shape that works. This is the editor/battery case. |
 | **Colour out of the vertex** | **no** | The `decisions.md` lock is stale — written when each geometry entry was its own VBO, where a colour change meant reuploading a buffer. With host-side quads a colour change rebuilds one block's `Vec`, and the per-frame case (selection highlight) is one block, not all. Leaving `col` in the vertex costs 16 bytes and buys simplicity. |
 
-Order: arena → compendium coordinate space → cached batch → shader clip. Each is
-useful alone, and each earlier one makes the next easier to evaluate.
+### Revised conclusion — this argues for doing less
+
+Two things reshaped the proposal after it was first written, both from litigating
+it rather than from measuring:
+
+1. **A batch subsumes the arena.** They are the same condensation at different
+   grains: the arena packs per-block `Vec`s into one array with ranges; a batch
+   packs many blocks into one buffer. If batches land, there is no per-frame
+   concatenation left for the arena to make faster. Sequencing "arena first" was
+   wrong — it is mostly wasted work if batches follow.
+2. **The idle frame does not exist**, so caching's remaining value is confined to
+   camera movement and edits, and the per-block cache *already* hits both now that
+   `at` and `size` are out of the key.
+
+Netting those out, batching splits cleanly by what it is *for*:
+
+| batching as… | worth it? |
+|---|---|
+| a **cache** (skip the concatenate) | only at the examples' extreme block counts — 2.04 ms at 41k blocks, a rounding error at compendium's hundreds |
+| a **draw-call reduction** (many notes, one call) | the real prize for compendium — and gated entirely behind the shader clip, not behind any caching work |
+
+So the geometry story is essentially finished. What remains is a *draw-call* story,
+and the arena is no longer the first step of it — it is an alternative to batching
+that only pays if batching never happens.
+
+Order, if picked up: compendium coordinate space (needed anyway, cheap) → shader
+clip → batch, with the batch owning its buffer. Arena only as a consolation prize.
 
 ---
 
