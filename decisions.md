@@ -610,7 +610,7 @@ Learned while building it:
   lets `draw_batch` concatenate many blocks into one upload and one draw call. A buffer and
   a draw call per block cost **267 ms** on a 41k-block frame versus **6.5 ms** batched — 40x,
   and none of it about text.
-- **Per-draw vertex buffers are correct and simple.** wgpu 29's
+- **Per-draw vertex buffers are correct and simple.** wgpu 30's
   `RenderPass::set_vertex_buffer` takes a `BufferSlice<'_>` with *no* lifetime tie —
   resources bound into a pass are ref-counted internally. So each `draw` builds its own
   buffer, binds it and drops it. That removes the shared-region clobber hazard entirely

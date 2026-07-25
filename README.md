@@ -12,7 +12,7 @@ razor-sharp at any zoom without ever re-rasterizing an atlas.
 sanscale = { git = "https://github.com/xpjb/sanscale" }
 ```
 
-<sub>License: MIT OR Apache-2.0 · wgpu 29</sub>
+<sub>License: MIT OR Apache-2.0 · wgpu 30</sub>
 
 ## Features
 
