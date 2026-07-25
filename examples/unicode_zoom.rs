@@ -682,6 +682,7 @@ fn dump() {
 
     println!("wrote unicode_map.png (regional) and unicode_map_zoom.png (CJK deep zoom)");
 
+
     // Perf probe: time the per-frame CPU render cost (emit + buffer upload +
     // encode + submit) for a dense, fully zoomed-out frame — the worst case now
     // that there is no LOD cull. Warm the caches first, then report percentiles.

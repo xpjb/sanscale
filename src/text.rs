@@ -505,9 +505,6 @@ struct ParaLayout {
 }
 
 struct BlockSlot {
-    /// Bumped every time this slot is refilled, so handles to the previous
-    /// occupant can be detected as stale.
-    generation: u32,
     block: Option<Block>,
 }
 
@@ -517,9 +514,6 @@ struct Block {
     parts: Vec<ParagraphKey>,
     layout: Layout,
     last_used: u64,
-    /// Pool 7: the block's quads, already on the GPU. Rebuilt only when the draw
-    /// parameters change or the emoji atlas recycles a cell.
-    geometry: Option<Geometry>,
 }
 
 /// What the cached vertices were built for. Color and size are baked into the
@@ -593,6 +587,14 @@ pub struct Text {
     chains: Vec<Option<Vec<FontHandle>>>,
 
     blocks: Vec<BlockSlot>,
+    /// Slot generations, held apart from `blocks` so validating a handle touches
+    /// a dense 4-byte array instead of pulling a ~200-byte `BlockSlot` into cache.
+    generations: Vec<u32>,
+    /// Pool 7, also held apart from `blocks`. `draw_batch` walks this and nothing
+    /// else: on a dense frame it is the only array in the hot loop, and keeping it
+    /// off `Block` is the difference between touching ~96 bytes per item and
+    /// chasing through the block's layout, parts and style to reach it.
+    geometry: Vec<Option<Geometry>>,
     /// Tombstoned block slots, newest first. Allocation pops from here instead of
     /// scanning `blocks` for a hole — a linear scan per `shape` is quadratic over
     /// a frame that shapes thousands of small blocks. Slots are never moved, so
@@ -690,6 +692,8 @@ impl Text {
         self.fonts.clear();
         self.chains.clear();
         self.blocks.clear();
+        self.generations.clear();
+        self.geometry.clear();
         self.free_blocks.clear();
         self.block_lookup.clear();
         self.paragraphs.clear();
@@ -723,13 +727,11 @@ impl Text {
         // Unchanged parts at the same style: the block is already correct, so
         // this is a comparison rather than a reflow.
         if let Some(&handle) = self.block_lookup.get(&block) {
-            if let Some(slot) = self.blocks.get_mut(handle.slot as usize) {
-                if slot.generation == handle.generation {
-                    if let Some(existing) = slot.block.as_mut() {
-                        if existing.style == *style && existing.parts == parts {
-                            existing.last_used = self.clock;
-                            return Some(handle);
-                        }
+            if let Some(index) = self.block_index(handle) {
+                if let Some(existing) = self.blocks[index].block.as_mut() {
+                    if existing.style == *style && existing.parts == parts {
+                        existing.last_used = self.clock;
+                        return Some(handle);
                     }
                 }
             }
@@ -748,29 +750,27 @@ impl Text {
             _ => match self.free_blocks.pop() {
                 Some(slot) => slot as usize,
                 None => {
-                    self.blocks.push(BlockSlot {
-                        generation: 0,
-                        block: None,
-                    });
+                    self.blocks.push(BlockSlot { block: None });
+                    self.generations.push(0);
+                    self.geometry.push(None);
                     self.blocks.len() - 1
                 }
             },
         };
-        let slot = &mut self.blocks[index];
-        if slot.block.is_none() {
-            slot.generation = slot.generation.wrapping_add(1);
+        if self.blocks[index].block.is_none() {
+            self.generations[index] = self.generations[index].wrapping_add(1);
         }
-        slot.block = Some(Block {
+        self.blocks[index].block = Some(Block {
             key: block,
             style: *style,
             parts: parts.to_vec(),
             layout,
             last_used: self.clock,
-            geometry: None,
         });
+        self.geometry[index] = None;
         let handle = ShapedHandle {
             slot: index as u32,
-            generation: slot.generation,
+            generation: self.generations[index],
         };
         self.block_lookup.insert(block, handle);
         // Only sweeps when a pool is actually over its bound, and the check
@@ -824,13 +824,15 @@ impl Text {
 
     /// Resolve a handle, rejecting one whose slot has since been reused.
     fn block(&self, h: ShapedHandle) -> Option<&Block> {
-        let slot = self.blocks.get(h.slot as usize)?;
-        (slot.generation == h.generation).then_some(slot.block.as_ref()?)
+        let index = self.block_index(h)?;
+        self.blocks[index].block.as_ref()
     }
 
+    /// Validate a handle. Touches only the dense generation array — the block
+    /// itself is never pulled into cache on the batch fast path.
     fn block_index(&self, h: ShapedHandle) -> Option<usize> {
-        let slot = self.blocks.get(h.slot as usize)?;
-        (slot.generation == h.generation && slot.block.is_some()).then_some(h.slot as usize)
+        let index = h.slot as usize;
+        (self.generations.get(index) == Some(&h.generation)).then_some(index)
     }
 
     /// Coverage and cache introspection.
@@ -938,13 +940,12 @@ impl Text {
                 color: item.color.0.map(f32::to_bits),
                 clip: item.clip.map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
             };
-            // Fast path: one traversal, cache hit, straight into the batch.
-            if let Some(geom) = self.blocks[index]
-                .block
-                .as_ref()
-                .and_then(|block| block.geometry.as_ref())
-            {
-                if geom.key == key && geom.epoch == epoch {
+            // Fast path: one dense-array probe, then straight into the batch.
+            if let Some(geom) = self.geometry[index].as_ref() {
+                // The epoch only matters if this block actually baked emoji UVs;
+                // an atlas eviction cannot disturb a text-only block, and
+                // invalidating those too rebuilds the whole frame for nothing.
+                if geom.key == key && (geom.emoji.is_empty() || geom.epoch == epoch) {
                     text_verts.extend_from_slice(&geom.text);
                     if !geom.emoji.is_empty() {
                         emoji_verts.extend_from_slice(&geom.emoji);
@@ -953,11 +954,7 @@ impl Text {
                 }
             }
             self.rebuild_geometry(index, item, key, epoch);
-            if let Some(geom) = self.blocks[index]
-                .block
-                .as_ref()
-                .and_then(|block| block.geometry.as_ref())
-            {
+            if let Some(geom) = self.geometry[index].as_ref() {
                 text_verts.extend_from_slice(&geom.text);
                 if !geom.emoji.is_empty() {
                     emoji_verts.extend_from_slice(&geom.emoji);
@@ -1049,14 +1046,12 @@ impl Text {
             }
         }
 
-        if let Some(block) = self.blocks[index].block.as_mut() {
-            block.geometry = Some(Geometry {
-                key,
-                epoch,
-                text: text_verts,
-                emoji: emoji_verts,
-            });
-        }
+        self.geometry[index] = Some(Geometry {
+            key,
+            epoch,
+            text: text_verts,
+            emoji: emoji_verts,
+        });
     }
 
     // -- internals -----------------------------------------------------------

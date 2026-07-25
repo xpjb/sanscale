@@ -78,6 +78,7 @@ mod text;
 mod vertex;
 
 pub use font::{read_font_file, FontMetrics};
+
 pub use text::{
     Align, BlockKey, CaretHit, CaretRect, CaretStop, Color, Diagnostics, Draw, FontChainHandle,
     FontData,
