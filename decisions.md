@@ -384,10 +384,15 @@ Genuinely open.
   segment-structured, not an opaque blob, so a future chunked path can patch a slice. Building
   it is deferred and genuinely open.
 
-- **Per-`ShapedHandle` draw calls vs coalescing.** Leaning "per-handle is fine" (compendium already
-  issues per-item draws with per-item scissors; the single coalesced buffer only ever saved
-  *uploads*, which the geometry pool saves better). Unverified against a heavy dense-canvas
-  frame — worth measuring the draw-call count before building on it.
+- ~~**Per-`ShapedHandle` draw calls vs coalescing.**~~ **Measured.** Per-handle is fine at
+  paragraph granularity (compendium draws hundreds of items) and ruinous at glyph
+  granularity: `unicode_zoom` draws 41 472 one-glyph blocks, which costs 267 ms one call
+  each and 6.5 ms through `draw_batch`. So both exist — `draw` for the ordinary case,
+  `draw_batch` when a consumer has many blocks and one set of pass state. Remaining gap
+  versus the pre-redesign baseline on that frame is ~2x (6.5 ms vs 3.3 ms), and it is
+  memory locality: 41k separate small vertex vecs instead of a few row-sized contiguous
+  ones. Closing it would mean caching geometry at a coarser grain than the block, which no
+  realistic consumer needs.
 
 - **Text (band/curve) atlas eviction.** Still observe-only from the emoji work — unbounded,
   warns at the device limit, no eviction. Whether it graduates to real eviction (harder: the
@@ -514,6 +519,23 @@ Two things the port added to the API that were not in the sketch:
 `TextEngine` surface is deleted, and the three headless examples render through it.
 
 Learned while building it:
+- **Handles must carry a generation, and slot allocation must not scan.** A bare-index
+  `ShapedHandle` is a correctness bug: eviction frees a slot, the next `shape` reuses it, and
+  a handle the consumer cached silently resolves to a *different* block — glyphs still draw,
+  just the wrong ones. Caught as visible corruption in `unicode_zoom`. The companion mistake
+  is allocating by scanning for a free slot, which is O(n) per `shape` and quadratic over a
+  frame; a tombstone free-list fixes it. Order-preserving removal only — never `swap_remove`,
+  which would invalidate live handles wholesale.
+- **Block eviction must be capacity-bounded, not time-bounded.** The consumer holds handles
+  for as long as it likes and the service cannot know one is dead, so a TTL measured in
+  `shape` calls evicts blocks that are still in use. The generation check makes that *safe*
+  (they draw nothing) but the result is missing text. Under a capacity bound, normal
+  workloads never evict and a pathological one loses its coldest blocks.
+- **Geometry must be cached on the CPU and batched, not one GPU buffer per block.** Quads
+  live in the transform's source space, so they survive pan and zoom; keeping them host-side
+  lets `draw_batch` concatenate many blocks into one upload and one draw call. A buffer and
+  a draw call per block cost **267 ms** on a 41k-block frame versus **6.5 ms** batched — 40x,
+  and none of it about text.
 - **Per-draw vertex buffers are correct and simple.** wgpu 29's
   `RenderPass::set_vertex_buffer` takes a `BufferSlice<'_>` with *no* lifetime tie —
   resources bound into a pass are ref-counted internally. So each `draw` builds its own

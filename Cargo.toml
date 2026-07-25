@@ -35,8 +35,14 @@ pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # System-font discovery for the fallback-chain examples (CJK, emoji, etc.).
 fontdb = "0.22"
+# The interactive `unicode_zoom` example opens a window.
+winit = "0.30"
 # Write reused vertex buffers directly (avoid per-frame buffer allocation).
 bytemuck = "1"
+# Clipboard: click-to-copy in the interactive examples.
+arboard = "3"
+# Canonical Unicode character names for the unicode_zoom hover.
+unicode_names2 = "3"
 # Surface the library's atlas warnings on stderr during headless smoke tests.
 env_logger = "0.11"
 

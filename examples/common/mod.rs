@@ -6,6 +6,23 @@
 
 use sanscale::{FontChainHandle, FontData, Text};
 
+pub mod emoji_data;
+
+/// What's under the cursor in the zoomable examples: a human-readable `label` for
+/// the debug line, the `text` to copy on left-click, and the `code` (code points)
+/// to copy on right-click.
+pub struct Hover {
+    pub label: String,
+    pub text: String,
+    pub code: String,
+}
+
+pub fn copy_to_clipboard(s: &str) {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(s.to_string());
+    }
+}
+
 pub const FONT_CANDIDATES: &[&str] = &[
     "C:/Windows/Fonts/segoeui.ttf",
     "C:/Windows/Fonts/arial.ttf",

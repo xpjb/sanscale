@@ -84,6 +84,16 @@ fn shapes_single_color(font: &Font, text: &str) -> bool {
     gid != 0 && font.is_color_glyph(gid as u16)
 }
 
+/// Whether `font` shapes `text` to exactly one glyph, of any kind. Diagnostic
+/// only — the fallback walk itself requires *color* (see `shapes_single_color`).
+pub(crate) fn shapes_to_single_glyph(font: &Font, text: &str) -> bool {
+    let mut buffer = UnicodeBuffer::new();
+    buffer.push_str(text);
+    buffer.guess_segment_properties();
+    let glyphs = shape(font.face(), &[], buffer);
+    glyphs.len() == 1 && glyphs.glyph_infos()[0].glyph_id != 0
+}
+
 /// First chain position whose font ligates the whole grapheme into one color glyph.
 fn single_glyph_face(chain: &[ChainFont<'_>], grapheme: &str) -> Option<usize> {
     chain

@@ -148,8 +148,16 @@ pub struct FontHandle(u16);
 pub struct FontChainHandle(u16);
 
 /// A shaped *block* — 1..N paragraphs flowed into one coordinate space.
+///
+/// Carries a generation alongside its slot. Eviction frees slots and later
+/// `shape` calls reuse them, so without this a handle the consumer cached would
+/// silently start pointing at a different block — the glyphs would still draw,
+/// just the wrong ones. A stale handle now measures empty and draws nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ShapedHandle(u32);
+pub struct ShapedHandle {
+    slot: u32,
+    generation: u32,
+}
 
 /// The consumer's identity for one paragraph: the unit of *invalidation*.
 ///
@@ -496,12 +504,62 @@ struct ParaLayout {
     last_used: u64,
 }
 
+struct BlockSlot {
+    /// Bumped every time this slot is refilled, so handles to the previous
+    /// occupant can be detected as stale.
+    generation: u32,
+    block: Option<Block>,
+}
+
 struct Block {
     key: BlockKey,
     style: Style,
     parts: Vec<ParagraphKey>,
     layout: Layout,
     last_used: u64,
+    /// Pool 7: the block's quads, already on the GPU. Rebuilt only when the draw
+    /// parameters change or the emoji atlas recycles a cell.
+    geometry: Option<Geometry>,
+}
+
+/// What the cached vertices were built for. Color and size are baked into the
+/// vertex format today, so they are part of the key; moving them to a per-draw
+/// uniform would reduce this to the clip alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GeomKey {
+    size: u32,
+    /// Quads are position-baked, so placement is part of the key. Pan and zoom
+    /// move the *transform*, not `at`, so a scrolling canvas still hits.
+    at: [u32; 2],
+    color: [u32; 4],
+    clip: Option<[u32; 4]>,
+}
+
+/// A block's quads, kept on the **CPU**.
+///
+/// Deliberately not a GPU buffer per block: quads live in the transform's source
+/// space, so they survive pan and zoom, and keeping them host-side lets many
+/// blocks concatenate into one upload and one draw call. A buffer per block
+/// means a draw call per block, which is ruinous on a dense canvas.
+struct Geometry {
+    key: GeomKey,
+    /// Emoji atlas eviction epoch the UVs were baked against. A change means a
+    /// cell was recycled and the cached quads may now point at another glyph —
+    /// the invalidation the old public `emoji_epoch` made the *consumer* do.
+    epoch: u64,
+    text: Vec<TextVertex>,
+    emoji: Vec<EmojiVertex>,
+}
+
+/// One block to draw, for [`Text::draw_batch`].
+#[derive(Clone, Copy, Debug)]
+pub struct Draw {
+    pub block: ShapedHandle,
+    /// Top-left of the block box, in the transform's source space.
+    pub at: Vec2,
+    pub size: f32,
+    pub color: Color,
+    pub clip: Option<Rect>,
 }
 
 struct Gpu {
@@ -512,8 +570,15 @@ struct Gpu {
     emoji_atlas: EmojiAtlas,
 }
 
-/// How long an unused cache entry survives, in `shape` calls.
-const CACHE_TTL: u64 = 512;
+/// Cache bounds. Eviction is capacity-based rather than time-based on purpose:
+/// the consumer holds `ShapedHandle`s for as long as it likes, and the service
+/// cannot know a handle is dead. A time-based TTL would evict blocks a consumer
+/// still holds — which the generation check makes *safe* (it draws nothing) but
+/// not *correct*. Under a capacity bound, normal workloads never evict at all,
+/// and a pathological one loses its least-recently-used blocks rather than its
+/// oldest-shaped ones.
+const MAX_BLOCKS: usize = 1 << 17;
+const MAX_PARAGRAPHS: usize = 1 << 17;
 
 /// One text service: every pool, every cache, and the GPU resources.
 ///
@@ -527,7 +592,12 @@ pub struct Text {
     /// `None` for a dropped slot, so live handles stay valid across a reload.
     chains: Vec<Option<Vec<FontHandle>>>,
 
-    blocks: Vec<Option<Block>>,
+    blocks: Vec<BlockSlot>,
+    /// Tombstoned block slots, newest first. Allocation pops from here instead of
+    /// scanning `blocks` for a hole — a linear scan per `shape` is quadratic over
+    /// a frame that shapes thousands of small blocks. Slots are never moved, so
+    /// live handles stay valid.
+    free_blocks: Vec<u32>,
     block_lookup: HashMap<BlockKey, ShapedHandle>,
     paragraphs: HashMap<(ParagraphKey, Style), ParaLayout>,
 
@@ -538,8 +608,8 @@ pub struct Text {
 
     clock: u64,
     empty_layout: Layout,
-    text_scratch: Vec<TextVertex>,
-    emoji_scratch: Vec<EmojiVertex>,
+    batch_text: Vec<TextVertex>,
+    batch_emoji: Vec<EmojiVertex>,
 }
 
 impl Text {
@@ -600,13 +670,15 @@ impl Text {
         };
         *slot = None;
         self.paragraphs.retain(|(_, style), _| style.chain != chain);
-        for block in self.blocks.iter_mut() {
-            let stale = block
+        for (index, slot) in self.blocks.iter_mut().enumerate() {
+            let stale = slot
+                .block
                 .as_ref()
                 .is_some_and(|block| block.style.chain == chain);
             if stale {
-                if let Some(block) = block.take() {
+                if let Some(block) = slot.block.take() {
                     self.block_lookup.remove(&block.key);
+                    self.free_blocks.push(index as u32);
                 }
             }
         }
@@ -618,6 +690,7 @@ impl Text {
         self.fonts.clear();
         self.chains.clear();
         self.blocks.clear();
+        self.free_blocks.clear();
         self.block_lookup.clear();
         self.paragraphs.clear();
         self.glyphs = GlyphCache::new();
@@ -650,10 +723,14 @@ impl Text {
         // Unchanged parts at the same style: the block is already correct, so
         // this is a comparison rather than a reflow.
         if let Some(&handle) = self.block_lookup.get(&block) {
-            if let Some(Some(existing)) = self.blocks.get_mut(handle.0 as usize) {
-                if existing.style == *style && existing.parts == parts {
-                    existing.last_used = self.clock;
-                    return Some(handle);
+            if let Some(slot) = self.blocks.get_mut(handle.slot as usize) {
+                if slot.generation == handle.generation {
+                    if let Some(existing) = slot.block.as_mut() {
+                        if existing.style == *style && existing.parts == parts {
+                            existing.last_used = self.clock;
+                            return Some(handle);
+                        }
+                    }
                 }
             }
         }
@@ -663,29 +740,41 @@ impl Text {
         }
         let layout = self.assemble(style, parts);
 
-        let handle = match self.block_lookup.get(&block) {
-            Some(&handle) => handle,
-            None => {
-                let slot = self
-                    .blocks
-                    .iter()
-                    .position(Option::is_none)
-                    .unwrap_or_else(|| {
-                        self.blocks.push(None);
-                        self.blocks.len() - 1
+        // Reuse this block's own slot if it still holds one; otherwise take a
+        // free slot and bump its generation so any handle to the old occupant
+        // stops resolving.
+        let index = match self.block_lookup.get(&block) {
+            Some(handle) if (handle.slot as usize) < self.blocks.len() => handle.slot as usize,
+            _ => match self.free_blocks.pop() {
+                Some(slot) => slot as usize,
+                None => {
+                    self.blocks.push(BlockSlot {
+                        generation: 0,
+                        block: None,
                     });
-                let handle = ShapedHandle(slot as u32);
-                self.block_lookup.insert(block, handle);
-                handle
-            }
+                    self.blocks.len() - 1
+                }
+            },
         };
-        self.blocks[handle.0 as usize] = Some(Block {
+        let slot = &mut self.blocks[index];
+        if slot.block.is_none() {
+            slot.generation = slot.generation.wrapping_add(1);
+        }
+        slot.block = Some(Block {
             key: block,
             style: *style,
             parts: parts.to_vec(),
             layout,
             last_used: self.clock,
+            geometry: None,
         });
+        let handle = ShapedHandle {
+            slot: index as u32,
+            generation: slot.generation,
+        };
+        self.block_lookup.insert(block, handle);
+        // Only sweeps when a pool is actually over its bound, and the check
+        // itself is O(1) — a frame that shapes thousands of blocks stays linear.
         self.evict();
         Some(handle)
     }
@@ -728,11 +817,20 @@ impl Text {
     /// Em-space geometry for a block. Borrow it for the length of the call and
     /// hold the [`ShapedHandle`], not this.
     pub fn measure(&self, h: ShapedHandle) -> &Layout {
-        self.blocks
-            .get(h.0 as usize)
-            .and_then(Option::as_ref)
+        self.block(h)
             .map(|block| &block.layout)
             .unwrap_or(&self.empty_layout)
+    }
+
+    /// Resolve a handle, rejecting one whose slot has since been reused.
+    fn block(&self, h: ShapedHandle) -> Option<&Block> {
+        let slot = self.blocks.get(h.slot as usize)?;
+        (slot.generation == h.generation).then_some(slot.block.as_ref()?)
+    }
+
+    fn block_index(&self, h: ShapedHandle) -> Option<usize> {
+        let slot = self.blocks.get(h.slot as usize)?;
+        (slot.generation == h.generation && slot.block.is_some()).then_some(h.slot as usize)
     }
 
     /// Coverage and cache introspection.
@@ -793,21 +891,117 @@ impl Text {
         color: Color,
         clip: Option<Rect>,
     ) {
+        self.draw_batch(
+            device,
+            queue,
+            pass,
+            &[Draw { block: h, at, size, color, clip }],
+        );
+    }
+
+    /// Record many blocks in **one** pair of draw calls.
+    ///
+    /// Each block's quads are cached and reused across frames while its draw
+    /// parameters hold, then concatenated into a single upload. This is what a
+    /// dense canvas needs: drawing tens of thousands of glyph-sized blocks one
+    /// call each costs hundreds of milliseconds in command recording alone, and
+    /// none of that work is about text.
+    pub fn draw_batch(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'_>,
+        items: &[Draw],
+    ) {
         self.ensure_gpu(device);
-        if self.gpu.is_none() || self.blocks.get(h.0 as usize).is_none_or(Option::is_none) {
+        if self.gpu.is_none() || items.is_empty() {
             return;
         }
 
-        let mut text_verts = std::mem::take(&mut self.text_scratch);
-        let mut emoji_verts = std::mem::take(&mut self.emoji_scratch);
+        let epoch = self.emoji.epoch();
+        let mut text_verts = std::mem::take(&mut self.batch_text);
+        let mut emoji_verts = std::mem::take(&mut self.batch_emoji);
         text_verts.clear();
         emoji_verts.clear();
+        // One growth up front. A dense frame concatenates tens of thousands of
+        // small runs, and letting the Vec double its way there is most of the
+        // batch cost.
+        text_verts.reserve(items.len() * 6);
+
+        for item in items {
+            let Some(index) = self.block_index(item.block) else {
+                continue;
+            };
+            let key = GeomKey {
+                size: item.size.to_bits(),
+                at: [item.at.x, item.at.y].map(f32::to_bits),
+                color: item.color.0.map(f32::to_bits),
+                clip: item.clip.map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
+            };
+            // Fast path: one traversal, cache hit, straight into the batch.
+            if let Some(geom) = self.blocks[index]
+                .block
+                .as_ref()
+                .and_then(|block| block.geometry.as_ref())
+            {
+                if geom.key == key && geom.epoch == epoch {
+                    text_verts.extend_from_slice(&geom.text);
+                    if !geom.emoji.is_empty() {
+                        emoji_verts.extend_from_slice(&geom.emoji);
+                    }
+                    continue;
+                }
+            }
+            self.rebuild_geometry(index, item, key, epoch);
+            if let Some(geom) = self.blocks[index]
+                .block
+                .as_ref()
+                .and_then(|block| block.geometry.as_ref())
+            {
+                text_verts.extend_from_slice(&geom.text);
+                if !geom.emoji.is_empty() {
+                    emoji_verts.extend_from_slice(&geom.emoji);
+                }
+            }
+        }
+
+        // Atlas uploads are `queue` writes, which land before this command buffer
+        // executes, so *adding* glyphs mid-pass is safe. The invariants that keep
+        // it safe — never recreate a texture already bound by an earlier draw in
+        // this pass, never evict a slot that draw sampled — live with the atlases.
+        let gpu = self.gpu.as_mut().expect("checked above");
+        gpu.text_atlas
+            .sync(device, queue, &gpu.text.atlas_layout, &self.glyphs);
+        gpu.emoji_atlas
+            .sync(device, queue, &gpu.emoji.atlas_layout, &self.emoji);
+
+        if !text_verts.is_empty() {
+            let buffer = TextRenderer::build_vertices(device, &text_verts);
+            gpu.text
+                .draw_vertices(pass, &gpu.text_atlas, &buffer, 0..text_verts.len() as u32);
+        }
+        if !emoji_verts.is_empty() {
+            let buffer = EmojiRenderer::build_vertices(device, &emoji_verts);
+            gpu.emoji
+                .draw(pass, &gpu.emoji_atlas, &buffer, 0..emoji_verts.len() as u32);
+        }
+
+        self.batch_text = text_verts;
+        self.batch_emoji = emoji_verts;
+    }
+
+    /// Build one block's quads into its geometry cache. CPU only — no device and
+    /// no upload; `draw_batch` does that once for the whole batch.
+    fn rebuild_geometry(&mut self, index: usize, item: &Draw, key: GeomKey, epoch: u64) {
+        let (at, size, color, clip) = (item.at, item.size, item.color, item.clip);
+        let mut text_verts = Vec::new();
+        let mut emoji_verts = Vec::new();
 
         // Emoji rasterization mutates the emoji cache, so it cannot happen while
-        // `block` is borrowed; collect the requests, then service them.
+        // the block is borrowed; collect the requests, then service them.
         let mut emoji_requests: Vec<(u16, u32, f32, f32)> = Vec::new();
         {
-            let block = self.blocks[h.0 as usize].as_ref().expect("checked above");
+            let block = self.blocks[index].block.as_ref().expect("checked by caller");
             for line in &block.layout.lines {
                 let top = at.y + line.metrics.top_em * size;
                 let bottom = top + line.metrics.height_em * size;
@@ -855,32 +1049,14 @@ impl Text {
             }
         }
 
-        // Atlas uploads are `queue` writes, which land before this command buffer
-        // executes, so *adding* glyphs mid-pass is safe. The invariants that keep
-        // it safe — never recreate a texture already bound by an earlier draw in
-        // this pass, never evict a slot that draw sampled — live with the atlases.
-        let gpu = self.gpu.as_mut().expect("checked above");
-        gpu.text_atlas
-            .sync(device, queue, &gpu.text.atlas_layout, &self.glyphs);
-        gpu.emoji_atlas
-            .sync(device, queue, &gpu.emoji.atlas_layout, &self.emoji);
-
-        // A buffer per draw. wgpu ref-counts resources bound into a pass, so these
-        // need not outlive the call — and because each draw owns its own, there is
-        // no shared region for a later draw in the same pass to clobber.
-        if !text_verts.is_empty() {
-            let buffer = TextRenderer::build_vertices(device, &text_verts);
-            gpu.text
-                .draw_vertices(pass, &gpu.text_atlas, &buffer, 0..text_verts.len() as u32);
+        if let Some(block) = self.blocks[index].block.as_mut() {
+            block.geometry = Some(Geometry {
+                key,
+                epoch,
+                text: text_verts,
+                emoji: emoji_verts,
+            });
         }
-        if !emoji_verts.is_empty() {
-            let buffer = EmojiRenderer::build_vertices(device, &emoji_verts);
-            gpu.emoji
-                .draw(pass, &gpu.emoji_atlas, &buffer, 0..emoji_verts.len() as u32);
-        }
-
-        self.text_scratch = text_verts;
-        self.emoji_scratch = emoji_verts;
     }
 
     // -- internals -----------------------------------------------------------
@@ -1037,16 +1213,39 @@ impl Text {
         }
     }
 
-    /// Drop cache entries untouched for a while. A block the consumer still uses
-    /// is kept alive by being re-shaped, which is a comparison when nothing moved.
+    /// Drop least-recently-used entries once a pool is over its bound. A block
+    /// the consumer keeps drawing is kept alive by being re-shaped (a comparison
+    /// when nothing moved), so this only ever reaches genuinely cold entries.
     fn evict(&mut self) {
-        let cutoff = self.clock.saturating_sub(CACHE_TTL);
-        self.paragraphs.retain(|_, entry| entry.last_used >= cutoff);
-        for slot in self.blocks.iter_mut() {
-            let stale = slot.as_ref().is_some_and(|block| block.last_used < cutoff);
-            if stale {
-                if let Some(block) = slot.take() {
+        if self.paragraphs.len() > MAX_PARAGRAPHS {
+            let mut ages: Vec<u64> = self.paragraphs.values().map(|p| p.last_used).collect();
+            let cut = self.paragraphs.len() - MAX_PARAGRAPHS * 3 / 4;
+            ages.select_nth_unstable(cut);
+            let threshold = ages[cut];
+            self.paragraphs.retain(|_, entry| entry.last_used > threshold);
+        }
+
+        let live = self.blocks.len() - self.free_blocks.len();
+        if live <= MAX_BLOCKS {
+            return;
+        }
+        let mut ages: Vec<u64> = self
+            .blocks
+            .iter()
+            .filter_map(|slot| slot.block.as_ref().map(|block| block.last_used))
+            .collect();
+        let cut = live - MAX_BLOCKS * 3 / 4;
+        ages.select_nth_unstable(cut);
+        let threshold = ages[cut];
+        for (index, slot) in self.blocks.iter_mut().enumerate() {
+            let cold = slot
+                .block
+                .as_ref()
+                .is_some_and(|block| block.last_used <= threshold);
+            if cold {
+                if let Some(block) = slot.block.take() {
                     self.block_lookup.remove(&block.key);
+                    self.free_blocks.push(index as u32);
                 }
             }
         }
@@ -1126,6 +1325,41 @@ impl Diagnostics<'_> {
         missing
     }
 
+    /// Whether any face in `chain` covers `c`. `false` means tofu.
+    pub fn covers(&self, chain: FontChainHandle, c: char) -> bool {
+        self.text
+            .chain_view(chain)
+            .iter()
+            .any(|entry| entry.font.has_glyph(c))
+    }
+
+    /// Family name of the face `c` would actually resolve to.
+    pub fn family_for(&self, chain: FontChainHandle, c: char) -> Option<String> {
+        let view = self.text.chain_view(chain);
+        let entry = view.iter().find(|entry| entry.font.has_glyph(c))?;
+        entry.font.family_name()
+    }
+
+    /// Em-space bounding box `(min_x, min_y, max_x, max_y)` of `c`'s outline, for
+    /// laying a single glyph out precisely. `None` for a color glyph or a
+    /// character nothing covers.
+    pub fn glyph_bbox(&self, chain: FontChainHandle, c: char) -> Option<(f32, f32, f32, f32)> {
+        let view = self.text.chain_view(chain);
+        let entry = view.iter().find(|entry| entry.font.has_glyph(c))?;
+        let id = entry.font.face().glyph_index(c)?;
+        let outlines = entry.font.load_glyph(id)?;
+        Some(outlines.bounding_box())
+    }
+
+    /// Whether `text` shapes to exactly one glyph in this chain — i.e. the font
+    /// ligates the whole sequence (a flag, a ZWJ emoji) rather than rendering it
+    /// as pieces.
+    pub fn is_single_glyph(&self, chain: FontChainHandle, text: &str) -> bool {
+        let view = self.text.chain_view(chain);
+        view.iter()
+            .any(|entry| crate::layout::shapes_to_single_glyph(entry.font, text))
+    }
+
     /// Curve, band and emoji atlas sizes, in texels.
     pub fn atlas_sizes(&self) -> ((u32, u32), (u32, u32), (u32, u32)) {
         (
@@ -1144,7 +1378,11 @@ impl Diagnostics<'_> {
     pub fn cache_occupancy(&self) -> (usize, usize) {
         (
             self.text.paragraphs.len(),
-            self.text.blocks.iter().filter(|slot| slot.is_some()).count(),
+            self.text
+                .blocks
+                .iter()
+                .filter(|slot| slot.block.is_some())
+                .count(),
         )
     }
 }
