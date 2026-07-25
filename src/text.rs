@@ -1390,8 +1390,8 @@ impl Diagnostics<'_> {
 
     /// Family name of the face `c` would actually resolve to.
     ///
-    /// Routed through the same [`face_for_grapheme`](crate::layout::face_for_grapheme)
-    /// the shaper uses, so this cannot disagree with what gets drawn. Resolving
+    /// Routed through the same `layout::face_for_grapheme` the shaper uses, so
+    /// this cannot disagree with what gets drawn. Resolving
     /// it here independently — "first face with a glyph" — silently ignores
     /// emoji presentation and reports the color font for every text-presentation
     /// character it happens to cover.

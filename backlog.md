@@ -71,8 +71,6 @@ compendium can't batch today, and the proposed order of work.
 
 ---
 
----
-
 ## No measurement of reflow itself
 
 `flow_paragraph` — greedy first-fit line breaking — has no benchmark. compendium's

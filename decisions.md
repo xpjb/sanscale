@@ -69,8 +69,8 @@ Pools:
 3. **Text glyph atlas** — Slug band/curve data (rasterized pixels). key: `(face_id, glyph_id)`. *(exists)*
 4. **Emoji atlas** — rasterized color glyphs (pixels). key: `(face_id, glyph_id, bucket)`. *(exists, bounded+evicting as of this week)*
 5. **Run shaping** *(Level 1)* — one itemized run's glyph sequence + advances, em-space. key: `(face, style, run-text)`. *(proposed; today shaping is only cached per-paragraph)*
-6. **Paragraph layout** *(Level 2)* — ordered run-refs + line flow for a paragraph. key: `(ParagraphKey, wrap_em, align)`. This is what a `ShapedHandle` points at.
-7. **Geometry** *(optional/deferred)* — per-key GPU vertex buffer. key: `(ParagraphKey, raster generation)`.
+6. **Paragraph layout** *(Level 2)* — ordered run-refs + line flow for a paragraph. key: `(ParagraphKey, Style)` — the whole style, since chain and `line_spacing` change the flow as much as `wrap_em` and `align` do. A block's part-refs point at these; a `ShapedHandle` resolves the *block*.
+7. **Geometry** — one block's quads, **host-side**, key `(color, clip)` plus an emoji atlas epoch and raster bucket. *Built* (it was written here as an optional GPU-buffer pool; both halves of that turned out wrong — see the note under *Maybe*).
 
 Note pools 3/4 (rasterization: glyph → pixels) are distinct from pool 5 (shaping:
 text → glyph sequence). Different arrows in the pipeline, different keys.
@@ -82,33 +82,41 @@ The pipeline, each arrow's output a cacheable pool:
 
 # API sketch (current)
 
-Reflects the locks below. wgpu is borrowed only at `draw` — the "optional wgpu" seam — so
-`shape`/`measure` run with no GPU. The `Text` body shows the pools; `Slab`/`Atlas`/`RunShaping`
-etc. are illustrative containers. Supporting value types (`Align`, `FontSource`, `Color`,
-`Layout`) elided.
+Tracks `src/text.rs` as built, not the shape we first sketched — where the two diverged, the
+divergence is noted at the decision it came from, below. wgpu is borrowed only at `draw` — the
+"optional wgpu" seam — so `shape`/`measure` run with no GPU. Supporting value types (`Align`,
+`FontData`, `Color`, `Layout`) elided.
 
 ```rust
 struct Text {
-    // the three pools the user's handles index into (a handle IS its slab index):
-    fonts:  Slab<Font>,   // FontHandle       — pool 1; deduped by font bytes
-    chains: Slab<Chain>,  // FontChainHandle  — pool 2; each a Vec<FontHandle>
-    blocks: Slab<Block>,  // ShapedHandle     — a composed unit: ordered part-refs into
-                          //   pool 6 + cumulative line offsets (the scroll index)
+    // the pools the user's handles index into (a handle IS its slot index):
+    fonts:  Vec<Font>,                     // FontHandle      — pool 1; deduped by data identity
+    chains: Vec<Option<Vec<FontHandle>>>,  // FontChainHandle — pool 2; `None` = dropped slot, so
+                                           //   live handles stay valid across a font reload
+    blocks: Vec<BlockSlot>,                // ShapedHandle    — a composed unit: ordered part-refs
+                                           //   into pool 6 + cumulative line offsets (scroll index)
 
-    // internally managed — no user handle (all evict LRU):
-    block_lookup: HashMap<BlockKey, ShapedHandle>,               // shape() hit → existing slot
-    paragraphs:   HashMap<(ParagraphKey, Style), ParaLayout>,    // pool 6; Level-2, per paragraph
-    runs:         HashMap<RunKey, RunShaping>,       // pool 5; Level-1, content-keyed (font + run text)
-    text_atlas:   Atlas,                             // pool 3; (font, glyph) → Slug pixels      (CPU)
-    emoji_atlas:  Atlas,                             // pool 4; (font, glyph, bucket) → RGBA      (CPU)
-    geometry:     HashMap<ParagraphKey, VertexBuf>,  // pool 7 (optional) — vertex buffers  (GPU, lazy)
-    gpu:          Option<GpuResources>,              // pipeline per target format, atlas textures
+    // held apart from `blocks` deliberately — each is walked by a hot path that wants to
+    // touch nothing else (see Implementation notes):
+    generations: Vec<u32>,                // handle validation: a dense 4-byte probe
+    geometry:    Vec<Option<Geometry>>,   // pool 7; the only array `draw_batch` walks
+    free_blocks: Vec<u32>,                // tombstoned slots, newest first. Never `swap_remove`
+
+    // internally managed — no user handle:
+    block_lookup: HashMap<BlockKey, ShapedHandle>,             // shape() hit → existing slot
+    paragraphs:   HashMap<(ParagraphKey, Style), ParaLayout>,   // pool 6; Level-2, per paragraph
+    glyphs:       GlyphCache,   // pool 3; (face, glyph)         → Slug band/curve data  (CPU)
+    emoji:        EmojiCache,   // pool 4; (face, glyph, bucket) → RGBA                  (CPU)
+    gpu:          Option<Gpu>,  // pipelines per target format, atlas textures, vertex arena
 }
+// Pool 5 (content-keyed run shaping) is not built: shaping caches per paragraph.
 
 // handles — all Copy, indices into the pools
-#[derive(Clone, Copy)] struct FontHandle(u32);       // one mapped concrete font
+#[derive(Clone, Copy)] struct FontHandle(u16);       // one mapped concrete font
 #[derive(Clone, Copy)] struct FontChainHandle(u16);  // ordered fallback list of fonts
-#[derive(Clone, Copy)] struct ShapedHandle(u32);     // a shaped *block* (1..N paragraphs)
+// Not a bare index: eviction reuses a slot, and a handle the consumer cached must resolve
+// to *nothing* rather than to a different block. See Implementation notes.
+#[derive(Clone, Copy)] struct ShapedHandle { slot: u32, generation: u32 }  // a shaped *block*
 
 // cousins of the handles: Copy, consumer-minted, not pool indices
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -120,12 +128,13 @@ struct BlockKey(u64);                                              // unit of co
 struct Style { chain: FontChainHandle, wrap_em: Option<f32>, align: Align, line_spacing: f32 }
 
 impl Text {
-    // takes nothing: pipelines are per-target and lazy (see set_target), and the atlas
-    // self-bounds to the device limit at first draw (width is fixed 2048 internally).
+    // takes nothing: pipelines are per-target and lazy (see set_target), and the atlases
+    // size themselves — grow-on-demand, warning at the device limit.
     fn new() -> Self;   // lives beside the consumer's renderer, never inside it
 
-    // discovery is the consumer's (fontdb → bytes). map dedups; "map" leaves mmap open.
-    fn map_font(&mut self, src: FontSource) -> Result<FontHandle, FontError>;
+    // discovery is the consumer's (fontdb → bytes). Dedups on data identity, so pass the
+    // *same* Arc for a shared face. `face_index` picks a face out of a collection.
+    fn map_font(&mut self, data: FontData, face_index: u32) -> Result<FontHandle, FontError>;
     fn register_chain(&mut self, fonts: &[FontHandle]) -> FontChainHandle;  // stored as-is
     fn drop_chain(&mut self, chain: FontChainHandle);   // settings font reload
     fn clear(&mut self);
@@ -160,6 +169,15 @@ impl Text {
     // device-free.
     fn draw(&mut self, device: &Device, queue: &Queue, pass: &mut RenderPass,
             h: ShapedHandle, at: Vec2, size: f32, color: Color, clip: Option<Rect>);
+
+    // Many blocks, one set of pass state: `draw` is this with a one-item slice. Ruinous
+    // to skip at glyph granularity (267 ms vs 6.5 ms on a 41k-block frame); see litigation.
+    fn draw_batch(&mut self, device: &Device, queue: &Queue, pass: &mut RenderPass,
+                  items: &[Draw]);   // Draw { block, at, size, color, clip }
+
+    // Coverage and atlas-pressure queries. Arrived by accretion; whether it belongs on the
+    // surface at all is parked in `backlog.md`.
+    fn diagnostics(&self) -> Diagnostics<'_>;
 }
 ```
 
@@ -173,8 +191,13 @@ Things we're certain about, and why.
   the GPU resources. Everything else is `Copy` handles into it — `FontHandle`,
   `FontChainHandle`, `ShapedHandle` — and value types — `ParagraphKey`, `BlockKey`, `Style`.
   Methods: `new`, `map_font`, `register_chain`, `drop_chain`, `clear`, `shape`, `shape_one`,
-  `measure`, `set_target`, `set_transform`, `draw`. wgpu is borrowed only at `draw` (plus the two
+  `shape_transient`, `measure`, `set_target`, `set_transform`, `pixel_ortho`, `draw`,
+  `draw_batch`, `diagnostics`. wgpu is borrowed only at `draw`/`draw_batch` (plus the two
   per-pass setters). No per-frame object.
+
+  *Three of those arrived after this lock was written and none of them bent it:*
+  `shape_transient` (content-keyed identity for tooltips), `draw_batch` (pass-state grain,
+  measured — see litigation) and `diagnostics` (accretion — see `backlog.md`).
 
 - **Two consumer-facing levels: the *block* is the coordinate space, the *paragraph* is the
   unit of invalidation.** `shape` takes a `BlockKey` and a slice of `ParagraphKey`s and returns
@@ -239,6 +262,17 @@ Things we're certain about, and why.
   twice — the provider returns `Option`, and the layout path bails on a `byte_len` mismatch.
   Without a failure path the alternatives are panic or silently rendering the wrong paragraph.
 
+  **Shipped as a trait, not a closure** — `trait ParagraphSource { fn paragraph_text(&self,
+  index: usize, key: ParagraphKey) -> Option<Cow<'_, str>> }`, taken as `&dyn`. The fallible
+  half of the lock is intact; what changed is the shape of the callable. Two reasons, both
+  found while building: an `FnMut` closure would have to capture the consumer's store
+  mutably, which fights `shape`'s own `&mut self` at the call site, whereas `&self` through a
+  trait unifies with the caller's other borrows; and `shape` consults the source *only for
+  parts that miss*, so a positional implementor needs the part `index` alongside the key —
+  a closure taking only the key cannot find its own text. Note this is not a return to the
+  boxed `TextParagraphProvider` under *Cutting*: it is borrowed, never boxed, and the
+  built-in `Paragraphs(&[&str])` covers consumers holding plain strings.
+
 - **`ParagraphKey` keeps a namespace.** `{namespace, slot, generation}`, not `{id, version}`.
   Same 16 bytes, but folding a document id and a pool slot into one `u64` needs a hash, and a
   hash collision in a cache key renders *the wrong text*, silently and persistently. Grounded:
@@ -264,6 +298,18 @@ Things we're certain about, and why.
   glyph). Adds are safe — `queue.write_texture` lands before the command buffer executes. This
   is realistic on the *emoji* atlas specifically, since it's the bounded, evicting one. Same
   shape of rule for the vertex arena: bump-allocate, never reuse a region within a frame.
+
+  **The allocate-once half was not built, and did not need to be.** Both atlases
+  grow on demand instead — power-of-two height, recreating the texture and bind group
+  (`renderer.rs`, `grow_texture_height`) — because allocating at the device cap up front means
+  a 4096×8192 RGBA texture for a document with one line of text. What makes that safe is
+  *ordering*, which is the cheaper fix: `draw_batch` builds all geometry, then syncs both
+  atlases, then records its draws — so a recreate can never land after a draw in that call has
+  already bound the old texture. A grown texture is bound by every draw that follows it, and
+  earlier calls' bind groups stay alive and still hold the glyphs they sampled (wgpu
+  ref-counts what a pass binds). The eviction half of the lock stands as written, unchanged.
+  What was really load-bearing here was never "one allocation" — it was "never recreate
+  *between* a bind and its draw", which is a statement about call order, not about capacity.
 
 - **The service is a glyph-quad source, not a compositor — it never owns the render pass.**
   The consumer builds the pass (target, clear/load, z-sorted interleave with its own
@@ -322,7 +368,8 @@ Things we're certain about, and why.
   that change this benefit silently does not happen.
 
 - **The consumer supplies identity; the service never mints paragraph handles from a blob.**
-  `ParagraphKey { id, version }`. One `shape()` = one unit = one handle. The service breaks
+  `ParagraphKey { namespace, slot, generation }` (this lock was written before the namespace
+  went in, as `{ id, version }`). One `shape()` = one unit = one handle. The service breaks
   internally (font, line) but never returns a variable number of handles. Reason: the
   consumer already owns document structure; service-minted handles force a sync problem.
   Selection/marquee is *easier* this way — `measure` gives per-unit geometry, the consumer
@@ -408,6 +455,17 @@ Things we were pretty confident on, phrased as if we'd do them — but might nee
   frame today and it's fine, so this is designed-in-shape, deferred-in-fact. Ship without it,
   add transparently when power actually matters.
 
+  **Built — and the "no API change" prediction held, while both nouns in the title turned out
+  wrong.** Not *vertex buffers*: quads are cached **host-side** (`Vec<Option<Geometry>>`), so
+  `draw_batch` can concatenate many blocks into one upload and one draw call, which is the
+  40x on a dense frame (267 ms → 6.5 ms) — a GPU buffer per block forecloses exactly that.
+  Not *per key* in the sense meant here either: the key is per **block** and is
+  `(color, clip)` plus an emoji epoch and raster bucket — `at` and `size` are deliberately
+  **not** in it, which is what makes the cache survive a camera move rather than invalidating
+  on every pan. That last point took a measurement to see and is the whole subject of
+  `rfc-batch-cache.md`; the entry as written would have shipped a cache that missed every
+  frame the camera moved.
+
 - **`ShapedHandle` as a distinct `Copy` token vs just `draw(BlockKey, …)`.** *We'd keep it* to
   skip re-hashing the key on measure/draw. *But maybe* collapse to draw-by-`BlockKey` (one extra
   hashmap lookup per draw, probably nothing). A dial, not a principle.
@@ -420,6 +478,12 @@ Things we were pretty confident on, phrased as if we'd do them — but might nee
 - **`FontError` enum replacing `Result<_, String>`.** In the sketch as `map_font -> Result`;
   stringly errors are wrong for a published crate. *But* exact variants (Io / Parse /
   NoCoverage / …) TBD.
+
+  **Built, and the variant list came out shorter than the guesses:** `Parse` and `PoolFull`,
+  with `Display` + `std::error::Error`. No `Io` — the crate stopped doing file I/O when
+  `FontSource::Path` was cut, so a read error is the consumer's before it ever reaches
+  `map_font`. No `NoCoverage` — an uncovered char is tofu at shape time, not a mapping
+  failure; the coverage queries on `diagnostics()` are where that question is answered.
 
 ---
 
