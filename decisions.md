@@ -5,6 +5,52 @@ machinery (Slug pipeline, glyph/emoji caches, eviction, rasterization) is **not*
 changing — this is a public-surface rework. Pressure-tested against the only real
 consumer, `compendium` (which aliases the crate as `text`), plus our own examples.
 
+---
+
+# Nouns
+
+The vocabulary, because it has accreted and most of it is one-per-pool. Read this
+first; everything below assumes it.
+
+1. **Font** — one mapped concrete face, deduped by data identity. `FontHandle`.
+2. **Chain** — an ordered fallback list of fonts. `FontChainHandle`. *Discovery*
+   (family name → bytes) is the consumer's; the *fallback walk* (chain → per-grapheme
+   face) is ours.
+3. **Run** — a maximal span of text resolving to a single face; what `itemize`
+   emits. Purely internal: the consumer never sees one, and never breaks text by
+   font.
+4. **Line** — what flow emits. One paragraph produces 1..N.
+5. **Paragraph** — the unit of **invalidation**. The consumer owns its identity and
+   version (`ParagraphKey`); it is flowed independently and cached at
+   `(ParagraphKey, Style)`, which is why an edit reshapes one paragraph and not the
+   document.
+6. **Block** — the unit of **coordinate space**. 1..N paragraphs at one `Style`,
+   concatenated — *not* reflowed — into one byte range, one line list, one `Layout`.
+   `BlockKey` names it; `ShapedHandle` resolves it. The reason it exists is that its
+   paragraphs want to be **measured together**: one hit-test, one caret space, a
+   selection that spans paragraph boundaries. Sharing a `Style` (so they would
+   reflow together if it changed) is a consequence, not the point.
+7. **Glyph** — a rasterized atlas cell. Keyed `(face, glyph_id)` for text,
+   `(face, glyph_id, bucket)` for emoji. Distinct from a *run*: rasterization and
+   shaping are different arrows in the pipeline.
+8. **Geometry** — one block's quads at a given set of draw parameters, cached
+   host-side. Position- and scale-independent, so a camera move re-runs none of it.
+9. **Batch** — *(proposed, see `rfc-batch-cache.md`)* the unit of **pass state**:
+   blocks sharing a scissor and a contiguous z-slot, concatenated into one draw
+   call. The only noun here that belongs to **rendering** rather than to text, which
+   is why it is a slice of `Draw` and not a key.
+
+Three of these are the load-bearing consumer-facing axes, and each has a different
+owner — confusing them is how the design goes wrong:
+
+| noun | unit of | owned by |
+|---|---|---|
+| paragraph | invalidation | consumer (identity + version) |
+| block | coordinate space | consumer composes, service flows |
+| batch | pass state | consumer (z-order, scissor) |
+
+---
+
 Mental model: **there is one `Text` service that holds ~7 keyed pools with eviction.**
 Only the atlas is hard, and it's already built. Everything else is a HashMap + a version.
 
