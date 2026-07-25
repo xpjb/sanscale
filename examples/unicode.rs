@@ -1,75 +1,88 @@
 //! Challenging Unicode: color emoji, CJK, Arabic/Hebrew, Indic, Greek, Cyrillic,
 //! math/symbols — all resolved through a system-font fallback chain and drawn in
-//! one pass (vector glyphs + the color-emoji atlas). Writes `unicode.png`.
+//! one pass (vector glyphs plus the color-emoji atlas). Writes `unicode.png`.
+//!
+//! Each labelled sample is its own block, so this also exercises many small
+//! blocks sharing one font pool and one glyph cache.
 //!
 //! Run with:  `cargo run --example unicode`
 
 mod common;
 
-use common::{font_chain, unicode_sections, Harness, UNICODE_FALLBACK};
-use sanscale::{EmojiRenderer, TextArgs, TextEngine, TextRenderer};
+use common::{unicode_sections, Harness, UNICODE_FALLBACK};
+use sanscale::{Align, Color, ShapedHandle, Style, Text, Vec2};
 
 fn main() {
     let (width, height) = (1220u32, 1000u32);
     let harness = Harness::new(width, height);
 
-    let sources = font_chain(UNICODE_FALLBACK);
-    if sources.is_empty() {
+    let mut text = Text::new();
+    let chain = common::font_chain(&mut text, UNICODE_FALLBACK);
+    let families = text.diagnostics().chain_families(chain);
+    if families.is_empty() {
         eprintln!("no fonts found via fontdb");
         return;
     }
-    let mut engine = TextEngine::from_sources(sources).expect("build fallback chain");
-    println!("fallback chain: {}", engine.fallback_family_names().join(" → "));
+    println!("fallback chain: {}", families.join(" → "));
 
-    let text_renderer = TextRenderer::new(&harness.device, &harness.config);
-    let emoji_renderer = EmojiRenderer::new(&harness.device, &harness.config);
-    let mut text_atlas = engine.new_atlas(&harness.device, &harness.queue, &text_renderer.atlas_layout);
-    let mut emoji_atlas =
-        engine.new_emoji_atlas(&harness.device, &harness.queue, &emoji_renderer.atlas_layout);
-
-    let label = TextArgs {
-        size_px: 15.0,
-        color: [0.45, 0.47, 0.52, 1.0],
-        ..Default::default()
-    };
-    let sample = TextArgs {
-        size_px: 30.0,
-        color: [0.10, 0.11, 0.13, 1.0],
-        ..Default::default()
+    let style = Style {
+        chain,
+        wrap_em: None,
+        align: Align::Left,
+        line_spacing: 1.2,
     };
 
-    let mut y = 46.0;
-    for (name, text) in unicode_sections() {
-        engine.text(40.0, y, name, &label);
-        engine.text(40.0, y + 34.0, text, &sample);
-        y += 76.0;
+    // Labels and samples differ only in draw size — one style, one cache.
+    let sections = unicode_sections();
+    let mut blocks: Vec<(ShapedHandle, ShapedHandle)> = Vec::new();
+    for (name, sample) in sections.iter() {
+        // Literals have no stable identity, so content-key them.
+        let Some(label) = text.shape_transient(name, &style) else {
+            continue;
+        };
+        let Some(body) = text.shape_transient(sample, &style) else {
+            continue;
+        };
+        blocks.push((label, body));
     }
-
-    // Report any codepoints no installed face could cover (diagnostic).
-    let all: String = unicode_sections().iter().map(|(_, t)| *t).collect();
-    let missing = engine.uncovered_chars(&all);
+    // Diagnostic: any code point no installed face can cover renders as tofu.
+    let all: String = sections.iter().map(|(_, t)| *t).collect();
+    let missing = text.diagnostics().uncovered_chars(chain, &all);
     if !missing.is_empty() {
         println!("uncovered on this system (no font): {missing:?}");
     }
 
-    engine.sync_atlas(&mut text_atlas, &harness.device, &harness.queue, &text_renderer.atlas_layout);
-    engine.sync_emoji_atlas(&mut emoji_atlas, &harness.device, &harness.queue, &emoji_renderer.atlas_layout);
-    let text_vertices = engine.flush().to_vec();
-    let emoji_vertices = engine.emoji_vertices().to_vec();
-
-    harness.save_png_with_emoji(
-        &text_renderer,
-        &text_atlas,
-        &text_vertices,
-        &emoji_renderer,
-        &emoji_atlas,
-        &emoji_vertices,
+    harness.save_png(
+        &mut text,
         wgpu::Color::WHITE,
         "unicode.png",
+        |text, device, queue, pass| {
+            let mut y = 40.0;
+            for (label, body) in &blocks {
+                text.draw(
+                    device,
+                    queue,
+                    pass,
+                    *label,
+                    Vec2::new(40.0, y),
+                    15.0,
+                    Color([0.45, 0.47, 0.52, 1.0]),
+                    None,
+                );
+                text.draw(
+                    device,
+                    queue,
+                    pass,
+                    *body,
+                    Vec2::new(40.0, y + 24.0),
+                    30.0,
+                    Color([0.10, 0.11, 0.13, 1.0]),
+                    None,
+                );
+                y += 76.0;
+            }
+        },
     );
-    println!(
-        "wrote unicode.png ({} glyphs, {} color emoji)",
-        text_vertices.len() / 6,
-        emoji_vertices.len() / 6
-    );
+    let (paragraphs, live) = text.diagnostics().cache_occupancy();
+    println!("wrote unicode.png ({paragraphs} cached paragraphs, {live} live blocks)");
 }

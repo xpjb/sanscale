@@ -1,41 +1,74 @@
-//! Minimal end-to-end: load a font, render a line of text, save a PNG.
+//! Minimal end-to-end: register a font, shape a line, draw it to a PNG.
 //!
 //! Headless — no window is opened. The GPU/PNG plumbing lives in `common`; this
-//! file is just the sanscale path: font → `text` → `flush` → upload → draw.
+//! file is the whole sanscale path: map font → register chain → shape → draw.
 //!
 //! Run with:  `cargo run --example hello_png`  (writes `hello.png`)
 
 mod common;
 
-use common::{Harness, FONT_CANDIDATES};
-use sanscale::{TextArgs, TextEngine, TextRenderer};
+use common::Harness;
+use sanscale::{Align, BlockKey, Color, ParagraphKey, Paragraphs, Style, Text, Vec2};
+
+const TEXT: &str = "Hello, sanscale!";
 
 fn main() {
     let harness = Harness::new(900, 220);
 
-    // Load the first available system font into a TextEngine.
-    let Some(mut engine) = FONT_CANDIDATES
-        .iter()
-        .find_map(|path| TextEngine::load(path).ok())
-    else {
-        eprintln!("no system font found; edit FONT_CANDIDATES in examples/common");
+    // One service holds the font pool, the caches and (lazily) the GPU
+    // resources. Nothing below touches a device until `save_png` draws.
+    let mut text = Text::new();
+    let chain = common::font_chain(
+        &mut text,
+        &["Segoe UI", "Helvetica Neue", "Arial", "DejaVu Sans"],
+    );
+
+    let style = Style {
+        chain,
+        wrap_em: None,
+        align: Align::Left,
+        line_spacing: 1.2,
+    };
+
+    // Identity is the consumer's to mint. A one-off like this can use any stable
+    // key; a document would use its own node/paragraph ids.
+    let key = ParagraphKey {
+        namespace: 0,
+        slot: 0,
+        generation: 0,
+    };
+    let Some(block) = text.shape(BlockKey(0), &style, &[key], &Paragraphs(&[TEXT])) else {
+        eprintln!("no usable system font found; edit the family list above");
         return;
     };
 
-    // The renderer owns the GPU pipeline; the atlas caches glyph curves on the GPU.
-    let renderer = TextRenderer::new(&harness.device, &harness.config);
-    let mut atlas = engine.new_atlas(&harness.device, &harness.queue, &renderer.atlas_layout);
+    // Geometry is em, so it is the same at every size. Multiply to place it.
+    let size_px = 96.0;
+    let measured = text.measure(block).size_em();
+    println!(
+        "shaped {TEXT:?} — {:.2} x {:.2} em ({:.0} x {:.0} px at {size_px}px)",
+        measured.x,
+        measured.y,
+        measured.x * size_px,
+        measured.y * size_px
+    );
 
-    // Queue one line of text at a pixel baseline, upload any new glyphs, flush.
-    let args = TextArgs {
-        size_px: 96.0,
-        color: [0.10, 0.11, 0.13, 1.0],
-        ..TextArgs::default()
-    };
-    engine.text(40.0, 150.0, "Hello, sanscale!", &args);
-    engine.sync_atlas(&mut atlas, &harness.device, &harness.queue, &renderer.atlas_layout);
-    let vertices = engine.flush().to_vec();
-
-    harness.save_png(&renderer, &atlas, &vertices, wgpu::Color::WHITE, "hello.png");
-    println!("wrote hello.png ({} vertices)", vertices.len());
+    harness.save_png(
+        &mut text,
+        wgpu::Color::WHITE,
+        "hello.png",
+        |text, device, queue, pass| {
+            text.draw(
+                device,
+                queue,
+                pass,
+                block,
+                Vec2::new(40.0, 40.0),
+                size_px,
+                Color([0.10, 0.11, 0.13, 1.0]),
+                None,
+            );
+        },
+    );
+    println!("wrote hello.png");
 }

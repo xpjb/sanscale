@@ -18,8 +18,7 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec2, Vec3};
 use sanscale::{
-    EmojiAtlas, EmojiRenderer, EmojiVertex, TextArgs, TextAtlas, TextEngine, TextRenderer,
-    TextVertex,
+    Align, Draw, FontChainHandle, ShapedHandle, Style, Text,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -61,8 +60,16 @@ fn ortho(w: f32, h: f32) -> Mat4 {
 fn model(offset: Vec2, scale: f32) -> Mat4 {
     Mat4::from_translation(Vec3::new(offset.x, offset.y, 0.0)) * Mat4::from_scale(Vec3::splat(scale))
 }
-fn args(size_px: f32, color: [f32; 4]) -> TextArgs {
-    TextArgs { size_px, color, ..Default::default() }
+/// The replacement box drawn for a sequence the fonts can't ligate.
+const TOFU_BOX: &str = "\u{25A1}";
+
+/// One placed cell: a shaped handle plus where and how big to draw it.
+#[derive(Clone, Copy)]
+struct PlacedCell {
+    glyph: ShapedHandle,
+    at: Vec2,
+    size: f32,
+    color: [f32; 4],
 }
 
 /// One emoji cell: world x, the (possibly multi-code-point) string, and its name.
@@ -96,92 +103,40 @@ fn build_layout() -> Vec<RowLayout> {
     layout
 }
 
-/// A vertex buffer written in place each frame; reallocated only when it grows.
-struct DynBuf {
-    buf: wgpu::Buffer,
-    cap: u64,
-}
-
-impl DynBuf {
-    fn new(device: &wgpu::Device) -> Self {
-        Self { buf: Self::alloc(device, 4096), cap: 4096 }
-    }
-    fn alloc(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dyn vertices"),
-            size,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
-    }
-    fn upload<T: bytemuck::Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[T]) -> u32 {
-        let bytes: &[u8] = bytemuck::cast_slice(data);
-        if bytes.is_empty() {
-            return 0;
-        }
-        if bytes.len() as u64 > self.cap {
-            self.cap = (bytes.len() as u64).next_power_of_two();
-            self.buf = Self::alloc(device, self.cap);
-        }
-        queue.write_buffer(&self.buf, 0, bytes);
-        data.len() as u32
-    }
-}
-
 struct Viewer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    engine: TextEngine,
-    text_renderer: TextRenderer,
-    emoji_renderer: EmojiRenderer,
-    text_atlas: TextAtlas,
-    emoji_atlas: EmojiAtlas,
-    grid_buf: DynBuf,
-    emoji_buf: DynBuf,
-    overlay_buf: DynBuf,
+    text: Text,
+    chain: FontChainHandle,
+    format: wgpu::TextureFormat,
     layout: Vec<RowLayout>,
     world_h: f32,
-    rows: HashMap<i64, (Vec<TextVertex>, Vec<EmojiVertex>)>,
-    /// Last-seen emoji atlas eviction epoch. When it changes, cached rows may hold
-    /// stale atlas UVs (a recycled cell now shows a different glyph) so we drop them.
-    emoji_epoch: u64,
-    scratch_text: Vec<TextVertex>,
-    scratch_emoji: Vec<EmojiVertex>,
+    /// Per-row cached *placements*; the service caches the shaping and the quads.
+    /// Gone with it: the `emoji_epoch` invalidation, which existed only because
+    /// these used to be atlas-baked vertices held out here.
+    rows: HashMap<i64, Vec<PlacedCell>>,
 }
 
 impl Viewer {
     fn new(device: wgpu::Device, queue: wgpu::Queue, config: &wgpu::SurfaceConfiguration) -> Self {
-        let mut engine =
-            TextEngine::from_sources(font_chain(UNICODE_FALLBACK)).expect("no usable fonts");
-        // Give the emoji atlas real headroom (the default cap is a conservative 4096),
-        // bounded by the device limit so it can never silently overflow the texture.
-        engine.set_emoji_atlas_max_height(device.limits().max_texture_dimension_2d.min(8192));
-        let text_renderer = TextRenderer::new(&device, config);
-        let emoji_renderer = EmojiRenderer::new(&device, config);
-        let text_atlas = engine.new_atlas(&device, &queue, &text_renderer.atlas_layout);
-        let emoji_atlas = engine.new_emoji_atlas(&device, &queue, &emoji_renderer.atlas_layout);
+        let mut text = Text::new();
+        let chain = font_chain(&mut text, UNICODE_FALLBACK);
         let layout = build_layout();
         let world_h = (layout.len() as f32 + 1.0) * CELL_H;
-        let (grid_buf, emoji_buf, overlay_buf) =
-            (DynBuf::new(&device), DynBuf::new(&device), DynBuf::new(&device));
         Self {
             device,
             queue,
-            engine,
-            text_renderer,
-            emoji_renderer,
-            text_atlas,
-            emoji_atlas,
-            grid_buf,
-            emoji_buf,
-            overlay_buf,
+            text,
+            chain,
+            format: config.format,
             layout,
             world_h,
             rows: HashMap::new(),
-            emoji_epoch: 0,
-            scratch_text: Vec::new(),
-            scratch_emoji: Vec::new(),
         }
+    }
+
+    fn style(&self) -> Style {
+        Style { chain: self.chain, wrap_em: None, align: Align::Left, line_spacing: 1.0 }
     }
 
     /// Shape and cache one row's emoji (each cell may be a multi-code-point
@@ -190,50 +145,66 @@ impl Viewer {
         if self.rows.contains_key(&r) {
             return;
         }
-        let (t, e) = if r >= 0 && (r as usize) < self.layout.len() {
-            let ink = args(GLYPH_PX, INK);
-            let tofu = args(GLYPH_PX * 0.72, [0.72, 0.73, 0.77, 1.0]);
-            let y = r as f32 * CELL_H + GLYPH_PX + 4.0;
-            let cells = &self.layout[r as usize].cells;
-            for cell in cells {
-                // Sequences the font can't ligate (a missing ZWJ/flag component)
+        let mut cells = Vec::new();
+        if r >= 0 && (r as usize) < self.layout.len() {
+            let style = self.style();
+            let y = r as f32 * CELL_H;
+            let row: Vec<(f32, &'static str)> = self.layout[r as usize]
+                .cells
+                .iter()
+                .map(|cell| (cell.x, cell.emoji))
+                .collect();
+            for (x, emoji) in row {
+                // Sequences the fonts can't ligate (a missing ZWJ/flag component)
                 // shape to several glyphs that overflow the cell — show one tofu
                 // box instead of the overlapping pieces.
-                if self.engine.is_single_glyph(cell.emoji) {
-                    self.engine.text(cell.x, y, cell.emoji, &ink);
+                let single = self.text.diagnostics().is_single_glyph(self.chain, emoji);
+                let (content, at, size, color) = if single {
+                    (emoji, Vec2::new(x, y), GLYPH_PX, INK)
                 } else {
-                    self.engine.text(cell.x + 3.0, y - 5.0, "\u{25A1}", &tofu);
+                    (TOFU_BOX, Vec2::new(x + 3.0, y + 5.0), GLYPH_PX * 0.72, [0.72, 0.73, 0.77, 1.0])
+                };
+                if let Some(glyph) = self.text.shape_transient(content, &style) {
+                    cells.push(PlacedCell { glyph, at, size, color });
                 }
             }
-            self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
-            self.engine.sync_emoji_atlas(&mut self.emoji_atlas, &self.device, &self.queue, &self.emoji_renderer.atlas_layout);
-            (self.engine.flush().to_vec(), self.engine.emoji_vertices().to_vec())
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        self.rows.insert(r, (t, e));
+        }
+        self.rows.insert(r, cells);
     }
 
     /// World-space category titles in the gutter — same offset-invariant dedup as
     /// `unicode_zoom` so panning doesn't reshuffle which show.
-    fn emit_titles(&mut self, offset: Vec2, scale: f32, h: f32) {
-        let args = args(TITLE_PX, TITLE);
+    fn title_cells(&mut self, offset: Vec2, scale: f32, h: f32) -> Vec<PlacedCell> {
+        let style = self.style();
         let min_gap = TITLE_PX * scale * 1.1;
         let mut last_kept = f32::MIN;
-        for r in 0..self.layout.len() {
-            let Some(name) = self.layout[r].title else { continue };
+        let mut cells = Vec::new();
+        let titles: Vec<(i64, &'static str)> = self
+            .layout
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| row.title.map(|t| (i as i64, t)))
+            .collect();
+        for (r, name) in titles {
             let screen_y = r as f32 * CELL_H * scale + offset.y;
             if screen_y < last_kept + min_gap {
                 continue;
             }
             last_kept = screen_y;
             if screen_y >= -TITLE_PX * scale && screen_y <= h {
-                self.engine.text(10.0, r as f32 * CELL_H + TITLE_PX * 0.82, name, &args);
+                if let Some(glyph) = self.text.shape_transient(name, &style) {
+                    cells.push(PlacedCell {
+                        glyph,
+                        at: Vec2::new(10.0, r as f32 * CELL_H),
+                        size: TITLE_PX,
+                        color: TITLE,
+                    });
+                }
             }
         }
+        cells
     }
 
-    /// Emoji under the cursor: name, its code points, and the resolved font.
     fn hovered(&self, cursor: Vec2, offset: Vec2, scale: f32) -> Option<Hover> {
         let world = (cursor - offset) / scale;
         let col = ((world.x - GUTTER_W) / CELL_W).floor() as i64;
@@ -252,7 +223,7 @@ impl Viewer {
             .emoji
             .chars()
             .next()
-            .and_then(|c| self.engine.family_for(c))
+            .and_then(|c| self.text.diagnostics().family_for(self.chain, c))
             .unwrap_or_else(|| "—".into());
         // Stable fields first (padded); the noisy variable-length name goes last.
         Some(Hover {
@@ -271,37 +242,34 @@ impl Viewer {
         scale: f32,
         hud: Option<&str>,
     ) {
-        // If the atlas recycled any cell since last frame, cached rows may point at a
-        // reused slot now holding a different glyph — drop the cache and re-shape.
-        let epoch = self.engine.emoji_epoch();
-        if epoch != self.emoji_epoch {
-            self.emoji_epoch = epoch;
-            self.rows.clear();
-        }
-
-        let max_row = (self.layout.len() as i64 - 1).max(0);
         let inv = 1.0 / scale;
-        let r0 = ((((0.0 - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, max_row);
-        let r1 = ((((h - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, max_row);
-        self.scratch_text.clear();
-        self.scratch_emoji.clear();
+        let r0 = ((((0.0 - offset.y) * inv) / CELL_H).floor() as i64).max(0);
+        let r1 = ((((h - offset.y) * inv) / CELL_H).floor() as i64)
+            .min(self.layout.len() as i64 - 1);
+        let mut cells: Vec<PlacedCell> = Vec::new();
         for r in r0..=r1 {
             self.build_row(r);
-            let (t, e) = &self.rows[&r];
-            self.scratch_text.extend_from_slice(t);
-            self.scratch_emoji.extend_from_slice(e);
+            cells.extend_from_slice(&self.rows[&r]);
         }
-        self.emit_titles(offset, scale, h);
-        self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
-        let titles = self.engine.flush().to_vec();
-        self.scratch_text.extend_from_slice(&titles);
+        cells.extend(self.title_cells(offset, scale, h));
 
-        let tn = self.grid_buf.upload(&self.device, &self.queue, &self.scratch_text);
-        let en = self.emoji_buf.upload(&self.device, &self.queue, &self.scratch_emoji);
-
+        self.text.set_target(&self.device, self.format);
+        // The pan/zoom camera is just the transform — same call screen-space text
+        // uses, different matrix.
         let cam = ortho(w, h) * model(offset, scale);
-        self.text_renderer.write_matrix(&self.queue, cam);
-        self.emoji_renderer.write_matrix(&self.queue, cam);
+        self.text.set_transform(&self.queue, cam.to_cols_array());
+
+        let batch: Vec<Draw> = cells
+            .iter()
+            .map(|cell| Draw {
+                block: cell.glyph,
+                at: sanscale::Vec2::new(cell.at.x, cell.at.y),
+                size: cell.size,
+                color: sanscale::Color(cell.color),
+                clip: None,
+            })
+            .collect();
+
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -311,7 +279,12 @@ impl Viewer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.99, g: 0.99, b: 0.99, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.99,
+                            g: 0.99,
+                            b: 0.99,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -320,17 +293,18 @@ impl Viewer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &self.grid_buf.buf, 0..tn);
-            self.emoji_renderer.draw(&mut pass, &self.emoji_atlas, &self.emoji_buf.buf, 0..en);
+            self.text
+                .draw_batch(&self.device, &self.queue, &mut pass, &batch);
         }
         self.queue.submit([enc.finish()]);
 
         let Some(hud) = hud else { return };
-        self.engine.text(16.0, h - 16.0, hud, &args(24.0, [1.0, 0.0, 0.0, 1.0]));
-        self.engine.sync_atlas(&mut self.text_atlas, &self.device, &self.queue, &self.text_renderer.atlas_layout);
-        let ov = self.engine.flush().to_vec();
-        let on = self.overlay_buf.upload(&self.device, &self.queue, &ov);
-        self.text_renderer.write_matrix(&self.queue, ortho(w, h));
+        let style = self.style();
+        let Some(overlay) = self.text.shape_transient(hud, &style) else {
+            return;
+        };
+        self.text
+            .set_transform(&self.queue, Text::pixel_ortho(w as u32, h as u32));
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -339,14 +313,26 @@ impl Viewer {
                     view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.text_renderer.draw_vertices(&mut pass, &self.text_atlas, &self.overlay_buf.buf, 0..on);
+            self.text.draw(
+                &self.device,
+                &self.queue,
+                &mut pass,
+                overlay,
+                sanscale::Vec2::new(16.0, h - 40.0),
+                24.0,
+                sanscale::Color([1.0, 0.0, 0.0, 1.0]),
+                None,
+            );
         }
         self.queue.submit([enc.finish()]);
     }
@@ -599,9 +585,9 @@ impl Gfx {
         }
         // Atlas pressure, so overflow is never invisible: current height and, if the
         // working set ever exceeds the budget, the count of glyphs it had to drop.
-        let (_, atlas_h) = self.viewer.engine.emoji_atlas_size();
+        let (_, _, (_, atlas_h)) = self.viewer.text.diagnostics().atlas_sizes();
         hud = format!("{hud}   ·   atlas {atlas_h}px");
-        let dropped = self.viewer.engine.dropped_glyphs();
+        let dropped = self.viewer.text.diagnostics().dropped_glyphs();
         if dropped > 0 {
             hud = format!("{hud}   ·   DROPPED {dropped}");
         }
@@ -676,11 +662,11 @@ fn dump() {
     let flags_y = 16.0 - flags_row as f32 * CELL_H * 0.95;
     dump_png(&mut viewer, 1450, 920, Vec2::new(10.0, flags_y), 0.95, "emoji_flags.png");
 
-    let (aw, ah) = viewer.engine.emoji_atlas_size();
+    let (_, _, (aw, ah)) = viewer.text.diagnostics().atlas_sizes();
     println!(
         "wrote emoji_board.png, emoji_board_zoom.png, emoji_flags.png \
          (emoji atlas {aw}x{ah} after full sweep, dropped {})",
-        viewer.engine.dropped_glyphs()
+        viewer.text.diagnostics().dropped_glyphs()
     );
 }
 
