@@ -6,6 +6,36 @@ scale-independent); vertex uploads go through a bump arena.
 
 ---
 
+## Summary
+
+Read this first; the conclusion moved a long way while the rest was being argued
+out, and the body still walks the route rather than the destination.
+
+- **The regression was never "we added a cache". It was that the grain stopped
+  being the consumer's to choose.** The old engine was immediate-mode, so
+  `unicode_zoom` picked per-row caching and compendium picked none, and both were
+  right. The service now fixes it at the block.
+- **The load-bearing fix has landed.** Taking `at`/`size` out of `GeomKey` makes the
+  existing per-block cache hit *during camera movement*, which — once you notice
+  that an idle app doesn't draw a frame at all — is the only case that matters
+  besides edits.
+- **What remains is a draw-call story, not a caching story.** For compendium the
+  prize is collapsing one draw call per note, and that is gated entirely behind
+  moving the clip from the hardware scissor into the fragment shader. No amount of
+  caching work reaches it.
+- **A batch subsumes the CPU arena**, so "arena first" is the wrong order — it is
+  mostly wasted effort if batching follows, and is worth doing only if batching
+  never happens.
+- **If a batch is built, it must be keyed to content, not visibility**, or it
+  invalidates on every scroll and loses to no cache at all. Content-keying is also
+  what removes any need for sub-buffer patching and compaction: the machinery is
+  avoidable by choosing the grain, not by building an allocator.
+
+Four predictions in this area were wrong until measured. Build nothing here on the
+strength of the argument.
+
+---
+
 ## The measurement that starts this
 
 `unicode_zoom`, fit-width, 41 472 one-glyph blocks:
@@ -149,7 +179,8 @@ That job can move into the fragment shader — a per-block clip rect, reached th
 same way a per-block transform would be (a block id on the vertex indexing a small
 per-block array), discarding fragments outside. Then no draw needs its own
 scissor, everything sharing a z-slot can batch, and compendium's hundreds of
-per-item buffers and draw calls collapse to one.
+per-item draw calls collapse to one. (Its per-item *buffers* are already gone —
+the vertex arena removed those.)
 
 This is the change that makes batching real for the actual consumer. It is also
 the most invasive: vertex format, both shaders, and a per-block array.
@@ -270,7 +301,7 @@ shape that works everywhere it has been tried.
 | | Do it | Why |
 |---|---|---|
 | **Arena + `Range<u32>`** replacing the `Vec`-per-block | **only if batching never happens** | Self-contained, no format change. Needs no real allocator: rebuilds fire on colour/clip/bucket changes, which do not alter the vertex *count*, so same-length overwrites in place and the rare length change goes on a size-classed free list. Halves the metadata array too, which is the guaranteed win since that probe is dense. |
-| **Cached batch** — `prepare_batch(&[Draw]) -> BatchHandle`, content-keyed, owning its buffer | **yes, and it subsumes the arena** | Restores the grain choice as a *draw* concept rather than a third identity type. Worth ~2 ms on the dense examples immediately. Worth nothing to compendium until the two items below. |
+| **Cached batch** — `prepare_batch(&[Draw]) -> BatchHandle`, content-keyed, owning its buffer | **yes, and it subsumes the arena** | Restores the grain choice as a *draw* concept rather than a third identity type, and subsumes the arena. Worth ~2 ms on the dense examples; worth little to compendium *as a cache*, and only pays there as a draw-call reduction once the shader clip lands. |
 | **Per-block clip in the shader**, retiring the per-item scissor | **yes, but major** | The only thing that makes batching reachable for compendium. Vertex format + shaders + per-block array. |
 | **compendium to world-space `at` + MVP** | **yes, consumer-side** | Needed regardless. Unlocks the batch cache; also the honest use of the transform. |
 | **GPU-resident per-*block* ranges** | **no** | Tile architecture at glyph granularity: 41k tiny allocations and a real allocator. |
