@@ -1386,6 +1386,12 @@ impl Diagnostics<'_> {
         // feeds cell fit-scaling, so a wrong face moves geometry, not just text.
         let entry = view.get(crate::layout::face_for_grapheme(&view, c.encode_utf8(&mut buf)))?;
         let id = entry.font.face().glyph_index(c)?;
+        // A colour glyph reports nothing, as documented. COLR faces layer real
+        // outlines under the colour, so asking for an outline *succeeds* and hands
+        // back a box for something that will never be drawn that way.
+        if entry.font.is_color_glyph(id.0) {
+            return None;
+        }
         let outlines = entry.font.load_glyph(id)?;
         Some(outlines.bounding_box())
     }
@@ -1492,4 +1498,95 @@ fn normalized_clip(item: &Draw) -> Option<Rect> {
         let y1 = snap_up((c.y + c.height) as f64 - ay);
         Rect::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::font::read_font_file;
+
+    fn font(paths: &[&str]) -> Option<FontData> {
+        paths
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .and_then(|p| read_font_file(p).ok())
+    }
+
+    /// Build a chain with the colour font **first**, which is how a real fallback
+    /// chain is ordered (emoji high-priority, Latin primary before it).
+    fn emoji_first_chain() -> Option<(Text, FontChainHandle)> {
+        let emoji = font(&["C:/Windows/Fonts/seguiemj.ttf"])?;
+        let latin = font(&["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"])?;
+        let mut text = Text::new();
+        let e = text.map_font(emoji, 0).ok()?;
+        let l = text.map_font(latin, 0).ok()?;
+        let chain = text.register_chain(&[e, l]);
+        Some((text, chain))
+    }
+
+    /// The family a diagnostic reports must be the family *shaping* actually
+    /// uses. Asserted against the shaper rather than a hardcoded font name, so
+    /// the invariant holds whatever chain the box happens to have installed.
+    ///
+    /// Regression: `family_for` was "first face in the chain holding a glyph",
+    /// which ignores emoji presentation entirely. With a colour font early in the
+    /// chain that reported the colour face for every text-presentation character
+    /// it happened to cover - 220 code points across planes 0-2, and because
+    /// `glyph_bbox` took the same shortcut it moved geometry, not just labels.
+    #[test]
+    fn diagnostics_resolve_the_face_shaping_uses() {
+        let Some((text, chain)) = emoji_first_chain() else {
+            return;
+        };
+        let mut buf = [0u8; 4];
+        for c in [
+            '\u{2600}', '\u{263A}', '\u{2640}', '\u{2328}', // text presentation
+            '\u{1F600}', '\u{1F308}', // emoji presentation
+            'A', '1', '\u{00E9}', // plain text
+        ] {
+            let s = c.encode_utf8(&mut buf);
+            let view = chain_view(&text.fonts, &text.chains, chain);
+            let mut cache = GlyphCache::new();
+            let run = shape_text(&view, &mut cache, s);
+            let Some(glyph) = run.glyphs.first() else { continue };
+            if glyph.glyph_id == 0 {
+                continue; // tofu; nothing to agree about
+            }
+            let shaped_family = text.fonts[glyph.font_id as usize].family_name();
+            assert_eq!(
+                text.diagnostics().family_for(chain, c),
+                shaped_family,
+                "U+{:04X}: the diagnostic disagrees with the face shaping picked",
+                c as u32,
+            );
+        }
+    }
+
+    /// `glyph_bbox` reports the outline of the face that will actually be used,
+    /// and reports nothing for a glyph that resolves to colour. It feeds cell
+    /// fit-scaling in grid layouts, so resolving through a different face than
+    /// shaping silently moves glyphs.
+    #[test]
+    fn glyph_bbox_follows_the_resolved_face() {
+        let Some((text, chain)) = emoji_first_chain() else {
+            return;
+        };
+        let mut buf = [0u8; 4];
+        for c in ['\u{2600}', '\u{1F600}', 'A'] {
+            let s = c.encode_utf8(&mut buf);
+            let view = chain_view(&text.fonts, &text.chains, chain);
+            let mut cache = GlyphCache::new();
+            let run = shape_text(&view, &mut cache, s);
+            let Some(glyph) = run.glyphs.first() else { continue };
+            if glyph.glyph_id == 0 {
+                continue;
+            }
+            let bbox = text.diagnostics().glyph_bbox(chain, c);
+            if glyph.is_color {
+                assert!(bbox.is_none(), "U+{:04X} resolves to colour: no outline", c as u32);
+            } else {
+                assert!(bbox.is_some(), "U+{:04X} resolves to an outline face", c as u32);
+            }
+        }
+    }
 }
