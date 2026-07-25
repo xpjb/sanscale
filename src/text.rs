@@ -22,7 +22,7 @@ use crate::emoji::{bucket_for, EmojiCache};
 use crate::flow::{flow_paragraph, FlowLine};
 use crate::font::Font;
 use crate::layout::{shape_text, ChainFont, ShapedGlyph};
-use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer};
+use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer, VertexArena};
 use crate::vertex::{push_emoji_quad, push_glyph_quad_pixels, EmojiVertex, TextVertex};
 
 /// Shared font bytes. Deliberately fontdb's `make_shared_face_data` return type,
@@ -522,10 +522,9 @@ struct Block {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GeomKey {
     size: u32,
-    /// Quads are position-baked, so placement is part of the key. Pan and zoom
-    /// move the *transform*, not `at`, so a scrolling canvas still hits.
-    at: [u32; 2],
     color: [u32; 4],
+    /// Held **relative to `at`**, because the quads are too. An absolute clip
+    /// would reintroduce the position dependence this key exists without.
     clip: Option<[u32; 4]>,
 }
 
@@ -535,6 +534,12 @@ struct GeomKey {
 /// space, so they survive pan and zoom, and keeping them host-side lets many
 /// blocks concatenate into one upload and one draw call. A buffer per block
 /// means a draw call per block, which is ruinous on a dense canvas.
+/// Quads are baked with the block's top-left at the **origin**; `draw_batch`
+/// adds `at` as it concatenates. This is what lets one shaped block be drawn at
+/// many positions — a repeated label, a glyph reused across a grid, or a body
+/// scrolling under a fixed clip — from a single build. Baking `at` in instead
+/// means a block drawn at N positions rebuilds N times per frame, each rebuild
+/// discarding the last.
 struct Geometry {
     key: GeomKey,
     /// Emoji atlas eviction epoch the UVs were baked against. A change means a
@@ -562,6 +567,9 @@ struct Gpu {
     emoji: EmojiRenderer,
     text_atlas: TextAtlas,
     emoji_atlas: EmojiAtlas,
+    /// One arena for both pipelines: suballocation is bump-only, so sharing it
+    /// costs nothing and halves the number of buffers to grow.
+    arena: VertexArena,
 }
 
 /// Cache bounds. Eviction is capacity-based rather than time-based on purpose:
@@ -936,9 +944,10 @@ impl Text {
             };
             let key = GeomKey {
                 size: item.size.to_bits(),
-                at: [item.at.x, item.at.y].map(f32::to_bits),
                 color: item.color.0.map(f32::to_bits),
-                clip: item.clip.map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
+                clip: item
+                    .clip
+                    .map(|c| [c.x - item.at.x, c.y - item.at.y, c.width, c.height].map(f32::to_bits)),
             };
             // Fast path: one dense-array probe, then straight into the batch.
             if let Some(geom) = self.geometry[index].as_ref() {
@@ -946,19 +955,13 @@ impl Text {
                 // an atlas eviction cannot disturb a text-only block, and
                 // invalidating those too rebuilds the whole frame for nothing.
                 if geom.key == key && (geom.emoji.is_empty() || geom.epoch == epoch) {
-                    text_verts.extend_from_slice(&geom.text);
-                    if !geom.emoji.is_empty() {
-                        emoji_verts.extend_from_slice(&geom.emoji);
-                    }
+                    place(&mut text_verts, &mut emoji_verts, geom, item.at);
                     continue;
                 }
             }
             self.rebuild_geometry(index, item, key, epoch);
             if let Some(geom) = self.geometry[index].as_ref() {
-                text_verts.extend_from_slice(&geom.text);
-                if !geom.emoji.is_empty() {
-                    emoji_verts.extend_from_slice(&geom.emoji);
-                }
+                place(&mut text_verts, &mut emoji_verts, geom, item.at);
             }
         }
 
@@ -973,14 +976,24 @@ impl Text {
             .sync(device, queue, &gpu.emoji.atlas_layout, &self.emoji);
 
         if !text_verts.is_empty() {
-            let buffer = TextRenderer::build_vertices(device, &text_verts);
-            gpu.text
-                .draw_vertices(pass, &gpu.text_atlas, &buffer, 0..text_verts.len() as u32);
+            let range = gpu.arena.push(device, queue, &text_verts);
+            gpu.text.draw_vertices(
+                pass,
+                &gpu.text_atlas,
+                gpu.arena.buffer(),
+                range.0..range.1,
+                0..text_verts.len() as u32,
+            );
         }
         if !emoji_verts.is_empty() {
-            let buffer = EmojiRenderer::build_vertices(device, &emoji_verts);
-            gpu.emoji
-                .draw(pass, &gpu.emoji_atlas, &buffer, 0..emoji_verts.len() as u32);
+            let range = gpu.arena.push(device, queue, &emoji_verts);
+            gpu.emoji.draw(
+                pass,
+                &gpu.emoji_atlas,
+                gpu.arena.buffer(),
+                range.0..range.1,
+                0..emoji_verts.len() as u32,
+            );
         }
 
         self.batch_text = text_verts;
@@ -990,7 +1003,13 @@ impl Text {
     /// Build one block's quads into its geometry cache. CPU only — no device and
     /// no upload; `draw_batch` does that once for the whole batch.
     fn rebuild_geometry(&mut self, index: usize, item: &Draw, key: GeomKey, epoch: u64) {
-        let (at, size, color, clip) = (item.at, item.size, item.color, item.clip);
+        let (size, color) = (item.size, item.color);
+        // Bake at the origin and shift the clip to match, so the build depends on
+        // everything about this draw *except* where it lands.
+        let at = Vec2::new(0.0, 0.0);
+        let clip = item
+            .clip
+            .map(|c| Rect::new(c.x - item.at.x, c.y - item.at.y, c.width, c.height));
         let mut text_verts = Vec::new();
         let mut emoji_verts = Vec::new();
 
@@ -1077,6 +1096,7 @@ impl Text {
             emoji,
             text_atlas,
             emoji_atlas,
+            arena: VertexArena::new(device),
         });
     }
 
@@ -1329,10 +1349,17 @@ impl Diagnostics<'_> {
     }
 
     /// Family name of the face `c` would actually resolve to.
+    ///
+    /// Routed through the same [`face_for_grapheme`](crate::layout::face_for_grapheme)
+    /// the shaper uses, so this cannot disagree with what gets drawn. Resolving
+    /// it here independently — "first face with a glyph" — silently ignores
+    /// emoji presentation and reports the color font for every text-presentation
+    /// character it happens to cover.
     pub fn family_for(&self, chain: FontChainHandle, c: char) -> Option<String> {
         let view = self.text.chain_view(chain);
-        let entry = view.iter().find(|entry| entry.font.has_glyph(c))?;
-        entry.font.family_name()
+        let mut buf = [0u8; 4];
+        let entry = view.get(crate::layout::face_for_grapheme(&view, c.encode_utf8(&mut buf)))?;
+        entry.font.has_glyph(c).then(|| entry.font.family_name())?
     }
 
     /// Em-space bounding box `(min_x, min_y, max_x, max_y)` of `c`'s outline, for
@@ -1340,7 +1367,10 @@ impl Diagnostics<'_> {
     /// character nothing covers.
     pub fn glyph_bbox(&self, chain: FontChainHandle, c: char) -> Option<(f32, f32, f32, f32)> {
         let view = self.text.chain_view(chain);
-        let entry = view.iter().find(|entry| entry.font.has_glyph(c))?;
+        let mut buf = [0u8; 4];
+        // The face the shaper picks, not the first one holding a glyph — this
+        // feeds cell fit-scaling, so a wrong face moves geometry, not just text.
+        let entry = view.get(crate::layout::face_for_grapheme(&view, c.encode_utf8(&mut buf)))?;
         let id = entry.font.face().glyph_index(c)?;
         let outlines = entry.font.load_glyph(id)?;
         Some(outlines.bounding_box())
@@ -1349,10 +1379,13 @@ impl Diagnostics<'_> {
     /// Whether `text` shapes to exactly one glyph in this chain — i.e. the font
     /// ligates the whole sequence (a flag, a ZWJ emoji) rather than rendering it
     /// as pieces.
+    /// Asks the *resolved* face, not any face in the chain. "Some face could
+    /// ligate this" accepts a monochrome ligation the fallback walk rejects, so
+    /// a caller drawing on that answer gets overlapping pieces instead of the
+    /// one glyph — or the tofu — it was promised.
     pub fn is_single_glyph(&self, chain: FontChainHandle, text: &str) -> bool {
         let view = self.text.chain_view(chain);
-        view.iter()
-            .any(|entry| crate::layout::shapes_to_single_glyph(entry.font, text))
+        crate::layout::resolves_to_single_glyph(&view, text)
     }
 
     /// Curve, band and emoji atlas sizes, in texels.
@@ -1379,5 +1412,25 @@ impl Diagnostics<'_> {
                 .filter(|slot| slot.block.is_some())
                 .count(),
         )
+    }
+}
+
+/// Concatenate one block's origin-baked quads into the batch, translated to
+/// `at`. The copy is a memcpy plus a linear add — orders of magnitude cheaper
+/// than the rebuild that baking `at` into the cache key would have forced.
+fn place(text: &mut Vec<TextVertex>, emoji: &mut Vec<EmojiVertex>, geom: &Geometry, at: Vec2) {
+    let base = text.len();
+    text.extend_from_slice(&geom.text);
+    for v in &mut text[base..] {
+        v.pos[0] += at.x;
+        v.pos[1] += at.y;
+    }
+    if !geom.emoji.is_empty() {
+        let base = emoji.len();
+        emoji.extend_from_slice(&geom.emoji);
+        for v in &mut emoji[base..] {
+            v.pos[0] += at.x;
+            v.pos[1] += at.y;
+        }
     }
 }

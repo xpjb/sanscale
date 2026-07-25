@@ -84,8 +84,10 @@ fn shapes_single_color(font: &Font, text: &str) -> bool {
     gid != 0 && font.is_color_glyph(gid as u16)
 }
 
-/// Whether `font` shapes `text` to exactly one glyph, of any kind. Diagnostic
-/// only — the fallback walk itself requires *color* (see `shapes_single_color`).
+/// Whether `font` shapes `text` to exactly one glyph, of any kind. Used to ask
+/// what a *already-chosen* face will do; choosing the face is
+/// [`face_for_grapheme`]'s job, and its emoji-sequence arm requires *color*
+/// (see `shapes_single_color`).
 pub(crate) fn shapes_to_single_glyph(font: &Font, text: &str) -> bool {
     let mut buffer = UnicodeBuffer::new();
     buffer.push_str(text);
@@ -127,7 +129,7 @@ fn text_face_for(chain: &[ChainFont<'_>], c: char) -> Option<usize> {
 /// `Emoji_Presentation` property decides (so `😀` is color and `❤` is text by
 /// default, while `❤\u{FE0F}` is the red heart). The chosen presentation prefers
 /// a color or monochrome face accordingly, falling back to any covering face.
-fn face_for_grapheme(chain: &[ChainFont<'_>], grapheme: &str) -> usize {
+pub(crate) fn face_for_grapheme(chain: &[ChainFont<'_>], grapheme: &str) -> usize {
     let base = grapheme.chars().next().unwrap_or(' ');
     if base.is_whitespace() || base.is_control() {
         return 0;
@@ -160,6 +162,21 @@ fn face_for_grapheme(chain: &[ChainFont<'_>], grapheme: &str) -> usize {
         }
     }
     preferred.unwrap_or(0)
+}
+
+/// Whether `grapheme` renders as exactly one glyph *through the real fallback
+/// walk* — the face [`face_for_grapheme`] picks, not any face that happens to
+/// ligate it.
+///
+/// The distinction is load-bearing for grid layouts: asking "does *some* face
+/// shape this to one glyph" accepts a monochrome ligation the walk would reject
+/// (its emoji-sequence arm requires color), so a caller that draws the sequence
+/// on that answer gets overlapping pieces where it expected one cell.
+pub(crate) fn resolves_to_single_glyph(chain: &[ChainFont<'_>], grapheme: &str) -> bool {
+    let Some(entry) = chain.get(face_for_grapheme(chain, grapheme)) else {
+        return false;
+    };
+    shapes_to_single_glyph(entry.font, grapheme)
 }
 
 /// Split `text` into maximal `(byte_start, run_text, chain_position)` runs where
