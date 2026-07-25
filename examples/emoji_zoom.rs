@@ -490,6 +490,7 @@ impl Gfx {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .expect("adapter");
@@ -501,6 +502,7 @@ impl Gfx {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: caps
@@ -628,7 +630,7 @@ impl Gfx {
             Some(&hud),
         );
         let cost = t0.elapsed().as_secs_f32() * 1000.0;
-        frame.present();
+        self.viewer.queue.present(frame);
 
         let now = Instant::now();
         self.samples.push((now, cost));
@@ -666,6 +668,7 @@ fn dump() {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .expect("adapter");
@@ -721,6 +724,7 @@ fn dummy_config() -> wgpu::SurfaceConfiguration {
     wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        color_space: wgpu::SurfaceColorSpace::Auto,
         width: 16,
         height: 16,
         present_mode: wgpu::PresentMode::Fifo,
@@ -775,7 +779,7 @@ fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path:
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
     viewer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().unwrap();
     let mut pixels = Vec::with_capacity((unpadded * h) as usize);
     for row in 0..h {
         let s = (row * padded) as usize;

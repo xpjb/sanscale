@@ -342,11 +342,11 @@ impl TextRenderer {
             vertex: wgpu::VertexState {
                 module: &vert,
                 entry_point: Some("main"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<TextVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &attrs,
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -768,11 +768,11 @@ impl EmojiRenderer {
             vertex: wgpu::VertexState {
                 module: &vert,
                 entry_point: Some("main"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<EmojiVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &attrs,
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {

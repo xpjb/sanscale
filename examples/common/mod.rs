@@ -125,6 +125,7 @@ impl Harness {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo,
@@ -237,7 +238,7 @@ impl Harness {
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
         self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().unwrap();
         let mut pixels = Vec::with_capacity((unpadded * height) as usize);
         for row in 0..height {
             let start = (row * padded) as usize;
@@ -255,6 +256,7 @@ async fn request_device() -> (wgpu::Device, wgpu::Queue) {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         })
         .await
         .expect("no GPU adapter");
