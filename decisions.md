@@ -35,50 +35,70 @@ etc. are illustrative containers. Supporting value types (`Align`, `FontSource`,
 ```rust
 struct Text {
     // the three pools the user's handles index into (a handle IS its slab index):
-    fonts:      Slab<Font>,        // FontHandle       — pool 1; deduped by font bytes
-    chains:     Slab<Chain>,       // FontChainHandle  — pool 2; each a Vec<FontHandle>
-    paragraphs: Slab<Paragraph>,   // ShapedHandle     — pool 6; Level-2 layout (run-refs + lines, em)
+    fonts:  Slab<Font>,   // FontHandle       — pool 1; deduped by font bytes
+    chains: Slab<Chain>,  // FontChainHandle  — pool 2; each a Vec<FontHandle>
+    blocks: Slab<Block>,  // ShapedHandle     — a composed unit: ordered part-refs into
+                          //   pool 6 + cumulative line offsets (the scroll index)
 
     // internally managed — no user handle (all evict LRU):
-    shape_lookup: HashMap<(ParagraphKey, Style), ShapedHandle>, // shape() hit → existing slot
+    block_lookup: HashMap<BlockKey, ShapedHandle>,               // shape() hit → existing slot
+    paragraphs:   HashMap<(ParagraphKey, Style), ParaLayout>,    // pool 6; Level-2, per paragraph
     runs:         HashMap<RunKey, RunShaping>,       // pool 5; Level-1, content-keyed (font + run text)
     text_atlas:   Atlas,                             // pool 3; (font, glyph) → Slug pixels      (CPU)
     emoji_atlas:  Atlas,                             // pool 4; (font, glyph, bucket) → RGBA      (CPU)
     geometry:     HashMap<ParagraphKey, VertexBuf>,  // pool 7 (optional) — vertex buffers  (GPU, lazy)
-    gpu:          Option<GpuResources>,              // pipelines, format, atlas textures   (GPU, lazy)
+    gpu:          Option<GpuResources>,              // pipeline per target format, atlas textures
 }
 
 // handles — all Copy, indices into the pools
 #[derive(Clone, Copy)] struct FontHandle(u32);       // one mapped concrete font
 #[derive(Clone, Copy)] struct FontChainHandle(u16);  // ordered fallback list of fonts
-#[derive(Clone, Copy)] struct ShapedHandle(u32);     // a shaped paragraph (pool 6)
+#[derive(Clone, Copy)] struct ShapedHandle(u32);     // a shaped *block* (1..N paragraphs)
 
-// cousin of the handles: Copy, but consumer-minted (your node id + version), not a pool index
-#[derive(Clone, Copy)] struct ParagraphKey { id: u64, version: u64 }
-struct Style { chain: FontChainHandle, wrap_em: Option<f32>, align: Align }  // zero px, no color
+// cousins of the handles: Copy, consumer-minted, not pool indices
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ParagraphKey { namespace: u64, slot: u32, generation: u32 }  // unit of invalidation
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct BlockKey(u64);                                              // unit of coordinate space
+
+#[derive(Clone, Copy, PartialEq)]  // Eq/Hash via wrap_em.to_bits()
+struct Style { chain: FontChainHandle, wrap_em: Option<f32>, align: Align, line_spacing: f32 }
 
 impl Text {
-    // atlas self-bounds to the device limit at first draw (width is fixed 2048 internally,
-    // so there's nothing to configure). format is Copy; no device yet. Add a single
-    // `max_height: u32` knob later only if memory tuning ever needs it.
-    fn new(format: TextureFormat) -> Self;
+    // takes nothing: pipelines are per-target and lazy (see set_target), and the atlas
+    // self-bounds to the device limit at first draw (width is fixed 2048 internally).
+    fn new() -> Self;
 
     // discovery is the consumer's (fontdb → bytes). map dedups; "map" leaves mmap open.
-    fn map_font(&mut self, src: FontSource) -> FontHandle;
-    fn register_chain(&mut self, fonts: Vec<FontHandle>) -> FontChainHandle;  // stored as-is
+    fn map_font(&mut self, src: FontSource) -> Result<FontHandle, FontError>;
+    fn register_chain(&mut self, fonts: &[FontHandle]) -> FontChainHandle;  // stored as-is
+    fn drop_chain(&mut self, chain: FontChainHandle);   // settings font reload
+    fn clear(&mut self);
 
-    // shape + cache (key, style); `fetch` runs only on a miss; GPU-free
-    fn shape(&mut self, key: ParagraphKey, style: &Style, fetch: impl FnOnce() -> Cow<str>) -> ShapedHandle;
+    // one block = 1..N paragraphs flowed together, with document-global byte offsets.
+    // `fetch` runs only for parts that miss; `None` from it = stale identity, block skipped.
+    // Re-calling with an unchanged `parts` slice is a memcmp, not a reflow. GPU-free.
+    fn shape(&mut self, block: BlockKey, style: &Style, parts: &[ParagraphKey],
+             fetch: impl FnMut(ParagraphKey) -> Option<Cow<str>>) -> Option<ShapedHandle>;
+    fn shape_one(&mut self, key: ParagraphKey, style: &Style,
+                 fetch: impl FnOnce() -> Cow<str>) -> Option<ShapedHandle>;
 
-    // em-space queries off the same shaping: box size, hit-test, carets; GPU-free
-    fn measure(&self, run: ShapedHandle) -> &Layout;
+    // em-space queries over the whole block: box size, hit-test, carets, selection.
+    // Transient — hold the handle, never the `&Layout` (see the lock). GPU-free.
+    fn measure(&self, h: ShapedHandle) -> &Layout;
 
-    // wgpu passed in directly (no bundle); size_px scales em→px and picks the raster bucket;
-    // transform is a column-major 4x4 (raw, no Camera type); shape/measure don't take wgpu,
-    // so leaving draw uncalled = device-free
+    // once per pass, before the draws that use them
+    fn set_target(&mut self, device: &Device, format: TextureFormat);  // pipeline cached per format
+    fn set_transform(&mut self, queue: &Queue, m: [f32; 16]);          // quads are emitted in local em
+    fn pixel_ortho(width: u32, height: u32) -> [f32; 16];              // helper, not a mode
+
+    // wgpu passed in directly (no bundle). `at`/`size` are in the transform's source space —
+    // screen pixels under `pixel_ortho`, world units under an MVP. `size` scales em→space and
+    // picks the emoji raster bucket. `clip` (same space) culls on the CPU *and*, when the
+    // transform is a pixel ortho, sets the scissor. shape/measure don't take wgpu, so leaving
+    // draw uncalled = device-free.
     fn draw(&mut self, device: &Device, queue: &Queue, pass: &mut RenderPass,
-            run: ShapedHandle, at: Vec2, size_px: f32, color: Color,
-            transform: [f32; 16], scissor: Rect);
+            h: ShapedHandle, at: Vec2, size: f32, color: Color, clip: Option<Rect>);
 }
 ```
 
@@ -90,9 +110,88 @@ Things we're certain about, and why.
 
 - **The surface is one object plus handles.** A single `Text` service owns every pool and
   the GPU resources. Everything else is `Copy` handles into it — `FontHandle`,
-  `FontChainHandle`, `ShapedHandle` — and value types — `ParagraphKey`, `Style`. Methods: `new`,
-  `map_font`, `register_chain`, `shape`, `measure`, `draw`. wgpu is borrowed only at `draw`.
-  No per-frame object.
+  `FontChainHandle`, `ShapedHandle` — and value types — `ParagraphKey`, `BlockKey`, `Style`.
+  Methods: `new`, `map_font`, `register_chain`, `drop_chain`, `clear`, `shape`, `shape_one`,
+  `measure`, `set_target`, `set_transform`, `draw`. wgpu is borrowed only at `draw` (plus the two
+  per-pass setters). No per-frame object.
+
+- **Two consumer-facing levels: the *block* is the coordinate space, the *paragraph* is the
+  unit of invalidation.** `shape` takes a `BlockKey` and a slice of `ParagraphKey`s and returns
+  one `ShapedHandle` over all of them — one byte range, one line list, one thing you measure,
+  hit-test and draw. Keys stay per-paragraph, so an edit reshapes one paragraph and the rest hit
+  the Level-2 cache. Grounded: compendium's drawn/measured/edited unit is a whole note body —
+  `TextSpecText::Document { paragraphs: Vec<TextParagraphIdentity> }`, stitched today by
+  `layout_paragraph_identity_lines` + `offset_layout_line`. A single-key `shape` would force
+  either a body-wide version bump (reshapes 10k paragraphs on a keystroke) or cross-handle
+  stitching in the consumer. `BlockKey` carries no version: change detection is comparing the
+  parts slice, whose keys carry their own. Inline style-runs, when they land, are a third level
+  *below* paragraph and stay invisible here.
+
+- **`measure` returns a borrow you use, not one you hold.** `measure(&self, h) -> &Layout` stays
+  one method, but the rule is: pass the `ShapedHandle` around, call `measure` at the point of
+  use. Holding the `&Layout` in a struct deadlocks against `draw`'s `&mut self` (it rasterizes on
+  a miss). Compendium clones a whole `TextLayout` today purely to escape that; with the handle
+  there is nothing to hold — `ActiveEditorRender` carries the handle plus the overlay rects it
+  already computes as owned `Vec`s, and `TextLayout`/`scale_pixels` leave the public surface.
+
+- **Quads are emitted in local em space; the per-pass transform is a full 4×4.** Screen-space is
+  the special case: pass `pixel_ortho(w, h)` and `at`/`size` in pixels — compendium's path,
+  identical to what it emits today via `world_to_screen` + `slug_pixel_matrix`. World or 3D text
+  is the *same call* with an MVP and `at` in world units — no mode flag, no second path. This
+  costs nothing and is worth taking now because Slug's antialiasing uses screen-space
+  derivatives in the fragment shader, so coverage is already correct under rotation and
+  perspective; baking screen-space into the vertex format would throw away the crate's
+  differentiator for no gain. Rendering world text offscreen-then-blitting is the wrong answer —
+  it discards the resolution independence that is the entire point.
+  Two things that don't come along, both fine: `clip` is screen-aligned by nature, so it's
+  `Option<Rect>` (in local space it still culls, it just can't set a scissor under a general
+  transform); and emoji need a real on-screen pixel size for their bucket, estimated by pushing
+  a unit vector through the transform (Slug glyphs need no bucket at all). Genuine 3D would also
+  want depth state on the pipeline — `set_target` grows a `depth_format` — noted, not built.
+
+- **`clip` culls, it doesn't just scissor.** One `Rect` on `draw` does both: drop whole lines and
+  individual glyphs on the CPU before emitting (what `intersects_y` / `intersects_glyph` do
+  today), then set the scissor for the remainder. A scrolled 10k-paragraph body must not emit
+  10k paragraphs' quads and lean on the GPU to throw them away.
+
+- **Scrolling is `at.y`.** Scroll offset is subtracted from the draw position; `clip` does the
+  rest. The block stores its paragraphs' cumulative line offsets, so `draw` binary-searches the
+  clip rect to the first visible line and walks only what's on screen — per-frame cost is
+  O(visible lines), not O(document). Block assembly is cached (unchanged parts = memcmp), and
+  `measure` gives content height for the scrollbar, which deletes compendium's
+  `measure_body_content_height` and its `body_content_h` cache.
+
+- **`fetch` is fallible.** `FnMut(ParagraphKey) -> Option<Cow<str>>`, and `shape` returns
+  `Option<ShapedHandle>`. An identity can go stale between building the draw list and shaping
+  (a slot freed or reused by a sync merge landing mid-frame); today's crate already guards it
+  twice — the provider returns `Option`, and the layout path bails on a `byte_len` mismatch.
+  Without a failure path the alternatives are panic or silently rendering the wrong paragraph.
+
+- **`ParagraphKey` keeps a namespace.** `{namespace, slot, generation}`, not `{id, version}`.
+  Same 16 bytes, but folding a document id and a pool slot into one `u64` needs a hash, and a
+  hash collision in a cache key renders *the wrong text*, silently and persistently. Grounded:
+  compendium's `TextParagraphCacheKey::namespace` exists precisely because the shaping cache is
+  shared across panes and slots are only unique within a document.
+
+- **Font ingestion is `Arc<dyn AsRef<[u8]> + Send + Sync>`, deduped by data pointer.** It takes
+  anything — `Vec<u8>`, `include_bytes!`, an mmap — and it is *exactly* fontdb's
+  `make_shared_face_data` return type, so bytes the consumer already discovered pass straight
+  through with no copy and no re-wrap (match the `+ Send + Sync` or they won't). This is also
+  what makes `drop_chain`/`clear` real: today `Font::from_bytes_with_index` **`Box::leak`s** the
+  bytes to get a `'static` face (`font.rs:44`), so every `reload_fonts` leaks a whole chain
+  including the 20–40 MB emoji font. Keeping the `Arc` alongside the face — one contained
+  `unsafe` to hold the `'static` slice, with the `Arc` outliving it and dropping together —
+  replaces a permanent leak with a sound one. Dedup key: `(data.as_ptr(), data.len(),
+  face_index)`. No bytes hash: 40 MB per font at startup is a real cost to defend against a
+  consumer that didn't share, and sharing is one fontdb call (see the consumer note below).
+
+- **Atlas invariants (internal, no surface).** `draw` may rasterize mid-pass, so: allocate each
+  atlas texture **once** at the device cap and never recreate it (a recreate invalidates a bind
+  group the consumer has already recorded into their pass), and **never evict a slot touched
+  since the last submit** (otherwise a draw recorded earlier in the same pass samples the new
+  glyph). Adds are safe — `queue.write_texture` lands before the command buffer executes. This
+  is realistic on the *emoji* atlas specifically, since it's the bounded, evicting one. Same
+  shape of rule for the vertex arena: bump-allocate, never reuse a region within a frame.
 
 - **The service is a glyph-quad source, not a compositor — it never owns the render pass.**
   The consumer builds the pass (target, clear/load, z-sorted interleave with its own
@@ -143,7 +242,12 @@ Things we're certain about, and why.
   "Segoe UI Emoji" twice into two atlases (emoji rasterized twice). A global font pool +
   chains-as-index-lists means UI and Mono share the one emoji font, cached once. This is the
   payoff that justifies collapsing compendium's two engines into one service. New machinery
-  required: `map_font` dedup key on font-bytes identity.
+  required: `map_font` dedup on data-pointer identity — **which only fires if the consumer
+  shares the bytes.** compendium doesn't today: `resolve_font_chain` builds a fresh
+  `fontdb::Database` per call and `data.to_vec()`s each face (`renderer.rs:133`), so UI and Mono
+  get two different allocations of the same emoji font. The consumer-side fix is to keep one
+  `Database` alive and use `make_shared_face_data(id)` — same `Arc` for both chains. Without
+  that change this benefit silently does not happen.
 
 - **The consumer supplies identity; the service never mints paragraph handles from a blob.**
   `ParagraphKey { id, version }`. One `shape()` = one unit = one handle. The service breaks
@@ -159,6 +263,16 @@ Things we're certain about, and why.
   document where 99% of visible paragraphs are unchanged, their text is never materialized —
   the closure is the escape hatch that says "give me the chars only if I'm actually
   reshaping." This is the un-boxed form of today's `TextParagraphProvider`.
+
+- **We never own the text — the consumer's data structure stays authoritative.** The service
+  stores only *shaping* (derived, disposable), keyed by identity, and borrows a `&str` via
+  `fetch` transiently on a miss. So the backing store is the consumer's choice — rope, gap
+  buffer, an immutable/persistent rope, a CRDT — and `version` is *its* version. This is the
+  same "don't seize the lifecycle" rule as *not owning the pass*, applied to data: render
+  lifecycle → draw into your pass; data lifecycle → keep your rope, we fetch by identity.
+  Contrast cosmic-text, whose `Buffer` **owns** the text as `Vec<BufferLine>` of `String`s (not
+  a rope) — fine with no data model, but a synced shadow of your rope/CRDT if you have one.
+  Compendium has both a rope and collaborative sync, so text-ownership had to stay app-side.
 
 - **`measure` and `draw` read the same `ShapedHandle` → no hit-test/render drift.** A single
   `Copy` handle feeds both. Baseline/ascent baked inside; `at` = top-left of the run box.
@@ -183,8 +297,14 @@ Things being removed from today's API. As definite as the locks.
 - **Public `TextVertex` / `EmojiVertex` and their fields** (`bnd`, `col`, `glyph`, `loc_em`)
   → geometry is opaque; the consumer never touches a vertex.
 - **`curve_atlas_size` / `band_atlas_size`** (Slug internals) → gone (or a `diagnostics()` accessor).
+- **`Box::leak`ing font bytes** (`font.rs:44`) → an `Arc` held beside the face, so a chain can
+  actually be dropped. Today every settings-driven `reload_fonts` leaks the whole chain.
+- **`FontSource::{Bytes, Path}`** → one shared-bytes handle; the crate stops doing file I/O.
 - **The three nested identity structs** (`ParagraphIdentity`, `TextParagraphIdentity`,
-  `TextParagraphCacheKey`) → one flat `ParagraphKey { id, version }`.
+  `TextParagraphCacheKey`) → one flat `ParagraphKey { namespace, slot, generation }`, plus a
+  `BlockKey` for the composed unit.
+- **Public `TextLayout` as a constructed, cloned, owned value** — and `scale_pixels` with it.
+  `Layout` becomes something you only ever borrow from `measure` for the length of a call.
 - **`TextParagraphProvider`** (a boxed trait threaded through the app) → a `fetch` closure.
 - **`emoji_epoch`** → gone by structure: it only existed to invalidate caller-held atlas-baked
   geometry; the service owns the geometry pool and invalidates on eviction internally. compendium
@@ -216,8 +336,8 @@ Things we were pretty confident on, phrased as if we'd do them — but might nee
   frame today and it's fine, so this is designed-in-shape, deferred-in-fact. Ship without it,
   add transparently when power actually matters.
 
-- **`ShapedHandle` as a distinct `Copy` token vs just `draw(ParagraphKey, …)`.** *We'd keep it* to
-  skip re-hashing the key on measure/draw. *But maybe* collapse to draw-by-`ParagraphKey` (one extra
+- **`ShapedHandle` as a distinct `Copy` token vs just `draw(BlockKey, …)`.** *We'd keep it* to
+  skip re-hashing the key on measure/draw. *But maybe* collapse to draw-by-`BlockKey` (one extra
   hashmap lookup per draw, probably nothing). A dial, not a principle.
 
 - **Inline style-runs for rich text / markdown.** *We'd support it* as consumer-supplied
@@ -225,8 +345,9 @@ Things we were pretty confident on, phrased as if we'd do them — but might nee
   font). *But maybe* it reshapes the "one Key = one paragraph" story — today's `Style` is
   uniform-per-run. A markdown renderer makes this real, so it's likely in scope but undesigned.
 
-- **`FontError` enum replacing `Result<_, String>`.** *We'd do it* — stringly errors are
-  wrong for a published crate. *But* exact variants (Io / Parse / NoCoverage / …) TBD.
+- **`FontError` enum replacing `Result<_, String>`.** In the sketch as `map_font -> Result`;
+  stringly errors are wrong for a published crate. *But* exact variants (Io / Parse /
+  NoCoverage / …) TBD.
 
 ---
 
@@ -234,28 +355,20 @@ Things we were pretty confident on, phrased as if we'd do them — but might nee
 
 Genuinely open.
 
-- **How wgpu enters — leaning: borrow it at `draw`, not an abstract backend trait.** This
-  subsumes two questions that turned out to be one: "one object or two" and "what is the
-  pass/`draw` really doing." An abstract-GPU trait (a "MaybeWGPU" à la the `log` facade) isn't
-  worth it — wgpu is huge, moving, and already *is* the abstraction over Vulkan/Metal/DX;
-  abstracting it is abstracting an abstraction. Lean: **borrow live wgpu handles only at
-  `draw`** (the `Wgpu<'_>` bundle in the sketch). Device-free `measure` then falls out for free
-  — `shape`/`measure` simply don't take it, so there's no second object and no no-op backend to
-  build. Still open: the exact `Wgpu<'_>` shape, and — same plumbing — how `draw` gets
-  position/transform (world + `camera` vs screen-space `at` + pixel ortho, which is what
-  compendium emits today via `world_to_screen` + `slug_pixel_matrix`; sets how `size_px`/bucket
-  derives on-screen px).
+- ~~**How wgpu enters.**~~ **Settled.** No abstract backend trait — wgpu is huge, moving, and
+  already *is* the abstraction over Vulkan/Metal/DX; abstracting it is abstracting an
+  abstraction. Live handles are borrowed at `draw` and at the two per-pass setters, passed
+  directly rather than in a `Wgpu<'_>` bundle. Device-free `measure` falls out for free.
+  Position/transform resolved to local-em quads + a per-pass 4×4 with a `pixel_ortho` helper
+  (see the lock), and target format resolved to `set_target` with a pipeline cached per format —
+  so `new()` takes nothing.
 
-- **Font ingestion: owned bytes vs mmap.** Today it's `FontSource::Bytes(Vec<u8>)` — a full read
-  into a resident copy per face. Fat CJK/emoji fonts are 20–40 MB; production renderers **mmap**
-  and let the OS page in glyphs lazily. The "here are some bytes" seam is clean but forces the
-  resident copy and blocks mmap. Consider a source that can borrow/mmap (`&'static [u8]`, or an
-  `Arc<dyn AsRef<[u8]>>`, or a memmap handle the parser face borrows). Interacts with the
-  `map_font` dedup key (dedup by path when mmapping vs by bytes-hash when owning).
-
-- **Handle granularity for markdown blocks.** Heading / paragraph / list-item / code-block
-  each their own `ParagraphKey`? Probably yes (independent caching + editing), but selection across
-  heterogeneous blocks and the cross-block geometry stitching is unproven.
+- ~~**Handle granularity for markdown blocks.**~~ **Mostly settled by the block/paragraph
+  split.** Heading / list-item / code-block each get their own `BlockKey` — they need a
+  different `size_px` at draw anyway, so they can't share one. Still genuinely open: selection
+  *across* heterogeneous blocks, which is consumer-side stitching over per-block `measure`.
+  What can't be expressed at all is inline bold/italic *within* a paragraph, since `Style` is
+  per-block; that lands as sub-runs below the paragraph (see Maybe) and doesn't change `shape`.
 
 - **Incremental *within a single run* (the actually-hard part).** The two-level split +
   content-keyed run pool (see Maybe) already gives incremental *across* runs for free. What it
@@ -272,9 +385,6 @@ Genuinely open.
   issues per-item draws with per-item scissors; the single coalesced buffer only ever saved
   *uploads*, which the geometry pool saves better). Unverified against a heavy dense-canvas
   frame — worth measuring the draw-call count before building on it.
-
-- **`map_font` dedup key.** Bytes hash vs `(source path, face index)`. Correctness vs cost,
-  and tied to the mmap-vs-owned decision above.
 
 - **Text (band/curve) atlas eviction.** Still observe-only from the emoji work — unbounded,
   warns at the device limit, no eviction. Whether it graduates to real eviction (harder: the
@@ -304,6 +414,62 @@ worth litigating, just parked.
 
 - **Text editor as an example.** Dogfood the caret/selection/hit-test surface — the hardest
   consumer path — as a `sanscale` example, not just an app feature buried in compendium. `>:)`
+
+---
+
+# Migration test (compendium, branch `text-api-migration`)
+
+The API skeleton is real code (`src/text.rs`, signatures and borrows only, bodies
+`todo!()`), and compendium was ported against it far enough to answer the open
+questions. **Zero borrow or lifetime errors** across the whole port; the 8 remaining
+compile errors are all one unresolved design question (last item below) plus its
+mechanical fallout. Net **−172 lines** across 15 consumer files.
+
+Confirmed:
+- **`&mut self.text` inside a live render pass is fine.** `draw` borrows `&self.device`,
+  `&self.queue` and `&mut self.text` while the pass holds `&self.rect_pipeline` etc. —
+  disjoint field borrows, no conflict. The whole "does draw-into-their-pass work" question
+  is settled.
+- **`measure` → `draw` in sequence works.** `renderer.text.measure(h)` immutably, build the
+  render struct, then `&mut` the renderer on the next line. The `ActiveEditorRender<'a>`
+  lifetime disappears entirely because it carries the `Copy` handle instead of `&TextLayout`.
+- **The block/paragraph split fits.** `TextParagraphCacheKey{namespace, id, version{slot,
+  generation}}` maps to `ParagraphKey` with no packing and no hash. `BlockKey` is minted from
+  `(node id, TextKind)` in one 8-line function.
+- **The collapse is real.** `Renderer`'s 17 text fields → 3. `RenderPane`'s
+  `P: TextParagraphProvider` generic and `BoxParagraphProvider` → one `&dyn Fn`. Four
+  `layout_text_paragraph_runs*` helpers → `shape_block` + `text_style`. Four atlas syncs,
+  four buffer grow-and-write blocks and two `write_matrix` calls → `set_target` +
+  `set_transform`. Every `pos.y + ascent * size_px` gone. `EditorLayoutKey`, `scale_pixels`,
+  the zoom fast path and `desired_x *= scale` all deleted.
+
+Changed by the test:
+- **`fetch` takes `(usize, ParagraphKey)`, not just the key.** A consumer holding
+  already-materialized text (a title, runner output) can only find the substring
+  positionally — and since `fetch` runs on *misses only*, it cannot assume it is called once
+  per part in order. Found by writing the `TextSpecText::Owned` arm; the index-free version
+  is silently wrong, not a compile error.
+- **`shape_transient(&str, &Style)` added.** compendium has text with no stable identity
+  (`paragraph_keys: None`). Without a content-keyed path every consumer has to invent a key
+  for "just draw this string", which reintroduces exactly the collision risk `namespace` was
+  added to avoid.
+- **The fetch's text lifetime must be its own parameter.** `RenderPane<'a, 't>`: with one
+  lifetime, `Cow<'a, str>` unifies with the pane's other borrows and every one of them is
+  required to outlive the document.
+- **`fontdb::make_shared_face_data` is `unsafe`** (it mmaps). Fine — same contract as any
+  mmap font stack — but the "just take the Arc" answer has an `unsafe` in it.
+
+Still open — the one real cost:
+- **Model-side editor operations now need the renderer.** Caret motion, edit actions and
+  hit-testing read the layout, which lives in the service, so `text_editor_motion_with_active_view`
+  and friends grow a `&Renderer` parameter — and that cascades into the keyboard input path,
+  which is exactly what compendium's architecture keeps GPU-free on purpose ("model logic
+  can't reach the GPU except where it's handed the renderer explicitly"). Today this is free
+  because the editor owns a cloned `TextLayout`. Options: thread the renderer (spreads GPU
+  reach), split the layout pool out of the service (breaks "one object"), or have the editor
+  keep the small line table motion actually needs — byte ranges plus em tops/heights,
+  refreshed at `prepare_layout`. The third is much smaller than today's owned layout and
+  keeps motion GPU-free; it is the likely answer but it is not designed yet.
 
 ---
 
@@ -341,6 +507,13 @@ gets simpler (all of it is read-only queries over one body `Layout`):
   dividing by zoom); `desired_x` stored em. Nothing in the current feature set breaks. Pin an
   explicit test on **word-wrap caret affinity** (the one feature coupled to `Layout` internals;
   survives via `CaretHit{byte,line}` + `caret_line_hint`).
+
+One thing compendium has to *change*, not just delete:
+- **Share the font bytes.** `resolve_font_chain` builds a fresh `fontdb::Database` per call and
+  `data.to_vec()`s each face (`renderer.rs:104–140`). Keep one `Database` alive and switch to
+  `make_shared_face_data(id) -> (Arc<dyn AsRef<[u8]> + Sync + Send>, u32)`, so UI and Mono hand
+  `map_font` the *same* `Arc` for a shared face. Without this the dedup never fires and the
+  "4 atlases → 2, emoji rasterized once" win silently doesn't happen.
 
 Still compendium's job (unchanged):
 - fontdb discovery (name → bytes).

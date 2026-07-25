@@ -22,6 +22,7 @@ mod font;
 mod layout;
 mod outline;
 mod renderer;
+pub mod text;
 mod vertex;
 
 pub use engine::{
