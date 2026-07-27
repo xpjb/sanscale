@@ -80,8 +80,8 @@ mod vertex;
 pub use font::{read_font_file, FontMetrics};
 
 pub use text::{
-    Align, BlockKey, CaretHit, CaretRect, CaretStop, Color, Diagnostics, Draw, FontChainHandle,
-    FontData,
+    Align, Batch, BlockKey, CaretHit, CaretRect, CaretStop, Color, Diagnostics, Draw,
+    FontChainHandle, FontData,
     FontError, FontHandle, Layout, LayoutLineSpec, LineMetrics, ParagraphKey, ParagraphSource,
-    Paragraphs, Rect, SelectionSpan, ShapedHandle, Style, TextService, Vec2,
+    Paragraphs, Rect, Segment, SelectionSpan, ShapedHandle, Style, TextService, Vec2,
 };

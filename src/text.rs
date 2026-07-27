@@ -22,7 +22,7 @@ use crate::emoji::{bucket_for, EmojiCache};
 use crate::flow::{flow_paragraph, FlowLine};
 use crate::font::Font;
 use crate::layout::{shape_text, ChainFont, ShapedGlyph};
-use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer, VertexArena};
+use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer};
 use crate::vertex::{push_emoji_quad, push_glyph_quad_pixels, EmojiVertex, TextVertex};
 
 /// Shared font bytes. Deliberately fontdb's `make_shared_face_data` return type,
@@ -539,7 +539,7 @@ struct GeomKey {
 /// space, so they survive pan and zoom, and keeping them host-side lets many
 /// blocks concatenate into one upload and one draw call. A buffer per block
 /// means a draw call per block, which is ruinous on a dense canvas.
-/// Quads are baked with the block's top-left at the **origin**; `draw_batch`
+/// Quads are baked with the block's top-left at the **origin**; `prepare`
 /// adds `at` as it concatenates. This is what lets one shaped block be drawn at
 /// many positions — a repeated label, a glyph reused across a grid, or a body
 /// scrolling under a fixed clip — from a single build. Baking `at` in instead
@@ -572,15 +572,61 @@ pub struct Draw {
     pub clip: Option<Rect>,
 }
 
+/// One clip-uniform run inside a [`Batch`]: the vertices between two scissor
+/// changes. Read-only, minted by [`TextService::prepare`], dies with its batch.
+///
+/// The general draw loop is: map `clip` to framebuffer pixels, set the scissor,
+/// [`TextService::draw_segment`]. The mapping is the consumer's one job in that
+/// loop — under an arbitrary transform only the consumer knows the viewport,
+/// which is why the crate contains no scissor call.
+#[derive(Clone, Copy, Debug)]
+pub struct Segment {
+    /// The clip these items were prepared with, echoed back in the space it was
+    /// passed in. `None` = unclipped: no scissor needed beyond the pass's own.
+    pub clip: Option<Rect>,
+    /// Byte and vertex bounds into the batch buffer, per pipeline. Private:
+    /// the buffer layout and the text/emoji stride split are not surface.
+    text_bytes: (u64, u64),
+    text_vertices: (u32, u32),
+    emoji_bytes: (u64, u64),
+    emoji_vertices: (u32, u32),
+}
+
+/// Blocks the consumer chose to group, concatenated into one GPU buffer **the
+/// consumer holds** — the unit of vertex ownership (`rfc-batch-cache.md`).
+///
+/// Nothing here is shared, so nothing can be clobbered: the buffer lives
+/// exactly as long as the `Batch`, and dropping it immediately after recording
+/// is fine — wgpu ref-counts what a pass binds. Rebuilding is the consumer's
+/// call (content changed, [`TextService::batch_live`] went false, a recolor —
+/// color is baked per-vertex); an unchanged batch costs zero per-frame upload.
+///
+/// Order within a batch is the order of the `&[Draw]` it was prepared from —
+/// that is z-order, and it is the consumer's: `prepare` never reorders, and
+/// drawing segments out of order is a silent z bug the service cannot detect.
+pub struct Batch {
+    buffer: wgpu::Buffer,
+    segments: Vec<Segment>,
+    /// Emoji-atlas eviction epoch the UVs were baked against; `None` for a
+    /// batch with no emoji, which can never go stale (the text atlas grows but
+    /// never evicts or moves slots).
+    emoji_epoch: Option<u64>,
+}
+
+impl Batch {
+    /// Where the clip changes: one entry per scissor-uniform run, in draw
+    /// order. A uniform-clip batch has exactly one.
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+}
+
 struct Gpu {
     format: wgpu::TextureFormat,
     text: TextRenderer,
     emoji: EmojiRenderer,
     text_atlas: TextAtlas,
     emoji_atlas: EmojiAtlas,
-    /// One arena for both pipelines: suballocation is bump-only, so sharing it
-    /// costs nothing and halves the number of buffers to grow.
-    arena: VertexArena,
 }
 
 /// Cache bounds. Eviction is capacity-based rather than time-based on purpose:
@@ -609,7 +655,7 @@ pub struct TextService {
     /// Slot generations, held apart from `blocks` so validating a handle touches
     /// a dense 4-byte array instead of pulling a ~200-byte `BlockSlot` into cache.
     generations: Vec<u32>,
-    /// Pool 7, also held apart from `blocks`. `draw_batch` walks this and nothing
+    /// Pool 7, also held apart from `blocks`. `prepare` walks this and nothing
     /// else: on a dense frame it is the only array in the hot loop, and keeping it
     /// off `Block` is the difference between touching ~96 bytes per item and
     /// chasing through the block's layout, parts and style to reach it.
@@ -626,6 +672,10 @@ pub struct TextService {
     emoji: EmojiCache,
     gpu: Option<Gpu>,
     pending_format: Option<wgpu::TextureFormat>,
+    /// On-screen pixels per source-space unit; `None` = 1 (exact under
+    /// `pixel_ortho`). Consulted only when picking an emoji raster bucket —
+    /// see [`TextService::set_pixel_scale`].
+    pixel_scale: Option<f32>,
 
     clock: u64,
     empty_layout: Layout,
@@ -879,6 +929,21 @@ impl TextService {
         }
     }
 
+    /// On-screen pixels per source-space unit. Consulted only to pick the emoji
+    /// raster bucket; Slug text is analytic and needs no bucket at all.
+    ///
+    /// Under [`TextService::pixel_ortho`] the default (1) is exact and this never
+    /// needs calling. Under an MVP, `size` is in world units and the service
+    /// cannot know what one unit maps to on screen — state it (a camera zoom,
+    /// typically), updating alongside [`TextService::set_transform`] when it
+    /// changes, or emoji rasterize at world-unit resolution and blur under
+    /// magnification. Zero and negatives are ignored.
+    pub fn set_pixel_scale(&mut self, px_per_unit: f32) {
+        if px_per_unit > 0.0 {
+            self.pixel_scale = Some(px_per_unit);
+        }
+    }
+
     /// Column-major ortho mapping `(0,0)..(width,height)` to clip space, y down —
     /// the screen-space special case.
     pub fn pixel_ortho(width: u32, height: u32) -> [f32; 16] {
@@ -920,26 +985,44 @@ impl TextService {
         );
     }
 
-    /// Record many blocks in **one** pair of draw calls.
+    /// Build a [`Batch`] the consumer owns: every block's quads (cached, and
+    /// reused across frames while its draw parameters hold) concatenated into
+    /// one buffer, split into [`Segment`]s where the clip changes.
     ///
-    /// Each block's quads are cached and reused across frames while its draw
-    /// parameters hold, then concatenated into a single upload. This is what a
-    /// dense canvas needs: drawing tens of thousands of glyph-sized blocks one
-    /// call each costs hundreds of milliseconds in command recording alone, and
-    /// none of that work is about text.
-    pub fn draw_batch(
+    /// **All mutation happens here** — geometry rebuilds, emoji rasterization,
+    /// atlas sync, one buffer upload. `draw_segment`/`draw_prepared` purely
+    /// record, so "never recreate a texture between a bind and its draw" holds
+    /// by construction rather than by call-order discipline.
+    ///
+    /// Input order is preserved (it is z-order, and it is yours); adjacent
+    /// items with an equal clip coalesce into one segment. Retention is only
+    /// meaningful if `at`/`size` are stable across frames — under a camera,
+    /// pass world units with the camera in the transform (`set_transform`),
+    /// not pre-projected pixels, or every pan invalidates every batch.
+    pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'_>,
         items: &[Draw],
-    ) {
+    ) -> Batch {
         self.ensure_gpu(device);
-        if self.gpu.is_none() || items.is_empty() {
-            return;
+        if self.gpu.is_none() {
+            // No target format was ever set, so there is no pipeline to bind
+            // and nothing to bind it to. A `Batch` owns a buffer by
+            // definition; this one is never bound, having no segments.
+            return Batch {
+                buffer: batch_buffer(device, 0),
+                segments: Vec::new(),
+                emoji_epoch: None,
+            };
         }
 
+        // Read *before* the walk: rasterizing a new emoji can evict, and the
+        // quads placed up to that point were baked against this value. It is
+        // also what `rebuild_geometry` stamps, so the batch and the geometry
+        // pool agree about what they were built against.
         let epoch = self.emoji.epoch();
+        let pixel_scale = self.pixel_scale.unwrap_or(1.0);
         let mut text_verts = std::mem::take(&mut self.batch_text);
         let mut emoji_verts = std::mem::take(&mut self.batch_emoji);
         text_verts.clear();
@@ -949,70 +1032,163 @@ impl TextService {
         // batch cost.
         text_verts.reserve(items.len() * 6);
 
-        for item in items {
-            let Some(index) = self.block_index(item.block) else {
-                continue;
-            };
-            let bucket = bucket_for(item.size);
-            let key = GeomKey {
-                color: item.color.0.map(f32::to_bits),
-                clip: normalized_clip(item).map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
-            };
-            // Fast path: one dense-array probe, then straight into the batch.
-            if let Some(geom) = self.geometry[index].as_ref() {
-                // The epoch only matters if this block actually baked emoji UVs;
-                // an atlas eviction cannot disturb a text-only block, and
-                // invalidating those too rebuilds the whole frame for nothing.
-                let emoji_still_valid =
-                    geom.emoji.is_empty() || (geom.epoch == epoch && geom.bucket == bucket);
-                if geom.key == key && emoji_still_valid {
-                    place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
+        let mut segments: Vec<Segment> = Vec::new();
+        for run in clip_runs(items) {
+            let text_start = text_verts.len() as u32;
+            let emoji_start = emoji_verts.len() as u32;
+            for item in &items[run.clone()] {
+                let Some(index) = self.block_index(item.block) else {
                     continue;
+                };
+                // The bucket wants an *on-screen* size: under an MVP `size` is
+                // world units, and the consumer-stated scale bridges the gap.
+                let bucket = bucket_for(item.size * pixel_scale);
+                let key = GeomKey {
+                    color: item.color.0.map(f32::to_bits),
+                    clip: normalized_clip(item)
+                        .map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
+                };
+                // Fast path: one dense-array probe, then straight into the batch.
+                if let Some(geom) = self.geometry[index].as_ref() {
+                    // The epoch only matters if this block actually baked emoji
+                    // UVs; an atlas eviction cannot disturb a text-only block,
+                    // and invalidating those too rebuilds the frame for nothing.
+                    let emoji_still_valid =
+                        geom.emoji.is_empty() || (geom.epoch == epoch && geom.bucket == bucket);
+                    if geom.key == key && emoji_still_valid {
+                        place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
+                        continue;
+                    }
+                }
+                self.rebuild_geometry(index, item, key, epoch, bucket);
+                if let Some(geom) = self.geometry[index].as_ref() {
+                    place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
                 }
             }
-            self.rebuild_geometry(index, item, key, epoch, bucket);
-            if let Some(geom) = self.geometry[index].as_ref() {
-                place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
-            }
+            segments.push(Segment {
+                clip: items[run.start].clip,
+                // Byte spans are batch-global under this layout and are only
+                // known once both halves are sized; filled in below.
+                text_bytes: (0, 0),
+                text_vertices: (text_start, text_verts.len() as u32),
+                emoji_bytes: (0, 0),
+                emoji_vertices: (emoji_start, emoji_verts.len() as u32),
+            });
         }
 
-        // Atlas uploads are `queue` writes, which land before this command buffer
-        // executes, so *adding* glyphs mid-pass is safe. The invariants that keep
+        // Atlas uploads are `queue` writes, which land before this batch is
+        // ever drawn, so *adding* glyphs here is safe. The invariants that keep
         // it safe — never recreate a texture already bound by an earlier draw in
-        // this pass, never evict a slot that draw sampled — live with the atlases.
+        // the pass, never evict a slot that draw sampled — live with the atlases.
         let gpu = self.gpu.as_mut().expect("checked above");
         gpu.text_atlas
             .sync(device, queue, &gpu.text.atlas_layout, &self.glyphs);
         gpu.emoji_atlas
             .sync(device, queue, &gpu.emoji.atlas_layout, &self.emoji);
 
-        if !text_verts.is_empty() {
-            let range = gpu.arena.push(device, queue, &text_verts);
-            gpu.text.draw_vertices(
-                pass,
-                &gpu.text_atlas,
-                gpu.arena.buffer(),
-                range.0..range.1,
-                0..text_verts.len() as u32,
-            );
+        // One buffer per batch, text quads then emoji quads: two writes and two
+        // `set_vertex_buffer` offsets whatever the segment count. Both strides
+        // (56 and 16) are multiples of four, so the emoji half starts at a legal
+        // offset however much text precedes it.
+        let text_data: &[u8] = bytemuck::cast_slice(&text_verts);
+        let emoji_data: &[u8] = bytemuck::cast_slice(&emoji_verts);
+        let split = text_data.len() as u64;
+        let total = split + emoji_data.len() as u64;
+        let buffer = batch_buffer(device, total);
+        if !text_data.is_empty() {
+            queue.write_buffer(&buffer, 0, text_data);
         }
-        if !emoji_verts.is_empty() {
-            let range = gpu.arena.push(device, queue, &emoji_verts);
-            gpu.emoji.draw(
-                pass,
-                &gpu.emoji_atlas,
-                gpu.arena.buffer(),
-                range.0..range.1,
-                0..emoji_verts.len() as u32,
-            );
+        if !emoji_data.is_empty() {
+            queue.write_buffer(&buffer, split, emoji_data);
+        }
+        for segment in &mut segments {
+            segment.text_bytes = (0, split);
+            segment.emoji_bytes = (split, total);
         }
 
+        let emoji_epoch = (!emoji_verts.is_empty()).then_some(epoch);
         self.batch_text = text_verts;
         self.batch_emoji = emoji_verts;
+        Batch {
+            buffer,
+            segments,
+            emoji_epoch,
+        }
+    }
+
+    /// Record one segment of a prepared batch. Sets **no scissor** — set yours
+    /// first from [`Segment::clip`]. Within a segment, text draws below emoji.
+    ///
+    /// Recording only: `&self`, no device, nothing is uploaded or rebuilt. A
+    /// no-op if `index` is out of range or no target was ever set.
+    pub fn draw_segment(&self, pass: &mut wgpu::RenderPass<'_>, batch: &Batch, index: usize) {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        let Some(seg) = batch.segments.get(index) else {
+            return;
+        };
+        gpu.text.draw_vertices(
+            pass,
+            &gpu.text_atlas,
+            &batch.buffer,
+            seg.text_bytes.0..seg.text_bytes.1,
+            seg.text_vertices.0..seg.text_vertices.1,
+        );
+        gpu.emoji.draw(
+            pass,
+            &gpu.emoji_atlas,
+            &batch.buffer,
+            seg.emoji_bytes.0..seg.emoji_bytes.1,
+            seg.emoji_vertices.0..seg.emoji_vertices.1,
+        );
+    }
+
+    /// Record every segment of a prepared batch, in order, with no scissor
+    /// changes — the uniform-clip fast path, and what [`TextService::draw_batch`]
+    /// desugars to. For per-segment scissors, loop [`Batch::segments`] and
+    /// [`TextService::draw_segment`] yourself.
+    pub fn draw_prepared(&self, pass: &mut wgpu::RenderPass<'_>, batch: &Batch) {
+        for index in 0..batch.segments.len() {
+            self.draw_segment(pass, batch, index);
+        }
+    }
+
+    /// Whether a retained batch's emoji UVs still point at the glyphs they were
+    /// baked from. Two integer compares — check per frame, re-`prepare` on
+    /// `false`. Drawing a stale batch is defined: it draws the old texels,
+    /// which may by then be a recycled emoji cell — wrong pixels, never UB.
+    /// Batches with no emoji never go stale.
+    pub fn batch_live(&self, batch: &Batch) -> bool {
+        epoch_live(batch.emoji_epoch, self.emoji.epoch())
+    }
+
+    /// Record many blocks in **one** pair of draw calls: `prepare` +
+    /// `draw_prepared` + drop. The easy path *is* the hard path plus a drop —
+    /// there is no second route to the GPU.
+    ///
+    /// This is what a dense canvas needs: drawing tens of thousands of
+    /// glyph-sized blocks one call each costs hundreds of milliseconds in
+    /// command recording alone, and none of that work is about text.
+    ///
+    /// The batch is dropped as this returns; wgpu ref-counts what a pass binds,
+    /// so its buffer outlives the recording without anyone holding it.
+    pub fn draw_batch(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'_>,
+        items: &[Draw],
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let batch = self.prepare(device, queue, items);
+        self.draw_prepared(pass, &batch);
     }
 
     /// Build one block's quads into its geometry cache. CPU only — no device and
-    /// no upload; `draw_batch` does that once for the whole batch.
+    /// no upload; `prepare` does that once for the whole batch.
     fn rebuild_geometry(
         &mut self,
         index: usize,
@@ -1091,7 +1267,6 @@ impl TextService {
             emoji,
             text_atlas,
             emoji_atlas,
-            arena: VertexArena::new(device),
         });
     }
 
@@ -1465,6 +1640,46 @@ impl Diagnostics<'_> {
     }
 }
 
+/// Split `items` into runs of equal `clip` — one [`Segment`] each.
+///
+/// **Adjacent only, and never reordered.** Order within a batch is z-order and
+/// the consumer chose it, so grouping by clip identity — which would fold
+/// `[a, b, a]` into two segments — silently reshuffles z. An interleaved clip
+/// costs a segment, and a segment costs a scissor call, not an upload.
+///
+/// Free and pure so the rule that decides scissor boundaries is testable
+/// without a device.
+fn clip_runs(items: &[Draw]) -> Vec<Range<usize>> {
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        match runs.last_mut() {
+            Some(run) if items[run.start].clip == item.clip => run.end = index + 1,
+            _ => runs.push(index..index + 1),
+        }
+    }
+    runs
+}
+
+/// The vertex buffer backing one [`Batch`]. Sized to the batch and never
+/// suballocated or reused, which is the whole of the ownership fix: no shared
+/// region means nothing to clobber.
+fn batch_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sanscale batch vertices"),
+        // A batch that placed nothing still owns a buffer; keep it nominally
+        // sized rather than relying on zero-length buffers being legal.
+        size: size.max(4),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// The staleness rule behind [`TextService::batch_live`], without a device:
+/// a batch that baked no emoji UVs has nothing an eviction can repoint.
+fn epoch_live(baked: Option<u64>, current: u64) -> bool {
+    baked.is_none_or(|epoch| epoch == current)
+}
+
 /// Concatenate one block's origin-baked quads into the batch, translated to
 /// `at`. The copy is a memcpy plus a linear add — orders of magnitude cheaper
 /// than the rebuild that baking `at` into the cache key would have forced.
@@ -1564,6 +1779,67 @@ mod tests {
 
     fn style_of(chain: FontChainHandle, wrap_em: Option<f32>) -> Style {
         Style { chain, wrap_em, align: Align::Left, line_spacing: 1.0 }
+    }
+
+    /// A `Draw` that differs from its neighbours only in `clip` — enough for
+    /// the segmentation rule, which reads nothing else. No font, no device.
+    fn clipped(clip: Option<Rect>) -> Draw {
+        Draw {
+            block: ShapedHandle { slot: 0, generation: 0 },
+            at: Vec2::new(0.0, 0.0),
+            size: 16.0,
+            color: Color([1.0, 1.0, 1.0, 1.0]),
+            clip,
+        }
+    }
+
+    /// A segment is a scissor change, and a scissor that didn't change isn't
+    /// one. Splitting per item instead would be correct and quietly cost a
+    /// draw call per block — the thing batching exists to avoid.
+    #[test]
+    fn adjacent_equal_clips_coalesce() {
+        let clip = Some(Rect::new(0.0, 0.0, 10.0, 10.0));
+        assert_eq!(clip_runs(&[clipped(clip), clipped(clip), clipped(clip)]), vec![0..3]);
+        assert_eq!(clip_runs(&[clipped(None), clipped(None)]), vec![0..2]);
+        assert_eq!(clip_runs(&[]), Vec::<Range<usize>>::new());
+    }
+
+    /// The consumer has nowhere to set a scissor *inside* a segment, so any
+    /// change of clip — including to or from unclipped — has to end one.
+    #[test]
+    fn a_clip_change_starts_a_new_segment() {
+        let a = Some(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let taller = Some(Rect::new(0.0, 0.0, 10.0, 11.0));
+        let items = [clipped(a), clipped(taller), clipped(None), clipped(a)];
+        assert_eq!(clip_runs(&items), vec![0..1, 1..2, 2..3, 3..4]);
+    }
+
+    /// Order within a batch is z-order and it is the consumer's. Grouping by
+    /// clip *identity* would fold the two `a` runs below into one segment and
+    /// silently draw `b` last — a reordering the service cannot detect and the
+    /// consumer never asked for.
+    #[test]
+    fn segments_preserve_input_order() {
+        let a = Some(Rect::new(0.0, 0.0, 1.0, 1.0));
+        let b = Some(Rect::new(5.0, 5.0, 1.0, 1.0));
+        let items = [clipped(a), clipped(a), clipped(b), clipped(a)];
+        let runs = clip_runs(&items);
+        assert_eq!(runs, vec![0..2, 2..3, 3..4]);
+        // Every item lands in exactly one run, and the runs read in input order.
+        let covered: Vec<usize> = runs.iter().flat_map(Clone::clone).collect();
+        assert_eq!(covered, (0..items.len()).collect::<Vec<_>>());
+    }
+
+    /// A text-only batch is immortal: the text atlas grows but never evicts or
+    /// moves a slot, so there is nothing for an epoch to invalidate. Keying
+    /// staleness on the epoch alone would re-`prepare` every retained batch in
+    /// the document each time one emoji cell was recycled.
+    #[test]
+    fn a_batch_with_no_emoji_never_goes_stale() {
+        assert!(epoch_live(None, 0));
+        assert!(epoch_live(None, u64::MAX));
+        assert!(epoch_live(Some(4), 4));
+        assert!(!epoch_live(Some(4), 5), "an eviction since the bake is staleness");
     }
 
     /// Counts how often the service asks for a paragraph's bytes.
