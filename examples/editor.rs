@@ -682,18 +682,25 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
                     let now = Instant::now();
-                    let double = gfx.last_click.is_some_and(|(t, p)| {
-                        now.duration_since(t).as_millis() < 400
-                            && (gfx.cursor.x - p.x).abs() + (gfx.cursor.y - p.y).abs() < 6.0
-                    });
-                    if double {
-                        gfx.dragging = false;
-                        gfx.last_click = None;
-                        gfx.select_word_at_cursor();
-                    } else {
-                        gfx.dragging = true;
-                        gfx.last_click = Some((now, gfx.cursor));
-                        gfx.place_at_cursor(gfx.mods.shift_key());
+                    let count = match gfx.last_click {
+                        Some((t, p, c))
+                            if now.duration_since(t).as_millis() < 400
+                                && (gfx.cursor.x - p.x).abs() + (gfx.cursor.y - p.y).abs()
+                                    < 6.0 =>
+                        {
+                            c + 1
+                        }
+                        _ => 1,
+                    };
+                    gfx.last_click = Some((now, gfx.cursor, count));
+                    gfx.dragging = count == 1;
+                    match count {
+                        1 => gfx.place_at_cursor(gfx.mods.shift_key()),
+                        2 => gfx.select_word_at_cursor(),
+                        _ => {
+                            gfx.select_paragraph_at_cursor();
+                            gfx.last_click = None; // a 4th click starts over
+                        }
                     }
                 }
                 ElementState::Released => gfx.dragging = false,
@@ -729,8 +736,10 @@ struct Gfx {
     /// you type and blinks only at rest.
     last_input: Instant,
     blink_phase: u64,
-    /// Previous left-press, for double-click detection (winit doesn't count).
-    last_click: Option<(Instant, Vec2)>,
+    /// Previous left-press + running click count, for double/triple-click
+    /// detection (winit doesn't count clicks; that is consumer work — only the
+    /// *range* each tier selects comes from the library).
+    last_click: Option<(Instant, Vec2, u32)>,
 }
 
 /// Half a blink cycle: visible for one period, hidden for the next.
@@ -883,10 +892,27 @@ impl Gfx {
         let Some(handle) = self.last_handle else { return };
         let layout = self.text.measure(handle);
         let range = layout.select_word_at(hit.byte_index, &self.editor.doc);
+        self.select_range(range);
+    }
+
+    /// Triple-click paragraph selection — pure geometry, hard break to hard
+    /// break ([`Layout::select_paragraph_at`]).
+    fn select_paragraph_at_cursor(&mut self) {
+        let Some(hit) = self.hit_at_cursor() else { return };
+        let Some(handle) = self.last_handle else { return };
+        let layout = self.text.measure(handle);
+        let range = layout.select_paragraph_at(hit.byte_index);
+        self.select_range(range);
+    }
+
+    fn select_range(&mut self, range: std::ops::Range<usize>) {
+        let Some(handle) = self.last_handle else { return };
+        let layout = self.text.measure(handle);
+        let caret = layout.caret_at(range.end);
         self.last_input = Instant::now();
         self.blink_phase = 0;
         self.editor.anchor = Some(range.start);
-        self.editor.caret = layout.caret_at(range.end);
+        self.editor.caret = caret;
         self.editor.goal = None;
         self.window.request_redraw();
     }

@@ -693,6 +693,36 @@ impl Layout {
         start.min(byte_index)..end.max(byte_index)
     }
 
+    /// The paragraph around `byte_index` — the triple-click selection: the
+    /// range between the hard breaks on either side. Pure geometry, unlike
+    /// [`Layout::select_word_at`]: a block's hard breaks *are* its paragraph
+    /// seams by construction (parts are joined with a separator byte), so no
+    /// classifier is consulted.
+    pub fn select_paragraph_at(&self, byte_index: usize) -> Range<usize> {
+        let byte_index = byte_index.min(self.len_bytes());
+        let line = self.caret_at(byte_index).line_index;
+        let soft_joined = |a: usize, b: usize| -> bool {
+            match (self.line_range(a), self.line_range(b)) {
+                (Some(upper), Some(lower)) => upper.end == lower.start,
+                _ => false,
+            }
+        };
+        let mut first = line;
+        while first > 0 && soft_joined(first - 1, first) {
+            first -= 1;
+        }
+        let mut last = line;
+        while last + 1 < self.lines.len() && soft_joined(last, last + 1) {
+            last += 1;
+        }
+        let start = self.line_range(first).map(|r| r.start).unwrap_or(0);
+        let end = self
+            .line_range(last)
+            .map(|r| r.end)
+            .unwrap_or_else(|| self.len_bytes());
+        start..end
+    }
+
     pub fn selection(&self, range: Range<usize>) -> Vec<SelectionSpan> {
         if range.is_empty() {
             return Vec::new();
@@ -2147,6 +2177,18 @@ mod tests {
         assert_eq!(layout.select_word_at(2, &Stub), 0..4);
         // `()` declines: the selection is the cluster around the byte.
         assert_eq!(layout.select_word_at(2, &()), 1..3);
+    }
+
+    /// `select_paragraph_at` expands across soft wraps and stops at hard breaks.
+    #[test]
+    fn select_paragraph_spans_wraps_and_stops_at_hard_breaks() {
+        // Soft-wrapped: both visual lines are one paragraph.
+        assert_eq!(wrapped_layout().select_paragraph_at(6), 0..7);
+        // Hard-broken: each line is its own paragraph, including the blank one.
+        let hard = three_line_layout();
+        assert_eq!(hard.select_paragraph_at(1), 0..2);
+        assert_eq!(hard.select_paragraph_at(3), 3..3);
+        assert_eq!(hard.select_paragraph_at(5), 4..6);
     }
 
     /// `caret_after_edit` is end-affine at a soft break and natural elsewhere.
