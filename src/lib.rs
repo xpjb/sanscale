@@ -22,7 +22,14 @@
 //!   what you measure, hit-test and draw.
 //!
 //! Shaping is em-space and carries no pixel size and no color, so the cache is
-//! zoom-invariant. Size and color enter once, at [`TextService::draw`].
+//! zoom-invariant. Size and color enter once, at draw time.
+//!
+//! Drawing is tiered, and the easy path is literally the hard path plus a drop:
+//! [`TextService::draw`] and [`TextService::draw_batch`] are sugar over
+//! [`TextService::prepare`], which concatenates blocks into a [`Batch`] — one
+//! GPU buffer **you** hold, split into [`Segment`]s where the clip changes.
+//! Hold a batch and unchanged content costs zero per-frame upload; ignore the
+//! word "batch" entirely and nothing is taken from you.
 //!
 //! # What this crate does not own
 //!
@@ -56,7 +63,8 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! Nothing above touches a GPU. [`TextService::draw`] is the only method that does.
+//! Nothing above touches a GPU. [`TextService::prepare`] (and the `draw*` sugar
+//! over it) is the only path that does.
 //!
 //! # Compatibility
 //!

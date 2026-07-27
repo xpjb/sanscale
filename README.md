@@ -23,6 +23,9 @@ sanscale = { git = "https://github.com/xpjb/sanscale" }
   fragment shader tests only nearby curves, not the whole outline.
 - **Lazy, incremental atlas** — glyphs are cached and uploaded to the GPU on
   first use; nothing to pre-declare.
+- **Consumer-owned batches** — `prepare` many blocks into one buffer *you* hold;
+  unchanged content re-uploads nothing, and the fire-and-forget `draw` path is
+  the same machinery plus a drop.
 - **Real shaping** via [rustybuzz](https://crates.io/crates/rustybuzz), script
   itemization, and multi-font **fallback chains**.
 - **Color emoji** (COLR v0/v1) through a rasterized side atlas.
@@ -98,14 +101,16 @@ depend on it via git.
 font bytes ──► itemize + shape ──► flow into lines ──► outlines ──► bands ──► GlyphCache ──► TextAtlas (GPU)
    font.rs      layout.rs           flow.rs             outline.rs   bands.rs    cache.rs       renderer.rs
   (rustybuzz)                                                                                        │
-   shape() caches a block ──► draw() / draw_batch() emit TextVertex ──► shader ◄─────────────────────┘
-            text.rs                       vertex.rs                  shaders/*.wgsl
+   shape() caches a block ──► prepare() builds a Batch ──► draw_prepared() ──► shader ◄──────────────┘
+            text.rs             (draw/draw_batch = sugar)      vertex.rs    shaders/*.wgsl
 ```
 
 `TextService` is the surface; everything else is internal. `shape()` caches a block's
 em-space layout, `measure()` and the caret/selection queries read it without
-touching a device, and `draw()` (or `draw_batch()`) rasterizes any newly needed
-glyphs into the atlas and records quads into your pass.
+touching a device, and `prepare()` rasterizes any newly needed glyphs into the
+atlas and concatenates blocks into a `Batch` — one vertex buffer you own, drawn
+segment-by-segment into your pass (`draw()`/`draw_batch()` are the transient
+sugar: prepare, draw, drop).
 
 | Module | Role |
 |---|---|

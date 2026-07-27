@@ -57,36 +57,24 @@ correctness bug is fixed — but the shape is unresolved.
 
 ---
 
-## Vertex ownership and batch grain → see `rfc-batch-cache.md`
+## Clip in the fragment shader (the batch RFC's deferred "Part 2")
 
-Moved out, and no longer parked: the RFC is **settled** and Parts 0–1 are work to
-do, not a question to answer.
+Parts 0–1 of `rfc-batch-cache.md` landed 2026-07-28 and the RFC folded into
+`decisions.md` (the "`Batch` owns its vertices" lock); this is the one piece
+deliberately not built.
 
-It started here as locality — each block owns two independently heap-allocated
-`Vec`s, so `draw_batch` chases a pointer per block and re-concatenates 41k of them
-every frame (2.04 ms of a 4.2 ms frame at `unicode_zoom`'s density, roughly nothing
-at compendium's hundreds). It stopped being a backlog item when the same area
-turned out to hold a correctness defect: the vertex arena rewinds mid-frame and
-clobbers draws already recorded into an open pass, because nothing owns the
-vertices. The RFC carries that diagnosis, the `Batch` design that removes it, and
-the deferred shader-clip work with its trigger. The ~2x locality gap is explicitly
-*not* what motivates the change.
+A scissor is pass state, so a `Batch` today draws one call per clip-distinct
+`Segment`. Moving the cut into the fragment shader — a per-block clip rect,
+preferably a +4 B per-vertex index into a storage buffer rather than a +16 B
+baked rect — collapses every batch to one segment and one draw call, and
+finishes the half-built clip story end-to-end (today the crate culls whole
+glyphs and the consumer's scissor cuts straddlers), permitting antialiased and
+rounded clip edges. When it lands nothing else changes: the segment loop just
+runs once.
 
----
-
-## `decisions.md` does double duty: append-only record *and* current-surface description
-
-The "API sketch (current)" section hand-tracks `src/text.rs`, which makes
-`decisions.md` both the record of why the design is what it is (append-only,
-policed by discipline) and a present-tense description of the surface (policed by
-nothing — it has drifted before, and the color lock drifted for a while without
-an append). Those are different documents with different failure modes.
-
-The fix is to move the current-surface content into rustdoc — `lib.rs` /
-`text.rs` — where `cargo doc` and the doctest police it mechanically, leaving
-`decisions.md` as pure record. Parked rather than done because Part 1 of
-`rfc-batch-cache.md` changes the surface anyway (`Batch`, `prepare`); restructure
-once, when it lands, not twice.
+**Trigger:** draw-call count actually measuring, or wanting a clip edge the
+scissor cannot express. Until then one draw call per separately-scissored item
+is accepted deliberately.
 
 ---
 

@@ -44,13 +44,22 @@ first; everything below assumes it.
    shaping are different arrows in the pipeline.
 8. **Geometry** — one block's quads at a given set of draw parameters, cached
    host-side. Position- and scale-independent, so a camera move re-runs none of it.
-9. **Batch** — *(settled, not yet built; see `rfc-batch-cache.md`)* the unit of
+9. **Batch** — *(built; design in `rfc-batch-cache.md`)* the unit of
    **vertex ownership**, and with it of pass state: blocks the consumer chose to
    group, concatenated into one buffer **it holds**, drawn as one range per scissor.
    The only noun here that belongs to **rendering** rather than to text. Originally
    scoped as pass state alone — "one scissor, one z-slot, one draw call" — which is
    still what bounds a *draw*, but the reason the noun exists is that a vertex
    buffer needs an owner and the service is the wrong one.
+10. **Segment** — one clip-uniform run inside a batch: the vertices between two
+    scissor changes. The smallest concept class here — derived by `prepare`, read
+    back by the consumer (which owns the scissor), no identity, no lifetime of its
+    own, dies with its batch. It exists because three locked facts corner it: a
+    scissor is pass state, the crate refuses to set scissors (only the consumer
+    knows the viewport), and a batch may span many clips (else clip grain would
+    dictate buffer grain). Designed to *decay*: when the RFC's Part 2 moves
+    clipping into the fragment shader, every batch has one segment and the loop
+    runs once.
 
 Three of these are the load-bearing consumer-facing axes, and each has a different
 owner — confusing them is how the design goes wrong:
@@ -83,106 +92,14 @@ The pipeline, each arrow's output a cacheable pool:
 
 ---
 
-# API sketch (current)
+# The surface
 
-Tracks `src/text.rs` as built, not the shape we first sketched — where the two diverged, the
-divergence is noted at the decision it came from, below. wgpu is borrowed only at `draw` — the
-"optional wgpu" seam — so `shape`/`measure` run with no GPU. Supporting value types (`Align`,
-`FontData`, `Color`, `Layout`) elided.
-
-```rust
-struct TextService {
-    // the pools the user's handles index into (a handle IS its slot index):
-    fonts:  Vec<Font>,                     // FontHandle      — pool 1; deduped by data identity
-    chains: Vec<Option<Vec<FontHandle>>>,  // FontChainHandle — pool 2; `None` = dropped slot, so
-                                           //   live handles stay valid across a font reload
-    blocks: Vec<BlockSlot>,                // ShapedHandle    — a composed unit: ordered part-refs
-                                           //   into pool 6 + cumulative line offsets (scroll index)
-
-    // held apart from `blocks` deliberately — each is walked by a hot path that wants to
-    // touch nothing else (see Implementation notes):
-    generations: Vec<u32>,                // handle validation: a dense 4-byte probe
-    geometry:    Vec<Option<Geometry>>,   // pool 7; the only array `draw_batch` walks
-    free_blocks: Vec<u32>,                // tombstoned slots, newest first. Never `swap_remove`
-
-    // internally managed — no user handle:
-    block_lookup: HashMap<BlockKey, ShapedHandle>,             // shape() hit → existing slot
-    paragraphs:   HashMap<(ParagraphKey, Style), ParaLayout>,   // pool 6; Level-2, per paragraph
-    glyphs:       GlyphCache,   // pool 3; (face, glyph)         → Slug band/curve data  (CPU)
-    emoji:        EmojiCache,   // pool 4; (face, glyph, bucket) → RGBA                  (CPU)
-    gpu:          Option<Gpu>,  // pipelines per target format, atlas textures, vertex arena
-}
-// Pool 5 (content-keyed run shaping) is not built: shaping caches per paragraph.
-
-// handles — all Copy, indices into the pools
-#[derive(Clone, Copy)] struct FontHandle(u16);       // one mapped concrete font
-#[derive(Clone, Copy)] struct FontChainHandle(u16);  // ordered fallback list of fonts
-// Not a bare index: eviction reuses a slot, and a handle the consumer cached must resolve
-// to *nothing* rather than to a different block. See Implementation notes.
-#[derive(Clone, Copy)] struct ShapedHandle { slot: u32, generation: u32 }  // a shaped *block*
-
-// cousins of the handles: Copy, consumer-minted, not pool indices
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct ParagraphKey { namespace: u64, slot: u32, generation: u32 }  // unit of invalidation
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct BlockKey(u64);                                              // unit of coordinate space
-
-#[derive(Clone, Copy, PartialEq)]  // Eq/Hash via wrap_em.to_bits()
-struct Style { chain: FontChainHandle, wrap_em: Option<f32>, align: Align, line_spacing: f32 }
-
-impl TextService {
-    // takes nothing: pipelines are per-target and lazy (see set_target), and the atlases
-    // size themselves — grow-on-demand, warning at the device limit.
-    fn new() -> Self;   // lives beside the consumer's renderer, never inside it
-
-    // discovery is the consumer's (fontdb → bytes). Dedups on data identity, so pass the
-    // *same* Arc for a shared face. `face_index` picks a face out of a collection.
-    fn map_font(&mut self, data: FontData, face_index: u32) -> Result<FontHandle, FontError>;
-    fn register_chain(&mut self, fonts: &[FontHandle]) -> FontChainHandle;  // stored as-is
-    fn drop_chain(&mut self, chain: FontChainHandle);   // settings font reload
-    fn clear(&mut self);
-
-    // one block = 1..N paragraphs flowed together, with document-global byte offsets.
-    // `source` is consulted only for parts that miss; `None` = stale identity, block
-    // skipped. Re-calling with an unchanged `parts` slice is a memcmp, not a reflow.
-    // GPU-free. The Cow borrows from `&self`, so no lifetime is threaded anywhere.
-    fn shape(&mut self, block: BlockKey, style: &Style, parts: &[ParagraphKey],
-             source: &dyn ParagraphSource) -> Option<ShapedHandle>;
-    fn shape_one(&mut self, key: ParagraphKey, style: &Style,
-                 source: &dyn ParagraphSource) -> Option<ShapedHandle>;
-    // text with no stable consumer identity (tooltips, labels): content-keyed
-    fn shape_transient(&mut self, text: &str, style: &Style) -> Option<ShapedHandle>;
-
-    // em-space queries over the whole block: box size, hit-test, carets, selection.
-    // Transient — hold the handle, never the `&Layout` (see the lock). GPU-free.
-    fn measure(&self, h: ShapedHandle) -> &Layout;
-
-    // once per pass, before the draws that use them
-    fn set_target(&mut self, device: &Device, format: TextureFormat);  // pipeline cached per format
-    fn set_transform(&mut self, queue: &Queue, m: [f32; 16]);          // quads are emitted in local em
-    fn pixel_ortho(width: u32, height: u32) -> [f32; 16];              // helper, not a mode
-
-    // wgpu passed in directly (no bundle). `at`/`size` are in the transform's source space —
-    // screen pixels under `pixel_ortho`, world units under an MVP. `size` scales em→space and
-    // picks the emoji raster bucket. `clip` (same space) culls whole lines and glyphs on the
-    // CPU — it does **not** set a scissor (the crate contains no scissor call), so cutting a
-    // glyph that straddles the boundary is still the consumer's, via its own scissor. That is
-    // also what caps a consumer's batch size at one when its items have differing clips; see
-    // `rfc-batch-cache.md`. shape/measure don't take wgpu, so leaving draw uncalled =
-    // device-free.
-    fn draw(&mut self, device: &Device, queue: &Queue, pass: &mut RenderPass,
-            h: ShapedHandle, at: Vec2, size: f32, color: Color, clip: Option<Rect>);
-
-    // Many blocks, one set of pass state: `draw` is this with a one-item slice. Ruinous
-    // to skip at glyph granularity (267 ms vs 6.5 ms on a 41k-block frame); see litigation.
-    fn draw_batch(&mut self, device: &Device, queue: &Queue, pass: &mut RenderPass,
-                  items: &[Draw]);   // Draw { block, at, size, color, clip }
-
-    // Coverage and atlas-pressure queries. Arrived by accretion; whether it belongs on the
-    // surface at all is parked in `backlog.md`.
-    fn diagnostics(&self) -> Diagnostics<'_>;
-}
-```
+Lives in rustdoc, not here: `cargo doc --no-deps --document-private-items`
+renders it and polices its links, and the `lib.rs` doctest compiles against it.
+This file is the **record** — what the design is and why, appends over rewrites.
+(An "API sketch (current)" section used to hand-track `src/text.rs` here; it
+drifted more than once, and was retired when Part 1 of `rfc-batch-cache.md`
+landed, per the backlog entry that scheduled exactly that.)
 
 ---
 
@@ -201,6 +118,13 @@ Things we're certain about, and why.
   *Three of those arrived after this lock was written and none of them bent it:*
   `shape_transient` (content-keyed identity for tooltips), `draw_batch` (pass-state grain,
   measured — see litigation) and `diagnostics` (accretion — see `backlog.md`).
+
+  *Part 1 of `rfc-batch-cache.md` then added the batch tier — `prepare`,
+  `draw_segment`, `draw_prepared`, `batch_live`, `set_pixel_scale`, and the `Batch` /
+  `Segment` value types — and still didn't bend it: `Batch` is a consumer-held value,
+  not a second service, and `draw`/`draw_batch` became sugar over the same route
+  (the easy path is the hard path plus a drop). One deliberate shift: all device
+  mutation now lives in `prepare`; the `draw_*` methods purely record, at `&self`.*
 
 - **Two consumer-facing levels: the *block* is the coordinate space, the *paragraph* is the
   unit of invalidation.** `shape` takes a `BlockKey` and a slice of `ParagraphKey`s and returns
@@ -235,6 +159,19 @@ Things we're certain about, and why.
   transform); and emoji need a real on-screen pixel size for their bucket, estimated by pushing
   a unit vector through the transform (Slug glyphs need no bucket at all). Genuine 3D would also
   want depth state on the pipeline — `set_target` grows a `depth_format` — noted, not built.
+
+  **Part 0 landed consumer-side (2026-07-28).** compendium now passes exactly this MVP —
+  `pixel_ortho ∘ world_to_screen` per pane, with `at`/`size`/`clip` in world units — so its
+  draw inputs are camera-stable and retained batches survive pan and zoom. Verified
+  pixel-equivalent against the screen-space path on headless dumps (one camera bit-identical,
+  the rest float-level AA deltas). Two things shipped differently than sketched above: the
+  emoji bucket estimate is not "a unit vector through the transform" (that yields clip units
+  and would need the viewport anyway) but a consumer-stated `set_pixel_scale` — the default 1
+  is exact under `pixel_ortho`, and a consumer that owns an MVP knows its scale exactly. And
+  the migration surfaced a latent bug the old convention had invited: compendium passed a
+  framebuffer-pixel clip while `at` was pane-local pixels — spaces that differ by the pane
+  offset — so the CPU cull was shifted in non-first panes. One space for `at`/`size`/`clip`
+  removes the class.
 
 - **`clip` culls, it doesn't just scissor.** One `Rect` on `draw` drops whole lines and
   individual glyphs on the CPU before emitting. A scrolled 10k-paragraph body must not emit
@@ -325,6 +262,33 @@ Things we're certain about, and why.
   in compendium's document catalog: sliced glyphs, garbage triangles, and a different victim
   every frame from identical content, because `offset` persists across frames. The fix is not
   to give the arena a frame boundary but to delete it; see `rfc-batch-cache.md`.
+
+  **Deleted, Part 1 (2026-07-28).** The arena is gone; a `Batch` owns its buffer and the
+  hazard is unrepresentable. The ordering half of this lock got *stronger* in the process:
+  all device mutation (geometry, rasterization, atlas sync, upload) now happens in
+  `prepare`, and the `draw_*` methods purely record at `&self` — "never recreate between a
+  bind and its draw" is now enforced by the signatures, not by call-order discipline.
+
+- **A `Batch` owns its vertices; the service never does.** *(Part 1, landed 2026-07-28; the
+  full argument was `rfc-batch-cache.md`, now git history.)* A vertex buffer needs a lifetime
+  that reaches the consumer's submit, which the service cannot observe — the shared arena that
+  ignored this rewound mid-frame and clobbered draws already recorded into an open pass. So
+  the consumer holds it: `prepare` concatenates chosen blocks into one buffer, preserving
+  input order (z is the consumer's, never reordered) and coalescing only adjacent equal clips
+  into `Segment`s; the consumer scissors per segment (`draw_segment`, by index — the buffer
+  layout stays private) or draws them all (`draw_prepared`), and `draw`/`draw_batch` are the
+  same route plus a drop. Staleness is a probe, not machinery: `prepare` stamps the emoji
+  epoch (text-only batches are immortal), `batch_live` is two compares, and drawing stale is
+  *defined* — old texels, never UB. Rejected, with reasons that outlive the RFC: teaching the
+  arena a frame boundary (a contract the service can't verify — it never sees submit); a
+  service-owned content-keyed batch cache (invents identity and an eviction bound for a
+  lifetime the consumer already knows); auto-rebuild inside `draw_prepared` (mutation hidden
+  in what must purely record); pinning atlas slots to live batches (hidden atlas leases that
+  can wedge eviction). Closed opens: z-contiguity across a batch is the consumer's,
+  documented — verifying it needs a z-model the service deliberately lacks; eviction guidance
+  is a README note, since consumer-held means consumer-dropped. The one deferred piece —
+  clip in the fragment shader, which collapses a batch's segments into one draw call — is
+  parked in `backlog.md` with its trigger.
 
 - **The service is a glyph-quad source, not a compositor — it never owns the render pass.**
   The consumer builds the pass (target, clear/load, z-sorted interleave with its own
@@ -726,6 +690,11 @@ Learned while building it:
   it is that nothing rewrites a region between a bind and its draw. `rfc-batch-cache.md`
   restores per-owner buffers as `Batch`, with the consumer holding the lifetime, and deletes
   the arena.
+
+  **Done — Part 1 landed 2026-07-28.** Per-owner buffers are back as `Batch` (one buffer
+  per batch, not per draw — the geometry pool plus concatenation keeps the 40x), the arena
+  is deleted, and this entry's original claim stands re-proven: wgpu ref-counts what a pass
+  binds, so a transient batch drops immediately after recording.
 - **Glyphs must carry the *global* font id, not the chain position.** Otherwise two chains
   sharing a face key into two glyph-cache entries and the dedup buys nothing. `ShapedGlyph`
   carries `font_id`; the chain is a borrow of `(id, &Font)` pairs out of the pool.

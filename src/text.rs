@@ -593,7 +593,8 @@ pub struct Segment {
 }
 
 /// Blocks the consumer chose to group, concatenated into one GPU buffer **the
-/// consumer holds** — the unit of vertex ownership (`rfc-batch-cache.md`).
+/// consumer holds** — the unit of vertex ownership (see the "`Batch` owns its
+/// vertices" lock in `decisions.md`).
 ///
 /// Nothing here is shared, so nothing can be clobbered: the buffer lives
 /// exactly as long as the `Batch`, and dropping it immediately after recording

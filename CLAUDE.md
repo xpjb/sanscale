@@ -13,9 +13,8 @@ The doc set, and what each one has to stay true to:
 |---|---|---|
 | `README.md` | the public surface as a consumer meets it | a type is renamed or a module added/removed — Quick start, the pipeline diagram *and* the module table each name real identifiers |
 | `src/lib.rs` | the crate-level model + the one doctest | the surface moves, or a dependency's major version bumps (`Compatibility`) |
-| `decisions.md` | what the design is and why; its *API sketch* tracks `src/text.rs` | a signature, handle width or pool changes; or a decision is overtaken by what got built |
+| `decisions.md` | the **record**: what the design is and why, appends over rewrites. The current surface lives in rustdoc, not here | a decision is overtaken by what got built — append what changed and why, never edit history to look right |
 | `backlog.md` | what's owed, and why it's parked | an item is picked up, or its stated reason stops holding |
-| `rfc-batch-cache.md` | who owns vertex buffers: the settled `Batch` design, in three parts | a part gets built — fold it into `decisions.md` and drop it from here; the file goes when all three are done or dropped |
 
 Specifics worth knowing before editing:
 
