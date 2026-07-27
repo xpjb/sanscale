@@ -681,8 +681,20 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
-                    gfx.dragging = true;
-                    gfx.place_at_cursor(gfx.mods.shift_key());
+                    let now = Instant::now();
+                    let double = gfx.last_click.is_some_and(|(t, p)| {
+                        now.duration_since(t).as_millis() < 400
+                            && (gfx.cursor.x - p.x).abs() + (gfx.cursor.y - p.y).abs() < 6.0
+                    });
+                    if double {
+                        gfx.dragging = false;
+                        gfx.last_click = None;
+                        gfx.select_word_at_cursor();
+                    } else {
+                        gfx.dragging = true;
+                        gfx.last_click = Some((now, gfx.cursor));
+                        gfx.place_at_cursor(gfx.mods.shift_key());
+                    }
                 }
                 ElementState::Released => gfx.dragging = false,
             },
@@ -717,6 +729,8 @@ struct Gfx {
     /// you type and blinks only at rest.
     last_input: Instant,
     blink_phase: u64,
+    /// Previous left-press, for double-click detection (winit doesn't count).
+    last_click: Option<(Instant, Vec2)>,
 }
 
 /// Half a blink cycle: visible for one period, hidden for the next.
@@ -805,6 +819,7 @@ impl Gfx {
             dragging: false,
             last_input: Instant::now(),
             blink_phase: 0,
+            last_click: None,
         };
         gfx.update_title();
         gfx.window.request_redraw();
@@ -838,23 +853,42 @@ impl Gfx {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Mouse → byte, through the same layout the last frame drew. `hit_test`
-    /// answers with both the byte *and* the visual line, which is the affinity
-    /// hint — a click near a soft break lands on the line you clicked.
-    fn place_at_cursor(&mut self, select: bool) {
-        let Some(handle) = self.last_handle else { return };
+    /// Mouse → placed caret, through the same layout the last frame drew.
+    /// `hit_test` answers with both the byte *and* the visual line, which is
+    /// the affinity — a click near a soft break lands on the line you clicked.
+    fn hit_at_cursor(&self) -> Option<Caret> {
+        let handle = self.last_handle?;
         let layout = self.text.measure(handle);
         let em = Vec2::new(
             (self.cursor.x - MARGIN) / self.editor.font_px,
             (self.cursor.y - MARGIN + self.editor.scroll_y) / self.editor.font_px,
         );
-        if let Some(hit) = layout.hit_test(em) {
+        layout.hit_test(em)
+    }
+
+    fn place_at_cursor(&mut self, select: bool) {
+        if let Some(hit) = self.hit_at_cursor() {
             self.last_input = Instant::now();
             self.blink_phase = 0;
             self.editor.place(hit, select);
             self.editor.goal = None;
             self.window.request_redraw();
         }
+    }
+
+    /// Double-click word selection: the library composes the same `Boundaries`
+    /// the word motions use ([`Layout::select_word_at`]).
+    fn select_word_at_cursor(&mut self) {
+        let Some(hit) = self.hit_at_cursor() else { return };
+        let Some(handle) = self.last_handle else { return };
+        let layout = self.text.measure(handle);
+        let range = layout.select_word_at(hit.byte_index, &self.editor.doc);
+        self.last_input = Instant::now();
+        self.blink_phase = 0;
+        self.editor.anchor = Some(range.start);
+        self.editor.caret = layout.caret_at(range.end);
+        self.editor.goal = None;
+        self.window.request_redraw();
     }
 
     fn on_key(&mut self, event: winit::event::KeyEvent) {

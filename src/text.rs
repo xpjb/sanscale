@@ -679,6 +679,20 @@ impl Layout {
         }
     }
 
+    /// The word around `byte_index` — the double-click selection. Classified
+    /// by the caller's [`Boundaries`] (words are semantics, not shaping); a
+    /// declining classifier degrades to the cluster around the byte.
+    pub fn select_word_at(&self, byte_index: usize, text: &impl Boundaries) -> Range<usize> {
+        let byte_index = byte_index.min(self.len_bytes());
+        let start = text.prev_word(byte_index).unwrap_or_else(|| {
+            self.prev_caret_stop(byte_index).unwrap_or(byte_index)
+        });
+        let end = text.next_word(byte_index).unwrap_or_else(|| {
+            self.next_caret_stop(byte_index).unwrap_or(byte_index)
+        });
+        start.min(byte_index)..end.max(byte_index)
+    }
+
     pub fn selection(&self, range: Range<usize>) -> Vec<SelectionSpan> {
         if range.is_empty() {
             return Vec::new();
@@ -828,7 +842,9 @@ struct Geometry {
 }
 
 /// One block to draw, for [`TextService::draw_batch`].
-#[derive(Clone, Copy, Debug)]
+// `PartialEq` so a consumer retaining a `Batch` can compare this frame's draw
+// list against the one it prepared from, instead of hand-rolling the compare.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Draw {
     pub block: ShapedHandle,
     /// Top-left of the block box, in the transform's source space.
@@ -2112,6 +2128,25 @@ mod tests {
         let mut goal = None;
         let caret = layout.caret_move(layout.caret_at(2), Motion::WordRight, &mut goal, &());
         assert_eq!(caret.byte_index, 3);
+    }
+
+    /// `select_word_at` composes the caller's boundaries; `()` degrades to the
+    /// cluster around the byte.
+    #[test]
+    fn select_word_composes_boundaries_and_degrades_to_clusters() {
+        struct Stub;
+        impl Boundaries for Stub {
+            fn prev_word(&self, _: usize) -> Option<usize> {
+                Some(0)
+            }
+            fn next_word(&self, _: usize) -> Option<usize> {
+                Some(4)
+            }
+        }
+        let layout = wrapped_layout();
+        assert_eq!(layout.select_word_at(2, &Stub), 0..4);
+        // `()` declines: the selection is the cluster around the byte.
+        assert_eq!(layout.select_word_at(2, &()), 1..3);
     }
 
     /// `caret_after_edit` is end-affine at a soft break and natural elsewhere.
