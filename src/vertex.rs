@@ -1,8 +1,11 @@
 //! Vertex format and quad generation for text rendering.
 //!
-//! `pos` is in window pixels (`0..width`, `0..height`). `loc_em` stays in glyph-local
-//! em coordinates for the Slug fragment shader (curve atlas is em-space). Y matches the
-//! old `scale(_, -font_size, _)` convention via `pen_y - ey * size`.
+//! `pos` is in the **transform's source space** — window pixels under `pixel_ortho`, world
+//! units under an MVP — because `place` bakes the caller's `at`/`size` into it. (It said
+//! "window pixels" while only one consumer existed; that is a property of what compendium
+//! passed, not of this format.) `loc_em` stays in glyph-local em coordinates for the Slug
+//! fragment shader (curve atlas is em-space). Y matches the old `scale(_, -font_size, _)`
+//! convention via `pen_y - ey * size`.
 
 use bytemuck::{Pod, Zeroable};
 

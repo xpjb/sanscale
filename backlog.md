@@ -57,17 +57,20 @@ correctness bug is fixed — but the shape is unresolved.
 
 ---
 
-## Geometry storage and batch grain → see `rfc-batch-cache.md`
+## Vertex ownership and batch grain → see `rfc-batch-cache.md`
 
-Moved out. The short version: each block owns two independently heap-allocated
+Moved out, and no longer parked: the RFC is **settled** and Parts 0–1 are work to
+do, not a question to answer.
+
+It started here as locality — each block owns two independently heap-allocated
 `Vec`s, so `draw_batch` chases a pointer per block and re-concatenates 41k of them
-every frame — 2.04 ms of a 4.2 ms frame at `unicode_zoom`'s density, and roughly
-nothing for a consumer drawing hundreds of items.
-
-It turned into a design question rather than a backlog item once it became clear
-the regression is *who chooses the grain*, and that a batch unit is pinned by
-sharing a scissor and a z-slot. The RFC carries the prior art, the constraint, why
-compendium can't batch today, and the proposed order of work.
+every frame (2.04 ms of a 4.2 ms frame at `unicode_zoom`'s density, roughly nothing
+at compendium's hundreds). It stopped being a backlog item when the same area
+turned out to hold a correctness defect: the vertex arena rewinds mid-frame and
+clobbers draws already recorded into an open pass, because nothing owns the
+vertices. The RFC carries that diagnosis, the `Batch` design that removes it, and
+the deferred shader-clip work with its trigger. The ~2x locality gap is explicitly
+*not* what motivates the change.
 
 ---
 

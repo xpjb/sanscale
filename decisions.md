@@ -44,10 +44,13 @@ first; everything below assumes it.
    shaping are different arrows in the pipeline.
 8. **Geometry** — one block's quads at a given set of draw parameters, cached
    host-side. Position- and scale-independent, so a camera move re-runs none of it.
-9. **Batch** — *(proposed, see `rfc-batch-cache.md`)* the unit of **pass state**:
-   blocks sharing a scissor and a contiguous z-slot, concatenated into one draw
-   call. The only noun here that belongs to **rendering** rather than to text, which
-   is why it is a slice of `Draw` and not a key.
+9. **Batch** — *(settled, not yet built; see `rfc-batch-cache.md`)* the unit of
+   **vertex ownership**, and with it of pass state: blocks the consumer chose to
+   group, concatenated into one buffer **it holds**, drawn as one range per scissor.
+   The only noun here that belongs to **rendering** rather than to text. Originally
+   scoped as pass state alone — "one scissor, one z-slot, one draw call" — which is
+   still what bounds a *draw*, but the reason the noun exists is that a vertex
+   buffer needs an owner and the service is the wrong one.
 
 Three of these are the load-bearing consumer-facing axes, and each has a different
 owner — confusing them is how the design goes wrong:
@@ -311,6 +314,18 @@ Things we're certain about, and why.
   What was really load-bearing here was never "one allocation" — it was "never recreate
   *between* a bind and its draw", which is a statement about call order, not about capacity.
 
+  **The arena half of this rule was never built, and that is a live defect.**
+  `VertexArena::push` does the opposite of "never reuse a region within a frame": when it
+  runs out it sets `offset = 0` and writes over regions that draws already recorded into the
+  open pass have bound but not yet executed. It survives in the examples because both push
+  once per frame; it fails for any consumer issuing one `draw` per item, which is the only
+  option for items with differing clips. Compounding it, capacity grows off the largest
+  *single* push rather than per-frame traffic, so a frame of many small labels never grows
+  past the 64 KB floor — 16 draws of a 12-glyph label exhaust it. Found as visible corruption
+  in compendium's document catalog: sliced glyphs, garbage triangles, and a different victim
+  every frame from identical content, because `offset` persists across frames. The fix is not
+  to give the arena a frame boundary but to delete it; see `rfc-batch-cache.md`.
+
 - **The service is a glyph-quad source, not a compositor — it never owns the render pass.**
   The consumer builds the pass (target, clear/load, z-sorted interleave with its own
   rects/strokes/tiles, per-pane scissor) and passes it in; the service records glyph-quad
@@ -464,7 +479,9 @@ Things we were pretty confident on, phrased as if we'd do them — but might nee
   **not** in it, which is what makes the cache survive a camera move rather than invalidating
   on every pan. That last point took a measurement to see and is the whole subject of
   `rfc-batch-cache.md`; the entry as written would have shipped a cache that missed every
-  frame the camera moved.
+  frame the camera moved. (That RFC has since been retitled and resettled around ownership
+  rather than caching — the host-side half recorded here stands unchanged; what it lacked
+  was an owner for the *GPU* half.)
 
 - **`ShapedHandle` as a distinct `Copy` token vs just `draw(BlockKey, …)`.** *We'd keep it* to
   skip re-hashing the key on measure/draw. *But maybe* collapse to draw-by-`BlockKey` (one extra
@@ -526,6 +543,11 @@ Genuinely open.
   memory locality: 41k separate small vertex vecs instead of a few row-sized contiguous
   ones. Closing it would mean caching geometry at a coarser grain than the block, which no
   realistic consumer needs.
+
+  **"No realistic consumer needs it" was answered for the wrong reason.** A coarser grain
+  is coming, but not to buy back locality — it is where a vertex buffer's *owner* lives.
+  See `rfc-batch-cache.md`; the locality gap remains an acceptable ~2x and is not what
+  motivates the change.
 
 - **Text (band/curve) atlas eviction.** Still observe-only from the emoji work — unbounded,
   warns at the device limit, no eviction. Whether it graduates to real eviction (harder: the
@@ -682,6 +704,15 @@ Learned while building it:
   &mut RenderPass<'a>, …, &'a Buffer)` signature was over-constrained — a holdover from
   when wgpu borrowed its resources. The geometry pool remains the optimization that
   removes the per-draw allocation, exactly as designed.
+
+  **Then a shared bump arena superseded this, and reintroduced the exact hazard the entry
+  says it removes.** Trading a buffer per draw for one ring gave back the "shared-region
+  clobber" this lock had eliminated by construction — and bought it in the one place the
+  reasoning didn't hold, *within* a pass rather than across frames. The lesson is the one
+  already written above about the atlas: what is load-bearing is never the allocation count,
+  it is that nothing rewrites a region between a bind and its draw. `rfc-batch-cache.md`
+  restores per-owner buffers as `Batch`, with the consumer holding the lifetime, and deletes
+  the arena.
 - **Glyphs must carry the *global* font id, not the chain position.** Otherwise two chains
   sharing a face key into two glyph-cache entries and the dedup buys nothing. `ShapedGlyph`
   carries `font_id`; the chain is a borrow of `(id, &Font)` pairs out of the pool.

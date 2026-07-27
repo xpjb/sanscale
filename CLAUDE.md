@@ -15,7 +15,7 @@ The doc set, and what each one has to stay true to:
 | `src/lib.rs` | the crate-level model + the one doctest | the surface moves, or a dependency's major version bumps (`Compatibility`) |
 | `decisions.md` | what the design is and why; its *API sketch* tracks `src/text.rs` | a signature, handle width or pool changes; or a decision is overtaken by what got built |
 | `backlog.md` | what's owed, and why it's parked | an item is picked up, or its stated reason stops holding |
-| `rfc-batch-cache.md` | the batch/geometry grain question | any of it gets built |
+| `rfc-batch-cache.md` | who owns vertex buffers: the settled `Batch` design, in three parts | a part gets built — fold it into `decisions.md` and drop it from here; the file goes when all three are done or dropped |
 
 Specifics worth knowing before editing:
 
