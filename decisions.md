@@ -290,6 +290,18 @@ Things we're certain about, and why.
   clip in the fragment shader, which collapses a batch's segments into one draw call — is
   parked in `backlog.md` with its trigger.
 
+  **The probe was too narrow, and the first consumer proved it the hard way.** "The
+  consumer knows when content changed" — the premise behind stamping only the emoji
+  epoch — is false for exactly the hottest case: an *edit*. A reshape happens in place
+  (same key, same slot, same handle), so a retained draw list compares identical while
+  the batch holds the old text's vertices; compendium shipped it as typed-text-not-
+  rendering-until-something-else-perturbed-the-cache. The service did the reshape, so
+  the service answers for it: each `BlockSlot` carries a revision bumped on assembly,
+  `prepare` stamps `(slot, generation, revision)` per baked block, and `batch_live`
+  checks them — so "text-only batches are immortal" is now "immortal until reshaped or
+  evicted". Still integer compares, still no machinery, and the consumer contract is
+  unchanged: check per frame, re-`prepare` on `false`.
+
 - **Caret motions live on `Layout`; the caret is typed.** *(2026-07-28, resolving the
   backlog's "should caret placement be typed?" — yes, and motions with it.)*
   `Caret { byte_index, line_index }` carries the wrap affinity a byte alone cannot

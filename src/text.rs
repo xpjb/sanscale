@@ -819,6 +819,10 @@ struct ParaLayout {
 
 struct BlockSlot {
     block: Option<Block>,
+    /// Bumped on every (re)assembly. An edit reshapes a block **in place** —
+    /// same key, same slot, same handle — so a retained [`Batch`] cannot see
+    /// it in anything it holds; this is what `batch_live` checks instead.
+    revision: u64,
 }
 
 struct Block {
@@ -921,9 +925,13 @@ pub struct Batch {
     buffer: wgpu::Buffer,
     segments: Vec<Segment>,
     /// Emoji-atlas eviction epoch the UVs were baked against; `None` for a
-    /// batch with no emoji, which can never go stale (the text atlas grows but
-    /// never evicts or moves slots).
+    /// batch with no emoji.
     emoji_epoch: Option<u64>,
+    /// The blocks these vertices were baked from, as `(slot, generation,
+    /// revision)`. An edit reshapes a block in place — same key, slot and
+    /// handle — so nothing in the consumer's draw list changes; the revision
+    /// is how `batch_live` sees it. Adjacent duplicates are collapsed.
+    blocks: Vec<(u32, u32, u64)>,
 }
 
 impl Batch {
@@ -1132,7 +1140,7 @@ impl TextService {
             _ => match self.free_blocks.pop() {
                 Some(slot) => slot as usize,
                 None => {
-                    self.blocks.push(BlockSlot { block: None });
+                    self.blocks.push(BlockSlot { block: None, revision: 0 });
                     self.generations.push(0);
                     self.geometry.push(None);
                     self.blocks.len() - 1
@@ -1149,6 +1157,7 @@ impl TextService {
             layout,
             last_used: self.clock,
         });
+        self.blocks[index].revision = self.blocks[index].revision.wrapping_add(1);
         self.geometry[index] = None;
         let handle = ShapedHandle {
             slot: index as u32,
@@ -1327,6 +1336,7 @@ impl TextService {
                 buffer: batch_buffer(device, 0),
                 segments: Vec::new(),
                 emoji_epoch: None,
+                blocks: Vec::new(),
             };
         }
 
@@ -1346,6 +1356,7 @@ impl TextService {
         text_verts.reserve(items.len() * 6);
 
         let mut segments: Vec<Segment> = Vec::new();
+        let mut blocks: Vec<(u32, u32, u64)> = Vec::new();
         for run in clip_runs(items) {
             let text_start = text_verts.len() as u32;
             let emoji_start = emoji_verts.len() as u32;
@@ -1353,6 +1364,10 @@ impl TextService {
                 let Some(index) = self.block_index(item.block) else {
                     continue;
                 };
+                let baked = (item.block.slot, item.block.generation, self.blocks[index].revision);
+                if blocks.last() != Some(&baked) {
+                    blocks.push(baked);
+                }
                 // The bucket wants an *on-screen* size: under an MVP `size` is
                 // world units, and the consumer-stated scale bridges the gap.
                 let bucket = bucket_for(item.size * pixel_scale);
@@ -1426,6 +1441,7 @@ impl TextService {
             buffer,
             segments,
             emoji_epoch,
+            blocks,
         }
     }
 
@@ -1467,13 +1483,25 @@ impl TextService {
         }
     }
 
-    /// Whether a retained batch's emoji UVs still point at the glyphs they were
-    /// baked from. Two integer compares — check per frame, re-`prepare` on
-    /// `false`. Drawing a stale batch is defined: it draws the old texels,
-    /// which may by then be a recycled emoji cell — wrong pixels, never UB.
-    /// Batches with no emoji never go stale.
+    /// Whether a retained batch still draws what it was baked from. Integer
+    /// compares only — check per frame, re-`prepare` on `false`. Goes stale
+    /// when the emoji atlas evicted under its UVs, **or when any block it
+    /// baked has since reshaped or been evicted**. The second clause is the
+    /// one a consumer cannot answer for itself: an edit reshapes a block *in
+    /// place* — same key, same slot, same handle — so the consumer's draw
+    /// list compares identical while the vertices it retained are of the old
+    /// text. The service did the reshape; the service answers for it.
+    /// Drawing a stale batch is defined: old vertices and texels — stale
+    /// pixels, never UB.
     pub fn batch_live(&self, batch: &Batch) -> bool {
         epoch_live(batch.emoji_epoch, self.emoji.epoch())
+            && batch.blocks.iter().all(|&(slot, generation, revision)| {
+                self.generations.get(slot as usize) == Some(&generation)
+                    && self
+                        .blocks
+                        .get(slot as usize)
+                        .is_some_and(|b| b.revision == revision)
+            })
     }
 
     /// Record many blocks in **one** pair of draw calls: `prepare` +
@@ -2189,6 +2217,37 @@ mod tests {
         assert_eq!(hard.select_paragraph_at(1), 0..2);
         assert_eq!(hard.select_paragraph_at(3), 3..3);
         assert_eq!(hard.select_paragraph_at(5), 4..6);
+    }
+
+    /// An edit reshapes a block **in place** — same key, same slot, same
+    /// handle — so nothing in a consumer's retained draw list changes; the
+    /// slot revision is the only witness, and `batch_live` reads it. Found
+    /// live in compendium: typed text didn't render until something else
+    /// perturbed the retention cache.
+    #[test]
+    fn reshape_in_place_bumps_the_revision_a_batch_checks() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let style = Style { chain, wrap_em: None, align: Align::Left, line_spacing: 1.0 };
+        let key = |generation| ParagraphKey { namespace: 9, slot: 1, generation };
+        let h1 = text
+            .shape(BlockKey(77), &style, &[key(0)], &Paragraphs(&["one"]))
+            .expect("shaped");
+        let baked = text.blocks[h1.slot as usize].revision;
+
+        // Unchanged parts: a comparison, not a reshape — revision holds.
+        text.shape(BlockKey(77), &style, &[key(0)], &Paragraphs(&["one"]));
+        assert_eq!(text.blocks[h1.slot as usize].revision, baked);
+
+        // Edited paragraph: same block key resolves to the same slot and
+        // generation (the handle a consumer retained stays valid) but the
+        // revision moves — which is what flips `batch_live`.
+        let h2 = text
+            .shape(BlockKey(77), &style, &[key(1)], &Paragraphs(&["two"]))
+            .expect("reshaped");
+        assert_eq!((h1.slot, h1.generation), (h2.slot, h2.generation));
+        assert_ne!(text.blocks[h2.slot as usize].revision, baked);
     }
 
     /// `caret_after_edit` is end-affine at a soft break and natural elsewhere.
