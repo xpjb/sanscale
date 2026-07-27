@@ -12,7 +12,8 @@
 //!   selection all read the same `Layout` the renderer draws from.
 //! - **Wrap affinity is a discipline.** Every caret placement decides its
 //!   visual line (`line_hint`); a byte at a soft break is ambiguous and the
-//!   hint is what keeps End/Up/Down honest. See `hint_for`.
+//!   caret is typed (`Caret { byte, line }`) and every motion goes through
+//!   `Layout::caret_move`, so the ambiguity cannot be dropped on the floor.
 //! - **Left/Right step by caret stops** (`Layout::{next,prev}_caret_stop`), so
 //!   the caret can't land inside a ligature or a ZWJ emoji sequence.
 //! - **Overlay geometry is the consumer's.** Selection and caret are rects in
@@ -34,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use ropey::Rope;
 use sanscale::{
-    Align, BlockKey, Color, Layout, ParagraphKey, ParagraphSource, Rect, ShapedHandle, Style,
-    TextService, Vec2,
+    Align, BlockKey, Boundaries, Caret, Color, Layout, Motion, ParagraphKey, ParagraphSource,
+    Rect, ShapedHandle, Style, TextService, Vec2,
 };
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -57,7 +58,7 @@ const CARET: [f32; 4] = [0.95, 0.96, 1.0, 1.0];
 
 const MARGIN: f32 = 14.0;
 const STATUS_H: f32 = 26.0;
-const PAGE_LINES: isize = 20;
+const PAGE_LINES: usize = 20;
 
 /// Mono first (the notepad default), then emoji + broad fallback so pasted
 /// CJK or emoji render instead of boxing. `--font` prepends a family.
@@ -203,42 +204,29 @@ impl ParagraphSource for Doc {
 
 struct Editor {
     doc: Doc,
-    cursor: usize,
+    /// The placed caret: byte **and** visual line, as one value. The library's
+    /// `caret_move` keeps the pair honest; `clamp_caret` re-anchors it after a
+    /// reshape. The hand-rolled hint bookkeeping this replaces was the part
+    /// that kept going wrong.
+    caret: Caret,
     anchor: Option<usize>,
-    /// Wrap affinity: which visual line the caret is *shown* on when its byte
-    /// sits exactly on a line boundary. Every placement decides it.
-    line_hint: Option<usize>,
-    desired_x: Option<f32>, // goal column for vertical motion, em
-    scroll_y: f32,          // px
+    /// Vertical-motion goal column (em) — owned here because the service is
+    /// stateless; `caret_move` seeds, preserves and clears it.
+    goal: Option<f32>,
+    scroll_y: f32, // px
     font_px: f32,
     /// Insert toggles between the bar caret and a block (overtype-style) caret
     /// covering the next cluster.
     caret_block: bool,
 }
 
-enum Motion {
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-    DocStart,
-    DocEnd,
-    WordLeft,
-    WordRight,
-}
-
 impl Editor {
     fn new(doc: Doc) -> Self {
         Self {
             doc,
-            cursor: 0,
+            caret: Caret { byte_index: 0, line_index: 0 },
             anchor: None,
-            line_hint: None,
-            desired_x: None,
+            goal: None,
             scroll_y: 0.0,
             font_px: 17.0,
             caret_block: false,
@@ -247,154 +235,112 @@ impl Editor {
 
     fn selection(&self) -> Option<std::ops::Range<usize>> {
         let anchor = self.anchor?;
-        let (a, b) = (anchor.min(self.cursor), anchor.max(self.cursor));
+        let byte = self.caret.byte_index;
+        let (a, b) = (anchor.min(byte), anchor.max(byte));
         (a != b).then_some(a..b)
     }
 
-    /// The caret's visual line: the validated hint, else the line that starts
-    /// with the byte (the layout's deterministic default).
-    fn caret_line(&self, layout: &Layout) -> Option<usize> {
-        if let Some(index) = self.line_hint {
-            if let Some(range) = layout.line_range(index) {
-                if self.cursor >= range.start && self.cursor <= range.end {
-                    return Some(index);
-                }
-            }
-        }
-        layout.line_for_byte(self.cursor)
-    }
-
-    fn place(&mut self, byte: usize, hint: Option<usize>, select: bool) {
+    /// Move the caret, extending or collapsing the selection. Does not touch
+    /// `goal` — `caret_move` owns its lifecycle; other placement paths (mouse,
+    /// edits) clear it themselves.
+    fn place(&mut self, caret: Caret, select: bool) {
         if select {
             if self.anchor.is_none() {
-                self.anchor = Some(self.cursor);
+                self.anchor = Some(self.caret.byte_index);
             }
         } else {
             self.anchor = None;
         }
-        self.cursor = byte.min(self.doc.rope.len_bytes());
-        self.line_hint = hint;
-        self.desired_x = None;
+        self.caret = caret;
     }
 
-    /// A boundary byte belongs to two visual lines; when a horizontal step
-    /// lands on one, stay on the line the caret came from. A hard `\n` end
-    /// additionally never matches `line_for_byte` (the byte after it starts
-    /// the next line), so pin it to the line whose end it is.
-    fn hint_for(&self, layout: &Layout, byte: usize) -> Option<usize> {
-        let current = self.caret_line(layout)?;
-        let range = layout.line_range(current)?;
-        if byte == range.start || byte == range.end {
-            return Some(current);
-        }
-        let natural = layout.line_for_byte(byte)?;
-        if layout.line_range(natural)?.start > byte {
-            return Some(natural.saturating_sub(1)); // end stop of the line above
-        }
-        Some(natural)
-    }
-
-    /// After an edit the caret byte may sit exactly on a soft break; keep it
-    /// shown at the *end* of the line the text was typed on, not the start of
-    /// the next — the same affinity rule as every other placement.
-    fn settle_hint(&mut self, layout: &Layout) {
-        let Some(natural) = layout.line_for_byte(self.cursor) else {
-            return;
-        };
-        if natural > 0
-            && layout.line_range(natural).is_some_and(|r| r.start == self.cursor)
-            && layout.line_range(natural - 1).is_some_and(|r| r.end == self.cursor)
-        {
-            self.line_hint = Some(natural - 1);
-        }
-    }
-
+    /// One library call per keypress. The affinity rules, boundary snaps and
+    /// goal-column lifecycle all live in [`Layout::caret_move`] now — this
+    /// method replaced ~80 lines of the bookkeeping that kept going wrong.
     fn motion(&mut self, layout: &Layout, motion: Motion, select: bool) {
-        let desired_x = match motion {
-            Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown => {
-                Some(self.desired_x.unwrap_or_else(|| {
-                    layout.caret_rect_on_line(self.caret_line(layout), self.cursor).x_em
-                }))
-            }
-            _ => None,
-        };
-        let vertical = |editor: &Editor, delta: isize| -> (usize, Option<usize>) {
-            let Some(current) = editor.caret_line(layout) else {
-                return (editor.cursor, editor.line_hint);
-            };
-            let target = (current as isize + delta)
-                .clamp(0, layout.line_count().saturating_sub(1) as isize)
-                as usize;
-            if target == current {
-                // Already on the boundary line: Up snaps to its start, Down to
-                // its end — the notepad convention.
-                let range = layout.line_range(current);
-                let byte = if delta < 0 {
-                    range.map(|r| r.start).unwrap_or(0)
-                } else {
-                    range
-                        .map(|r| r.end)
-                        .unwrap_or_else(|| editor.doc.rope.len_bytes())
-                };
-                return (byte, Some(current));
-            }
-            let byte = layout
-                .caret_on_line(target, desired_x.unwrap_or(0.0))
-                .unwrap_or(editor.cursor);
-            (byte, Some(target))
-        };
-        let (next, hint) = match motion {
-            Motion::Left => {
-                let byte = layout.prev_caret_stop(self.cursor).unwrap_or(self.cursor);
-                (byte, self.hint_for(layout, byte))
-            }
-            Motion::Right => {
-                let byte = layout.next_caret_stop(self.cursor).unwrap_or(self.cursor);
-                (byte, self.hint_for(layout, byte))
-            }
-            Motion::WordLeft => {
-                let byte = self.prev_word(self.cursor);
-                (byte, self.hint_for(layout, byte))
-            }
-            Motion::WordRight => {
-                let byte = self.next_word(self.cursor);
-                (byte, self.hint_for(layout, byte))
-            }
-            Motion::Home => {
-                let line = self.caret_line(layout);
-                let byte = line
-                    .and_then(|l| layout.line_range(l))
-                    .map(|r| r.start)
-                    .unwrap_or(0);
-                (byte, line)
-            }
-            Motion::End => {
-                let line = self.caret_line(layout);
-                let byte = line
-                    .and_then(|l| layout.line_range(l))
-                    .map(|r| r.end)
-                    .unwrap_or_else(|| self.doc.rope.len_bytes());
-                (byte, line)
-            }
-            Motion::Up => vertical(self, -1),
-            Motion::Down => vertical(self, 1),
-            Motion::PageUp => vertical(self, -PAGE_LINES),
-            Motion::PageDown => vertical(self, PAGE_LINES),
-            Motion::DocStart => (0, Some(0)),
-            Motion::DocEnd => (
-                self.doc.rope.len_bytes(),
-                layout.line_count().checked_sub(1),
-            ),
-        };
-        self.place(next, hint, select);
-        if desired_x.is_some() {
-            self.desired_x = desired_x;
-        }
+        let next = layout.caret_move(self.caret, motion, &mut self.goal, &self.doc);
+        self.place(next, select);
     }
 
-    /// Word boundaries are semantics, not shaping — they stay consumer-side.
-    fn prev_word(&self, byte: usize) -> usize {
-        let mut chars = self.doc.rope.chars_at(self.doc.rope.byte_to_char(byte));
+    /// After an edit, resolve the caret against the fresh layout — end-affine
+    /// at a soft break, so typing the character that wraps stays on its line.
+    fn settle(&mut self, layout: &Layout) {
+        self.caret = layout.caret_after_edit(self.caret.byte_index);
+    }
+
+    fn insert(&mut self, text: &str) {
+        let byte = self.caret.byte_index;
+        let range = self.selection().unwrap_or(byte..byte);
+        let at = range.start;
+        self.doc.replace(range, text);
+        self.edit_placed(at + text.len());
+    }
+
+    /// Backspace/Delete step by caret stops too — one keypress removes one
+    /// cluster, so a ZWJ emoji family goes as a unit instead of decomposing.
+    fn backspace(&mut self, layout: &Layout) {
+        let byte = self.caret.byte_index;
+        let range = match self.selection() {
+            Some(range) => range,
+            None => match layout.prev_caret_stop(byte) {
+                Some(prev) => prev..byte,
+                None => return,
+            },
+        };
+        let at = range.start;
+        self.doc.replace(range, "");
+        self.edit_placed(at);
+    }
+
+    fn delete(&mut self, layout: &Layout) {
+        let byte = self.caret.byte_index;
+        let range = match self.selection() {
+            Some(range) => range,
+            None => match layout.next_caret_stop(byte) {
+                Some(next) => byte..next,
+                None => return,
+            },
+        };
+        let at = range.start;
+        self.doc.replace(range, "");
+        self.edit_placed(at);
+    }
+
+    /// Post-edit caret: the line index is stale until the reshape (`settle`
+    /// runs then); byte is authoritative now.
+    fn edit_placed(&mut self, byte: usize) {
+        self.caret.byte_index = byte;
+        self.anchor = None;
+        self.goal = None;
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let range = self.selection()?;
+        let range = self.doc.rope.byte_to_char(range.start)..self.doc.rope.byte_to_char(range.end);
+        Some(self.doc.rope.slice(range).to_string())
+    }
+
+    /// Keep the caret inside the viewport after motion or edits.
+    fn scroll_caret_into_view(&mut self, layout: &Layout, view_h: f32) {
+        let caret = layout.clamp_caret(self.caret);
+        let rect = layout.caret_rect_on_line(Some(caret.line_index), caret.byte_index);
+        let top = MARGIN + rect.y_em * self.font_px - self.scroll_y;
+        let height = (rect.height_em.max(1.0)) * self.font_px;
+        if top < MARGIN {
+            self.scroll_y -= MARGIN - top;
+        } else if top + height > view_h - STATUS_H - MARGIN {
+            self.scroll_y += top + height - (view_h - STATUS_H - MARGIN);
+        }
+        self.scroll_y = self.scroll_y.max(0.0);
+    }
+}
+
+/// Word boundaries are semantics over the rope, not shaping — the library asks
+/// through this seam exactly the way it asks for text through
+/// `ParagraphSource`, and never holds the text.
+impl Boundaries for Doc {
+    fn prev_word(&self, byte: usize) -> Option<usize> {
+        let mut chars = self.rope.chars_at(self.rope.byte_to_char(byte));
         let mut offset = byte;
         let mut in_word = false;
         while let Some(ch) = chars.prev() {
@@ -409,13 +355,13 @@ impl Editor {
                 break;
             }
         }
-        offset
+        Some(offset)
     }
 
-    fn next_word(&self, byte: usize) -> usize {
+    fn next_word(&self, byte: usize) -> Option<usize> {
         let mut offset = byte;
         let mut in_word = false;
-        for ch in self.doc.rope.chars_at(self.doc.rope.byte_to_char(byte)) {
+        for ch in self.rope.chars_at(self.rope.byte_to_char(byte)) {
             if in_word && !(ch.is_alphanumeric() || ch == '_') {
                 break;
             }
@@ -424,61 +370,7 @@ impl Editor {
             }
             offset += ch.len_utf8();
         }
-        offset
-    }
-
-    fn insert(&mut self, text: &str) {
-        let range = self.selection().unwrap_or(self.cursor..self.cursor);
-        let at = range.start;
-        self.doc.replace(range, text);
-        self.place(at + text.len(), None, false);
-    }
-
-    /// Backspace/Delete step by caret stops too — one keypress removes one
-    /// cluster, so a ZWJ emoji family goes as a unit instead of decomposing.
-    fn backspace(&mut self, layout: &Layout) {
-        let range = match self.selection() {
-            Some(range) => range,
-            None => match layout.prev_caret_stop(self.cursor) {
-                Some(prev) => prev..self.cursor,
-                None => return,
-            },
-        };
-        let at = range.start;
-        self.doc.replace(range, "");
-        self.place(at, None, false);
-    }
-
-    fn delete(&mut self, layout: &Layout) {
-        let range = match self.selection() {
-            Some(range) => range,
-            None => match layout.next_caret_stop(self.cursor) {
-                Some(next) => self.cursor..next,
-                None => return,
-            },
-        };
-        let at = range.start;
-        self.doc.replace(range, "");
-        self.place(at, None, false);
-    }
-
-    fn selected_text(&self) -> Option<String> {
-        let range = self.selection()?;
-        let range = self.doc.rope.byte_to_char(range.start)..self.doc.rope.byte_to_char(range.end);
-        Some(self.doc.rope.slice(range).to_string())
-    }
-
-    /// Keep the caret inside the viewport after motion or edits.
-    fn scroll_caret_into_view(&mut self, layout: &Layout, view_h: f32) {
-        let caret = layout.caret_rect_on_line(self.caret_line(layout), self.cursor);
-        let top = MARGIN + caret.y_em * self.font_px - self.scroll_y;
-        let height = (caret.height_em.max(1.0)) * self.font_px;
-        if top < MARGIN {
-            self.scroll_y -= MARGIN - top;
-        } else if top + height > view_h - STATUS_H - MARGIN {
-            self.scroll_y += top + height - (view_h - STATUS_H - MARGIN);
-        }
-        self.scroll_y = self.scroll_y.max(0.0);
+        Some(offset)
     }
 }
 
@@ -648,10 +540,17 @@ fn render_frame(
     // shaping — no identity to invent for chrome text.
     let status = {
         let layout = text.measure(handle);
-        let line = editor.caret_line(layout).unwrap_or(0);
+        let caret = layout.clamp_caret(editor.caret);
+        let line = caret.line_index;
         let col = layout
             .line_range(line)
-            .map(|r| editor.doc.rope.byte_slice(r.start..editor.cursor.max(r.start).min(r.end)).len_chars())
+            .map(|r| {
+                editor
+                    .doc
+                    .rope
+                    .byte_slice(r.start..caret.byte_index.max(r.start).min(r.end))
+                    .len_chars()
+            })
             .unwrap_or(0);
         format!(
             "{}{}   ·   Ln {}, Col {}   ·   {:.0} px   ·   Ctrl+O open · Ctrl+S save",
@@ -679,13 +578,14 @@ fn render_frame(
     // width read from the caret stops), translucent so the glyph shows through.
     if caret_visible {
         let layout = text.measure(handle);
-        let line = editor.caret_line(layout);
-        let caret = layout.caret_rect_on_line(line, editor.cursor);
+        let placed = layout.clamp_caret(editor.caret);
+        let line = Some(placed.line_index);
+        let caret = layout.caret_rect_on_line(line, placed.byte_index);
         let height = if caret.height_em > 0.0 { caret.height_em } else { 1.2 };
         if editor.caret_block {
             let width_em = line
                 .and_then(|l| layout.line_range(l))
-                .zip(layout.next_caret_stop(editor.cursor))
+                .zip(layout.next_caret_stop(placed.byte_index))
                 .filter(|(range, next)| *next <= range.end)
                 .map(|(_, next)| {
                     (layout.caret_rect_on_line(line, next).x_em - caret.x_em).abs()
@@ -951,7 +851,8 @@ impl Gfx {
         if let Some(hit) = layout.hit_test(em) {
             self.last_input = Instant::now();
             self.blink_phase = 0;
-            self.editor.place(hit.byte_index, Some(hit.line_index), select);
+            self.editor.place(hit, select);
+            self.editor.goal = None;
             self.window.request_redraw();
         }
     }
@@ -980,8 +881,10 @@ impl Gfx {
             Key::Named(NamedKey::End) if ctrl => editor.motion(layout, Motion::DocEnd, shift),
             Key::Named(NamedKey::Home) => editor.motion(layout, Motion::Home, shift),
             Key::Named(NamedKey::End) => editor.motion(layout, Motion::End, shift),
-            Key::Named(NamedKey::PageUp) => editor.motion(layout, Motion::PageUp, shift),
-            Key::Named(NamedKey::PageDown) => editor.motion(layout, Motion::PageDown, shift),
+            Key::Named(NamedKey::PageUp) => editor.motion(layout, Motion::PageUp(PAGE_LINES), shift),
+            Key::Named(NamedKey::PageDown) => {
+                editor.motion(layout, Motion::PageDown(PAGE_LINES), shift)
+            }
             Key::Named(NamedKey::Backspace) => editor.backspace(layout),
             Key::Named(NamedKey::Delete) => editor.delete(layout),
             Key::Named(NamedKey::Enter) => editor.insert("\n"),
@@ -994,9 +897,11 @@ impl Gfx {
             Key::Character(ref c) if ctrl => match c.as_str() {
                 "a" | "A" => {
                     editor.anchor = Some(0);
-                    editor.cursor = editor.doc.rope.len_bytes();
-                    editor.line_hint = None;
-                    editor.desired_x = None;
+                    editor.caret = Caret {
+                        byte_index: editor.doc.rope.len_bytes(),
+                        line_index: usize::MAX, // clamped at next use
+                    };
+                    editor.goal = None;
                 }
                 "c" | "C" => {
                     if let Some(s) = editor.selected_text() {
@@ -1041,7 +946,7 @@ impl Gfx {
                 self.last_handle = Some(handle);
                 let view_h = self.config.height as f32;
                 let layout = self.text.measure(handle);
-                self.editor.settle_hint(layout);
+                self.editor.settle(layout);
                 self.editor.scroll_caret_into_view(layout, view_h);
             }
         }
@@ -1169,7 +1074,7 @@ fn dump_png(font: Option<&str>) {
     let start = DUMP_TEXT.find("a notepad").unwrap();
     let end = DUMP_TEXT.find("disagree").unwrap();
     editor.anchor = Some(start);
-    editor.cursor = end;
+    editor.caret = Caret { byte_index: end, line_index: usize::MAX }; // clamped at render
     let style = Style {
         chain,
         wrap_em: Some((900.0 - 2.0 * MARGIN) / editor.font_px),

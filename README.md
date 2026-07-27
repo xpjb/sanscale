@@ -30,8 +30,9 @@ sanscale = { git = "https://github.com/xpjb/sanscale" }
   itemization, and multi-font **fallback chains**.
 - **Color emoji** (COLR v0/v1) through a rasterized side atlas.
 - **Layout**: line wrapping, left/center/right alignment, multi-paragraph runs.
-- **Editor geometry**: measurement, caret positions, hit-testing, selection
-  rectangles, and pixel clip rectangles.
+- **Editor geometry**: measurement, hit-testing, selection rectangles, and a
+  typed caret with library-resolved motions (`caret_move`: cluster-true
+  steps, visual-line Home/End, goal-column verticals, wrap affinity handled).
 
 ## Quick start
 

@@ -214,10 +214,58 @@ impl Style {
 // layout — em space, read-only, borrowed transiently from `measure`
 // ---------------------------------------------------------------------------
 
+/// A placed caret: a byte offset **and** the visual line it is shown on.
+///
+/// The line is not derivable from the byte: at a soft break one byte belongs
+/// to two visual lines, and which one the caret renders on is the affinity the
+/// user's last action decided. Carrying both makes that decision impossible to
+/// drop — [`Layout::caret_move`] consumes and produces `Caret`s, so the
+/// ambiguity never leaks into consumer bookkeeping. After a reshape the line
+/// index may be stale; [`Layout::clamp_caret`] re-anchors it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CaretHit {
+pub struct Caret {
     pub byte_index: usize,
     pub line_index: usize,
+}
+
+/// One caret motion, resolved by [`Layout::caret_move`].
+///
+/// Everything here is pure layout geometry except `WordLeft`/`WordRight`,
+/// which classify *text* the service never holds — they consult the caller's
+/// [`Boundaries`]. `PageUp`/`PageDown` carry their stride in visual lines,
+/// because page size is viewport knowledge, which is also the caller's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion {
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp(usize),
+    PageDown(usize),
+    DocStart,
+    DocEnd,
+    WordLeft,
+    WordRight,
+}
+
+/// Word classification over the caller's text, for [`Motion::WordLeft`] /
+/// [`Motion::WordRight`]. Words are semantics, not shaping, so the crate asks
+/// rather than guesses — the same seam as [`ParagraphSource`]. Return `None`
+/// to decline; the motion degrades to a cluster step. `()` always declines.
+pub trait Boundaries {
+    fn prev_word(&self, byte_index: usize) -> Option<usize>;
+    fn next_word(&self, byte_index: usize) -> Option<usize>;
+}
+
+impl Boundaries for () {
+    fn prev_word(&self, _: usize) -> Option<usize> {
+        None
+    }
+    fn next_word(&self, _: usize) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -364,10 +412,10 @@ impl Layout {
     }
 
     /// Caret nearest a point, in em relative to the block's top-left.
-    pub fn hit_test(&self, at_em: Vec2) -> Option<CaretHit> {
+    pub fn hit_test(&self, at_em: Vec2) -> Option<Caret> {
         let line_index = self.line_index_for_y(at_em.y)?;
         let byte_index = self.caret_on_line(line_index, at_em.x)?;
-        Some(CaretHit {
+        Some(Caret {
             byte_index,
             line_index,
         })
@@ -453,6 +501,182 @@ impl Layout {
             .map(|caret| caret.byte_index)
             .filter(|&byte| byte < byte_index)
             .max()
+    }
+
+    /// Re-anchor a caret to this layout: byte clamped into range, line kept if
+    /// it still contains the byte (that *is* the affinity), else re-derived.
+    /// Call after a reshape invalidates line indices.
+    pub fn clamp_caret(&self, caret: Caret) -> Caret {
+        let byte_index = caret.byte_index.min(self.len_bytes());
+        let line_index = self
+            .line_range(caret.line_index)
+            .filter(|range| byte_index >= range.start && byte_index <= range.end)
+            .map(|_| caret.line_index)
+            .or_else(|| self.line_for_byte(byte_index))
+            .unwrap_or(0);
+        Caret { byte_index, line_index }
+    }
+
+    /// The caret for a byte, with the layout's default (start-affine) line.
+    ///
+    /// One correction over raw [`Layout::line_for_byte`]: a hard break's end
+    /// byte belongs to no line, and `line_for_byte` answers with the following
+    /// line — whose start is *past* the byte. That byte pins to the line whose
+    /// end it is, which is also what puts a blank line's caret on the blank
+    /// line rather than the one below it.
+    pub fn caret_at(&self, byte_index: usize) -> Caret {
+        let byte_index = byte_index.min(self.len_bytes());
+        let natural = self.line_for_byte(byte_index).unwrap_or(0);
+        let line_index = if self
+            .line_range(natural)
+            .is_some_and(|range| range.start > byte_index)
+        {
+            natural.saturating_sub(1)
+        } else {
+            natural
+        };
+        Caret { byte_index, line_index }
+    }
+
+    /// The caret for a byte placed by an **edit**: end-affine at a soft break,
+    /// so typing the character that wraps a line leaves the caret shown at the
+    /// end of the line it was typed on rather than the start of the next.
+    pub fn caret_after_edit(&self, byte_index: usize) -> Caret {
+        let caret = self.caret_at(byte_index);
+        if caret.line_index > 0
+            && self
+                .line_range(caret.line_index)
+                .is_some_and(|range| range.start == caret.byte_index)
+            && self
+                .line_range(caret.line_index - 1)
+                .is_some_and(|range| range.end == caret.byte_index)
+        {
+            return Caret {
+                line_index: caret.line_index - 1,
+                ..caret
+            };
+        }
+        caret
+    }
+
+    /// Resolve one caret [`Motion`]. Consumes a placed caret, returns the next
+    /// one with its affinity decided — the bookkeeping every editor needs and
+    /// keeps getting wrong, written once, next to the geometry it reads.
+    ///
+    /// `goal` is the vertical-motion goal column (em), owned by the caller so
+    /// the service stays stateless: vertical motions seed and preserve it,
+    /// every other motion clears it. Pass the same `&mut Option<f32>` you keep
+    /// beside the caret. `text` supplies word boundaries ([`Boundaries`]); pass
+    /// `&()` to degrade word motions to cluster steps.
+    ///
+    /// The affinity rules, in one place: a horizontal step landing on the
+    /// current line's start or end stays on the current line; a byte that is a
+    /// hard break's end (which `line_for_byte` gives to the following line)
+    /// pins to the line whose end it is; Up on the top line snaps to its
+    /// start, Down on the bottom line to its end.
+    pub fn caret_move(
+        &self,
+        caret: Caret,
+        motion: Motion,
+        goal: &mut Option<f32>,
+        text: &impl Boundaries,
+    ) -> Caret {
+        if self.lines.is_empty() {
+            *goal = None;
+            return Caret { byte_index: 0, line_index: 0 };
+        }
+        let caret = self.clamp_caret(caret);
+
+        // Horizontal placement: boundary bytes keep the line the caret came
+        // from; elsewhere `caret_at`'s default resolution.
+        let place = |byte_index: usize| -> Caret {
+            let byte_index = byte_index.min(self.len_bytes());
+            if let Some(range) = self.line_range(caret.line_index) {
+                if byte_index == range.start || byte_index == range.end {
+                    return Caret { byte_index, line_index: caret.line_index };
+                }
+            }
+            self.caret_at(byte_index)
+        };
+
+        let vertical = |goal: &mut Option<f32>, delta: isize| -> Caret {
+            let current = caret.line_index;
+            let target = (current as isize + delta)
+                .clamp(0, self.lines.len() as isize - 1) as usize;
+            if target == current {
+                // Boundary line: Up snaps to its start, Down to its end.
+                let range = self.line_range(current);
+                let byte_index = if delta < 0 {
+                    range.map(|r| r.start).unwrap_or(0)
+                } else {
+                    range.map(|r| r.end).unwrap_or_else(|| self.len_bytes())
+                };
+                return Caret { byte_index, line_index: current };
+            }
+            let x = *goal.get_or_insert_with(|| {
+                self.caret_rect_on_line(Some(current), caret.byte_index).x_em
+            });
+            let byte_index = self.caret_on_line(target, x).unwrap_or(caret.byte_index);
+            Caret { byte_index, line_index: target }
+        };
+
+        match motion {
+            Motion::Left => {
+                *goal = None;
+                place(self.prev_caret_stop(caret.byte_index).unwrap_or(caret.byte_index))
+            }
+            Motion::Right => {
+                *goal = None;
+                place(self.next_caret_stop(caret.byte_index).unwrap_or(caret.byte_index))
+            }
+            Motion::WordLeft => {
+                *goal = None;
+                place(text.prev_word(caret.byte_index).unwrap_or_else(|| {
+                    self.prev_caret_stop(caret.byte_index).unwrap_or(caret.byte_index)
+                }))
+            }
+            Motion::WordRight => {
+                *goal = None;
+                place(text.next_word(caret.byte_index).unwrap_or_else(|| {
+                    self.next_caret_stop(caret.byte_index).unwrap_or(caret.byte_index)
+                }))
+            }
+            Motion::Home => {
+                *goal = None;
+                Caret {
+                    byte_index: self
+                        .line_range(caret.line_index)
+                        .map(|range| range.start)
+                        .unwrap_or(0),
+                    line_index: caret.line_index,
+                }
+            }
+            Motion::End => {
+                *goal = None;
+                Caret {
+                    byte_index: self
+                        .line_range(caret.line_index)
+                        .map(|range| range.end)
+                        .unwrap_or_else(|| self.len_bytes()),
+                    line_index: caret.line_index,
+                }
+            }
+            Motion::Up => vertical(goal, -1),
+            Motion::Down => vertical(goal, 1),
+            Motion::PageUp(lines) => vertical(goal, -(lines as isize)),
+            Motion::PageDown(lines) => vertical(goal, lines as isize),
+            Motion::DocStart => {
+                *goal = None;
+                Caret { byte_index: 0, line_index: 0 }
+            }
+            Motion::DocEnd => {
+                *goal = None;
+                Caret {
+                    byte_index: self.len_bytes(),
+                    line_index: self.lines.len() - 1,
+                }
+            }
+        }
     }
 
     pub fn selection(&self, range: Range<usize>) -> Vec<SelectionSpan> {
@@ -1829,6 +2053,78 @@ mod tests {
         let spans = layout.selection(0..2);
         assert_eq!(spans.len(), 1);
         assert!((spans[0].width_em - 2.0).abs() < 1e-6);
+    }
+
+    /// Two soft-wrapped lines — "abcd|efg": 0..4 wraps to 4..7 — unit advances.
+    fn wrapped_layout() -> Layout {
+        let line = |bytes: Range<usize>, top: f32| LayoutLineSpec {
+            carets: bytes
+                .clone()
+                .chain([bytes.end])
+                .enumerate()
+                .map(|(i, byte_index)| CaretStop { byte_index, x_em: i as f32 })
+                .collect(),
+            metrics: LineMetrics {
+                top_em: top,
+                baseline_em: top + 0.8,
+                height_em: 1.0,
+                width_em: bytes.len() as f32,
+            },
+            byte_range: bytes,
+        };
+        Layout::from_lines(vec![line(0..4, 0.0), line(4..7, 1.0)])
+    }
+
+    /// The affinity rules `caret_move` owns: boundary bytes keep the caret's
+    /// line, verticals snap at the edges, and the goal column survives.
+    #[test]
+    fn caret_move_owns_the_affinity_rules() {
+        let layout = wrapped_layout();
+        let mut goal = None;
+
+        // Right onto the soft break keeps the current line (end of line 0)...
+        let caret = layout.caret_at(3);
+        let caret = layout.caret_move(caret, Motion::Right, &mut goal, &());
+        assert_eq!((caret.byte_index, caret.line_index), (4, 0));
+        // ...and Left from inside line 1 onto the same byte keeps line 1.
+        let caret = layout.caret_move(Caret { byte_index: 5, line_index: 1 }, Motion::Left, &mut goal, &());
+        assert_eq!((caret.byte_index, caret.line_index), (4, 1));
+
+        // Up on the top line snaps to its start; Down on the bottom to its end.
+        let caret = layout.caret_move(layout.caret_at(2), Motion::Up, &mut goal, &());
+        assert_eq!((caret.byte_index, caret.line_index), (0, 0));
+        let caret = layout.caret_move(Caret { byte_index: 5, line_index: 1 }, Motion::Down, &mut goal, &());
+        assert_eq!((caret.byte_index, caret.line_index), (7, 1));
+
+        // The goal column seeds on the first vertical and survives the trip:
+        // down from x=3 onto a 3-wide line clamps, up returns to x=3.
+        let mut goal = None;
+        let caret = layout.caret_move(layout.caret_at(3), Motion::Down, &mut goal, &());
+        assert_eq!(caret.line_index, 1);
+        assert_eq!(goal, Some(3.0));
+        let caret = layout.caret_move(caret, Motion::Up, &mut goal, &());
+        assert_eq!((caret.byte_index, caret.line_index), (3, 0));
+        // Any horizontal motion clears it.
+        layout.caret_move(caret, Motion::Left, &mut goal, &());
+        assert_eq!(goal, None);
+
+        // Word motions degrade to cluster steps under `()`.
+        let mut goal = None;
+        let caret = layout.caret_move(layout.caret_at(2), Motion::WordRight, &mut goal, &());
+        assert_eq!(caret.byte_index, 3);
+    }
+
+    /// `caret_after_edit` is end-affine at a soft break and natural elsewhere.
+    #[test]
+    fn caret_after_edit_is_end_affine_at_soft_breaks() {
+        let layout = wrapped_layout();
+        assert_eq!(layout.caret_after_edit(4).line_index, 0);
+        assert_eq!(layout.caret_after_edit(2).line_index, 0);
+        assert_eq!(layout.caret_after_edit(5).line_index, 1);
+        // Hard break (three_line_layout): byte 3 starts the blank line and is
+        // no line's soft end, so it stays natural.
+        let hard = three_line_layout();
+        assert_eq!(hard.caret_after_edit(3).line_index, 1);
     }
 
     fn font(paths: &[&str]) -> Option<FontData> {

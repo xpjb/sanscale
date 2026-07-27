@@ -290,6 +290,25 @@ Things we're certain about, and why.
   clip in the fragment shader, which collapses a batch's segments into one draw call — is
   parked in `backlog.md` with its trigger.
 
+- **Caret motions live on `Layout`; the caret is typed.** *(2026-07-28, resolving the
+  backlog's "should caret placement be typed?" — yes, and motions with it.)*
+  `Caret { byte_index, line_index }` carries the wrap affinity a byte alone cannot
+  express, and `Layout::caret_move(Caret, Motion, &mut goal, &impl Boundaries) -> Caret`
+  resolves every geometric motion — cluster steps, visual-line Home/End, vertical with
+  goal column, boundary snaps, page strides — in one place, next to the geometry it
+  reads. Motivation is empirical: the affinity/goal-column glue is the code the
+  consumers shipped the same bug class in twice; a motion that *consumes and produces*
+  the typed caret makes the hint impossible to drop, which is stronger than the type
+  alone. The line the design holds: geometry in, geometry out, no text, no state — the
+  goal column is caller-owned (`&mut Option<f32>`), and word motions classify text the
+  service never holds, so they consult the caller's `Boundaries` (the same seam as
+  `ParagraphSource`; `()` declines and they degrade to cluster steps). Contrast
+  cosmic-text, whose editor tier owns a text buffer — exactly the coupling this crate
+  refuses. `caret_at`/`caret_after_edit`/`clamp_caret` are the placement companions:
+  default resolution (with the hard-break-end correction), end-affine post-edit
+  placement, and re-anchoring after a reshape. `CaretHit` was renamed to `Caret` —
+  `hit_test` was already returning a placed caret; the name caught up.
+
 - **The service is a glyph-quad source, not a compositor — it never owns the render pass.**
   The consumer builds the pass (target, clear/load, z-sorted interleave with its own
   rects/strokes/tiles, per-pane scissor) and passes it in; the service records glyph-quad
