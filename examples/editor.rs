@@ -30,6 +30,7 @@ mod common;
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ropey::Rope;
 use sanscale::{
@@ -210,6 +211,9 @@ struct Editor {
     desired_x: Option<f32>, // goal column for vertical motion, em
     scroll_y: f32,          // px
     font_px: f32,
+    /// Insert toggles between the bar caret and a block (overtype-style) caret
+    /// covering the next cluster.
+    caret_block: bool,
 }
 
 enum Motion {
@@ -237,6 +241,7 @@ impl Editor {
             desired_x: None,
             scroll_y: 0.0,
             font_px: 17.0,
+            caret_block: false,
         }
     }
 
@@ -289,10 +294,19 @@ impl Editor {
         Some(natural)
     }
 
-    fn vertical_target(&self, layout: &Layout, delta: isize) -> Option<usize> {
-        let line = self.caret_line(layout)?;
-        Some((line as isize + delta).clamp(0, layout.line_count().saturating_sub(1) as isize)
-            as usize)
+    /// After an edit the caret byte may sit exactly on a soft break; keep it
+    /// shown at the *end* of the line the text was typed on, not the start of
+    /// the next — the same affinity rule as every other placement.
+    fn settle_hint(&mut self, layout: &Layout) {
+        let Some(natural) = layout.line_for_byte(self.cursor) else {
+            return;
+        };
+        if natural > 0
+            && layout.line_range(natural).is_some_and(|r| r.start == self.cursor)
+            && layout.line_range(natural - 1).is_some_and(|r| r.end == self.cursor)
+        {
+            self.line_hint = Some(natural - 1);
+        }
     }
 
     fn motion(&mut self, layout: &Layout, motion: Motion, select: bool) {
@@ -305,9 +319,25 @@ impl Editor {
             _ => None,
         };
         let vertical = |editor: &Editor, delta: isize| -> (usize, Option<usize>) {
-            let Some(target) = editor.vertical_target(layout, delta) else {
+            let Some(current) = editor.caret_line(layout) else {
                 return (editor.cursor, editor.line_hint);
             };
+            let target = (current as isize + delta)
+                .clamp(0, layout.line_count().saturating_sub(1) as isize)
+                as usize;
+            if target == current {
+                // Already on the boundary line: Up snaps to its start, Down to
+                // its end — the notepad convention.
+                let range = layout.line_range(current);
+                let byte = if delta < 0 {
+                    range.map(|r| r.start).unwrap_or(0)
+                } else {
+                    range
+                        .map(|r| r.end)
+                        .unwrap_or_else(|| editor.doc.rope.len_bytes())
+                };
+                return (byte, Some(current));
+            }
             let byte = layout
                 .caret_on_line(target, desired_x.unwrap_or(0.0))
                 .unwrap_or(editor.cursor);
@@ -571,6 +601,7 @@ fn render_frame(
     queue: &wgpu::Queue,
     pass: &mut wgpu::RenderPass<'_>,
     screen: Vec2,
+    caret_visible: bool,
 ) -> Frame {
     let keys = editor.doc.keys();
     let handle = text.shape(BlockKey(1), style, &keys, &editor.doc);
@@ -644,19 +675,43 @@ fn render_frame(
         );
     }
 
-    // Caret, over the glyphs.
-    {
+    // Caret, over the glyphs. The block form covers the next cluster (its
+    // width read from the caret stops), translucent so the glyph shows through.
+    if caret_visible {
         let layout = text.measure(handle);
-        let caret = layout.caret_rect_on_line(editor.caret_line(layout), editor.cursor);
+        let line = editor.caret_line(layout);
+        let caret = layout.caret_rect_on_line(line, editor.cursor);
         let height = if caret.height_em > 0.0 { caret.height_em } else { 1.2 };
-        rects.push(
-            origin.x + caret.x_em * font_px - 0.5,
-            origin.y + caret.y_em * font_px,
-            1.5,
-            height * font_px,
-            CARET,
-            screen,
-        );
+        if editor.caret_block {
+            let width_em = line
+                .and_then(|l| layout.line_range(l))
+                .zip(layout.next_caret_stop(editor.cursor))
+                .filter(|(range, next)| *next <= range.end)
+                .map(|(_, next)| {
+                    (layout.caret_rect_on_line(line, next).x_em - caret.x_em).abs()
+                })
+                .filter(|w| *w > 0.05)
+                .unwrap_or(0.55);
+            let mut color = CARET;
+            color[3] = 0.45;
+            rects.push(
+                origin.x + caret.x_em * font_px,
+                origin.y + caret.y_em * font_px,
+                width_em * font_px,
+                height * font_px,
+                color,
+                screen,
+            );
+        } else {
+            rects.push(
+                origin.x + caret.x_em * font_px - 0.5,
+                origin.y + caret.y_em * font_px,
+                1.5,
+                height * font_px,
+                CARET,
+                screen,
+            );
+        }
     }
     rects.flush(device, pass);
     Frame { handle: Some(handle) }
@@ -681,6 +736,22 @@ impl ApplicationHandler for App {
                 self.path.take(),
             )));
         }
+    }
+
+    /// Blink scheduling: wake at the next phase flip and repaint only when one
+    /// actually happened — no continuous redraw loop.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        let since = gfx.last_input.elapsed().as_millis() as u64;
+        let phase = since / BLINK_MS;
+        if phase != gfx.blink_phase {
+            gfx.blink_phase = phase;
+            gfx.window.request_redraw();
+        }
+        let next_flip = BLINK_MS - (since % BLINK_MS);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(next_flip.max(1)),
+        ));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -742,7 +813,14 @@ struct Gfx {
     mods: ModifiersState,
     cursor: Vec2,
     dragging: bool,
+    /// Caret blink anchor: any input resets it, so the caret is solid while
+    /// you type and blinks only at rest.
+    last_input: Instant,
+    blink_phase: u64,
 }
+
+/// Half a blink cycle: visible for one period, hidden for the next.
+const BLINK_MS: u64 = 530;
 
 impl Gfx {
     async fn new(event_loop: &ActiveEventLoop, font: Option<&str>, path: Option<PathBuf>) -> Self {
@@ -825,6 +903,8 @@ impl Gfx {
             mods: ModifiersState::empty(),
             cursor: Vec2::new(0.0, 0.0),
             dragging: false,
+            last_input: Instant::now(),
+            blink_phase: 0,
         };
         gfx.update_title();
         gfx.window.request_redraw();
@@ -837,7 +917,7 @@ impl Gfx {
             chain: self.chain,
             wrap_em: Some(wrap.max(4.0)),
             align: Align::Left,
-            line_spacing: 1.3,
+            line_spacing: 1.15,
         }
     }
 
@@ -869,12 +949,16 @@ impl Gfx {
             (self.cursor.y - MARGIN + self.editor.scroll_y) / self.editor.font_px,
         );
         if let Some(hit) = layout.hit_test(em) {
+            self.last_input = Instant::now();
+            self.blink_phase = 0;
             self.editor.place(hit.byte_index, Some(hit.line_index), select);
             self.window.request_redraw();
         }
     }
 
     fn on_key(&mut self, event: winit::event::KeyEvent) {
+        self.last_input = Instant::now();
+        self.blink_phase = 0;
         let ctrl = self.mods.control_key();
         let shift = self.mods.shift_key();
         let Some(handle) = self.last_handle else { return };
@@ -903,6 +987,10 @@ impl Gfx {
             Key::Named(NamedKey::Enter) => editor.insert("\n"),
             Key::Named(NamedKey::Tab) => editor.insert("    "),
             Key::Named(NamedKey::Escape) => editor.anchor = None,
+            Key::Named(NamedKey::Insert) => {
+                editor.caret_block = !editor.caret_block;
+                edited = false;
+            }
             Key::Character(ref c) if ctrl => match c.as_str() {
                 "a" | "A" => {
                     editor.anchor = Some(0);
@@ -953,6 +1041,7 @@ impl Gfx {
                 self.last_handle = Some(handle);
                 let view_h = self.config.height as f32;
                 let layout = self.text.measure(handle);
+                self.editor.settle_hint(layout);
                 self.editor.scroll_caret_into_view(layout, view_h);
             }
         }
@@ -1032,6 +1121,8 @@ impl Gfx {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            let caret_visible =
+                (self.last_input.elapsed().as_millis() as u64 / BLINK_MS) % 2 == 0;
             let result = render_frame(
                 &mut self.text,
                 &mut self.rects,
@@ -1041,6 +1132,7 @@ impl Gfx {
                 &self.queue,
                 &mut pass,
                 screen,
+                caret_visible,
             );
             self.last_handle = result.handle;
         }
@@ -1072,7 +1164,9 @@ fn dump_png(font: Option<&str>) {
     let mut editor = Editor::new(Doc::from_text(DUMP_TEXT, None));
     // A selection spanning the wrap on the third paragraph, and the caret at
     // its end — the dump shows overlays, not just glyphs.
-    let start = DUMP_TEXT.find("Everything").unwrap();
+    // Spanning the blank line between two paragraphs, so the dump proves the
+    // newline stubs render (a blank line inside a selection is not invisible).
+    let start = DUMP_TEXT.find("a notepad").unwrap();
     let end = DUMP_TEXT.find("disagree").unwrap();
     editor.anchor = Some(start);
     editor.cursor = end;
@@ -1080,7 +1174,7 @@ fn dump_png(font: Option<&str>) {
         chain,
         wrap_em: Some((900.0 - 2.0 * MARGIN) / editor.font_px),
         align: Align::Left,
-        line_spacing: 1.3,
+        line_spacing: 1.15,
     };
     harness.save_png(&mut text, BG, "editor.png", |text, device, queue, pass| {
         render_frame(
@@ -1092,6 +1186,7 @@ fn dump_png(font: Option<&str>) {
             queue,
             pass,
             Vec2::new(900.0, 620.0),
+            true,
         );
     });
     println!("wrote editor.png");

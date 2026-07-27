@@ -459,20 +459,36 @@ impl Layout {
         if range.is_empty() {
             return Vec::new();
         }
+        /// Visual width of a selected line break, em: the stub an editor shows
+        /// past the last glyph — and the entire highlight of a blank line.
+        const NEWLINE_STUB_EM: f32 = 0.45;
         let mut spans = Vec::new();
         for (index, line) in self.lines.iter().enumerate() {
             let start = range.start.max(line.byte_range.start);
             let end = range.end.min(line.byte_range.end);
-            if start >= end {
+            // A hard break's separator byte belongs to no line. Selecting past
+            // this line's end selects it, and that must be *visible*: a stub
+            // after the last glyph, which on a blank line is the whole span.
+            // Soft wraps have no separator byte and get no stub — the highlight
+            // simply continues on the next line.
+            let hard_break = self
+                .lines
+                .get(index + 1)
+                .is_some_and(|next| next.byte_range.start > line.byte_range.end);
+            let newline_selected = hard_break
+                && range.start <= line.byte_range.end
+                && range.end > line.byte_range.end;
+            if start >= end && !newline_selected {
                 continue;
             }
-            let x0 = caret_x_on(line, start);
-            let x1 = caret_x_on(line, end);
+            let x0 = caret_x_on(line, start.min(end));
+            let x1 = caret_x_on(line, end.max(start));
+            let stub = if newline_selected { NEWLINE_STUB_EM } else { 0.0 };
             spans.push(SelectionSpan {
                 line: index,
                 x_em: x0.min(x1) + line.align_em,
                 y_em: line.metrics.top_em,
-                width_em: (x1 - x0).abs(),
+                width_em: (x1 - x0).abs() + stub,
                 height_em: line.metrics.height_em,
             });
         }
@@ -1776,6 +1792,44 @@ fn normalized_clip(item: &Draw) -> Option<Rect> {
 mod tests {
     use super::*;
     use crate::font::read_font_file;
+
+    /// Three hard-broken lines — "ab" (0..2), blank (3..3), "cd" (4..6) — with
+    /// unit-advance caret stops, GPU- and font-free via `from_lines`.
+    fn three_line_layout() -> Layout {
+        let line = |bytes: Range<usize>, top: f32| LayoutLineSpec {
+            carets: bytes
+                .clone()
+                .chain([bytes.end])
+                .enumerate()
+                .map(|(i, byte_index)| CaretStop { byte_index, x_em: i as f32 })
+                .collect(),
+            metrics: LineMetrics {
+                top_em: top,
+                baseline_em: top + 0.8,
+                height_em: 1.0,
+                width_em: bytes.len() as f32,
+            },
+            byte_range: bytes,
+        };
+        Layout::from_lines(vec![line(0..2, 0.0), line(3..3, 1.0), line(4..6, 2.0)])
+    }
+
+    /// A selected hard newline shows as a stub past the last glyph, and a blank
+    /// line inside the selection is a stub rather than nothing at all.
+    #[test]
+    fn selection_shows_newline_stubs_and_blank_lines() {
+        let layout = three_line_layout();
+        let spans = layout.selection(1..5);
+        assert_eq!(spans.len(), 3, "every line the selection touches has a span");
+        assert!(spans[0].width_em > 1.0, "line 0: one glyph plus the newline stub");
+        assert_eq!(spans[1].line, 1);
+        assert!(spans[1].width_em > 0.0, "blank line: a visible stub, not nothing");
+        assert!((spans[2].width_em - 1.0).abs() < 1e-6, "line 2: one glyph, newline not selected");
+        // Selection ending exactly at a line's end selects no newline: no stub.
+        let spans = layout.selection(0..2);
+        assert_eq!(spans.len(), 1);
+        assert!((spans[0].width_em - 2.0).abs() < 1e-6);
+    }
 
     fn font(paths: &[&str]) -> Option<FontData> {
         paths
