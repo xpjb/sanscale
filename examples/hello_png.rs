@@ -8,7 +8,7 @@
 mod common;
 
 use common::Harness;
-use sanscale::{Align, BlockKey, Color, ParagraphKey, Paragraphs, Style, Text, Vec2};
+use sanscale::{Align, BlockKey, Color, ParagraphKey, Paragraphs, Style, TextService, Vec2};
 
 const TEXT: &str = "Hello, sanscale!";
 
@@ -17,7 +17,7 @@ fn main() {
 
     // One service holds the font pool, the caches and (lazily) the GPU
     // resources. Nothing below touches a device until `save_png` draws.
-    let mut text = Text::new();
+    let mut text = TextService::new();
     let chain = common::font_chain(
         &mut text,
         &["Segoe UI", "Helvetica Neue", "Arial", "DejaVu Sans"],

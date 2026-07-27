@@ -63,7 +63,7 @@ owner — confusing them is how the design goes wrong:
 
 ---
 
-Mental model: **there is one `Text` service that holds ~7 keyed pools with eviction.**
+Mental model: **there is one `TextService` that holds ~7 keyed pools with eviction.**
 Only the atlas is hard, and it's already built. Everything else is a HashMap + a version.
 
 Pools:
@@ -91,7 +91,7 @@ divergence is noted at the decision it came from, below. wgpu is borrowed only a
 `FontData`, `Color`, `Layout`) elided.
 
 ```rust
-struct Text {
+struct TextService {
     // the pools the user's handles index into (a handle IS its slot index):
     fonts:  Vec<Font>,                     // FontHandle      — pool 1; deduped by data identity
     chains: Vec<Option<Vec<FontHandle>>>,  // FontChainHandle — pool 2; `None` = dropped slot, so
@@ -130,7 +130,7 @@ struct BlockKey(u64);                                              // unit of co
 #[derive(Clone, Copy, PartialEq)]  // Eq/Hash via wrap_em.to_bits()
 struct Style { chain: FontChainHandle, wrap_em: Option<f32>, align: Align, line_spacing: f32 }
 
-impl Text {
+impl TextService {
     // takes nothing: pipelines are per-target and lazy (see set_target), and the atlases
     // size themselves — grow-on-demand, warning at the device limit.
     fn new() -> Self;   // lives beside the consumer's renderer, never inside it
@@ -190,7 +190,7 @@ impl Text {
 
 Things we're certain about, and why.
 
-- **The surface is one object plus handles.** A single `Text` service owns every pool and
+- **The surface is one object plus handles.** A single `TextService` owns every pool and
   the GPU resources. Everything else is `Copy` handles into it — `FontHandle`,
   `FontChainHandle`, `ShapedHandle` — and value types — `ParagraphKey`, `BlockKey`, `Style`.
   Methods: `new`, `map_font`, `register_chain`, `drop_chain`, `clear`, `shape`, `shape_one`,
@@ -355,6 +355,17 @@ Things we're certain about, and why.
   baking it (today's `TextVertex.col`) makes the geometry cache color-specific for nothing.
   Same shaped+rasterized run redraws in any color free (selection highlight, theme swap).
 
+  **Half held, and the built geometry cache reversed the other half.** Shaping and the
+  atlases are color-free as stated — a recolor reshapes nothing and rasterizes nothing.
+  But `TextVertex.col` survived, deliberately: per-vertex color is what lets
+  differently-colored blocks concatenate into **one** draw call, and a per-draw uniform
+  would split every batch by color — foreclosing exactly what `draw_batch` exists for.
+  The cost is that `GeomKey` carries color, so a recolor rebakes that block's quads (a
+  CPU quad walk, not a reshape). "For nothing" was written before batching existed; the
+  baking now buys the draw-call collapse. "Redraws in any color free" is true at the
+  shaping and atlas tiers, false at the geometry tier — and a retained `Batch`
+  (`rfc-batch-cache.md`) bakes color the same way, so a recolored batch is a re-prepare.
+
 - **Wrap is em, and it's the consumer's one conversion.** `wrap_em = pane_px / font_px`,
   done once by the consumer. It's the honest resolution-independent form, and it's where the
   two "zooms" correctly diverge (camera-zoom keeps `wrap_em`, pane-resize changes it).
@@ -434,6 +445,8 @@ Things being removed from today's API. As definite as the locks.
 - **`Box::leak`ing font bytes** (`font.rs:44`) → an `Arc` held beside the face, so a chain can
   actually be dropped. Today every settings-driven `reload_fonts` leaks the whole chain.
 - **`FontSource::{Bytes, Path}`** → one shared-bytes handle; the crate stops doing file I/O.
+  (`read_font_file` remains as a free helper returning `FontData` — the cut was I/O inside
+  the service, so `map_font` never touches the filesystem; the helper is sugar outside it.)
 - **The three nested identity structs** (`ParagraphIdentity`, `TextParagraphIdentity`,
   `TextParagraphCacheKey`) → one flat `ParagraphKey { namespace, slot, generation }`, plus a
   `BlockKey` for the composed unit.
@@ -635,13 +648,13 @@ Changed by the test:
   mmap font stack — but the "just take the Arc" answer has an `unsafe` in it.
 
 Resolved — where the service lives:
-- **`Text` is a sibling of the consumer's renderer, not a field of it.** The migration
+- **`TextService` is a sibling of the consumer's renderer, not a field of it.** The migration
   surfaced this as caret motion and edit actions needing a `&Renderer`, cascading into the
   keyboard input path — exactly what compendium keeps GPU-free on purpose. The fix is not to
   hand the editor a copy of the layout (a "small line table" supporting `caret_on_line` needs
   per-line caret stops, i.e. most of `Layout` — that is just today's clone again). It is that
-  **nothing in `Text` needs a renderer**: `shape`/`measure` are device-free and `draw` takes
-  `device`/`queue`/`pass` as parameters. So model code borrows `&Text` — a shaping cache, no
+  **nothing in `TextService` needs a renderer**: `shape`/`measure` are device-free and `draw` takes
+  `device`/`queue`/`pass` as parameters. So model code borrows `&TextService` — a shaping cache, no
   GPU handles — and the rule is respected rather than bent. Bonus: it makes shaping and
   measuring work headless, deleting compendium's existing "the layout below needs the
   renderer, so bail without one" path. In the port this is a `TextSystem { text, ui_chain,

@@ -8,7 +8,7 @@
 mod common;
 
 use common::Harness;
-use sanscale::{Align, BlockKey, Color, ParagraphKey, Paragraphs, Style, Text, Vec2};
+use sanscale::{Align, BlockKey, Color, ParagraphKey, Paragraphs, Style, TextService, Vec2};
 
 const BODY: &[&str] = &[
     "sanscale renders each glyph from its Bézier outline with analytic per-pixel \
@@ -34,7 +34,7 @@ fn main() {
     let (width, height) = (760u32, 600u32);
     let harness = Harness::new(width, height);
 
-    let mut text = Text::new();
+    let mut text = TextService::new();
     let chain = common::font_chain(
         &mut text,
         &["Segoe UI", "Helvetica Neue", "Arial", "DejaVu Sans"],

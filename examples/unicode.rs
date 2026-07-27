@@ -10,13 +10,13 @@
 mod common;
 
 use common::{unicode_sections, Harness, UNICODE_FALLBACK};
-use sanscale::{Align, Color, ShapedHandle, Style, Text, Vec2};
+use sanscale::{Align, Color, ShapedHandle, Style, TextService, Vec2};
 
 fn main() {
     let (width, height) = (1220u32, 1000u32);
     let harness = Harness::new(width, height);
 
-    let mut text = Text::new();
+    let mut text = TextService::new();
     let chain = common::font_chain(&mut text, UNICODE_FALLBACK);
     let families = text.diagnostics().chain_families(chain);
     if families.is_empty() {

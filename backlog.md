@@ -10,7 +10,7 @@ what's owed.
 
 ## `chain_view` allocates a `Vec` on every call
 
-`Text::chain_view` doesn't borrow the chain — it builds a fresh
+`TextService::chain_view` doesn't borrow the chain — it builds a fresh
 `Vec<ChainFont<'_>>` each time, pairing every handle in the chain with its
 `&Font`. Twelve call sites, including all six `Diagnostics` methods.
 
@@ -71,6 +71,22 @@ clobbers draws already recorded into an open pass, because nothing owns the
 vertices. The RFC carries that diagnosis, the `Batch` design that removes it, and
 the deferred shader-clip work with its trigger. The ~2x locality gap is explicitly
 *not* what motivates the change.
+
+---
+
+## `decisions.md` does double duty: append-only record *and* current-surface description
+
+The "API sketch (current)" section hand-tracks `src/text.rs`, which makes
+`decisions.md` both the record of why the design is what it is (append-only,
+policed by discipline) and a present-tense description of the surface (policed by
+nothing — it has drifted before, and the color lock drifted for a while without
+an append). Those are different documents with different failure modes.
+
+The fix is to move the current-surface content into rustdoc — `lib.rs` /
+`text.rs` — where `cargo doc` and the doctest police it mechanically, leaving
+`decisions.md` as pure record. Parked rather than done because Part 1 of
+`rfc-batch-cache.md` changes the surface anyway (`Batch`, `prepare`); restructure
+once, when it lands, not twice.
 
 ---
 

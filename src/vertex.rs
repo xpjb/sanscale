@@ -15,7 +15,8 @@ use crate::cache::GlyphInfo;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct TextVertex {
-    /// Window-space pixel position (matches orthographic `0..width`, `0..height`).
+    /// Position in the transform's source space (see module docs) — `place`
+    /// bakes the caller's `at`/`size` in.
     pub pos: [f32; 2],
     /// Packed glyph metadata: band start and band max.
     pub glyph: [u32; 2],

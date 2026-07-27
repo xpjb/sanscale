@@ -6,7 +6,7 @@
 //!
 //! # The model
 //!
-//! One [`Text`] service holds every pool. You hold `Copy` handles into it.
+//! One [`TextService`] holds every pool. You hold `Copy` handles into it.
 //!
 //! ```text
 //! text ─[itemize]→ runs ─[shape]→ glyphs ─[flow]→ lines ─[rasterize]→ atlas ─[draw]→ quads
@@ -22,7 +22,7 @@
 //!   what you measure, hit-test and draw.
 //!
 //! Shaping is em-space and carries no pixel size and no color, so the cache is
-//! zoom-invariant. Size and color enter once, at [`Text::draw`].
+//! zoom-invariant. Size and color enter once, at [`TextService::draw`].
 //!
 //! # What this crate does not own
 //!
@@ -39,9 +39,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use sanscale::{Align, BlockKey, ParagraphKey, Paragraphs, Style, Text};
+//! use sanscale::{Align, BlockKey, ParagraphKey, Paragraphs, Style, TextService};
 //!
-//! let mut text = Text::new();
+//! let mut text = TextService::new();
 //! let font = text.map_font(sanscale::read_font_file("font.ttf")?, 0)?;
 //! let chain = text.register_chain(&[font]);
 //!
@@ -56,11 +56,11 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! Nothing above touches a GPU. [`Text::draw`] is the only method that does.
+//! Nothing above touches a GPU. [`TextService::draw`] is the only method that does.
 //!
 //! # Compatibility
 //!
-//! - **wgpu 30** — [`Text::draw`] borrows `wgpu::Device`, `Queue` and
+//! - **wgpu 30** — [`TextService::draw`] borrows `wgpu::Device`, `Queue` and
 //!   `RenderPass` directly, so your application must use the same wgpu major
 //!   version. Bumping it here is a breaking change.
 //! - **MSRV: Rust 1.82.**
@@ -83,5 +83,5 @@ pub use text::{
     Align, BlockKey, CaretHit, CaretRect, CaretStop, Color, Diagnostics, Draw, FontChainHandle,
     FontData,
     FontError, FontHandle, Layout, LayoutLineSpec, LineMetrics, ParagraphKey, ParagraphSource,
-    Paragraphs, Rect, SelectionSpan, ShapedHandle, Style, Text, Vec2,
+    Paragraphs, Rect, SelectionSpan, ShapedHandle, Style, TextService, Vec2,
 };

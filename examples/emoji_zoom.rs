@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec2, Vec3};
 use sanscale::{
-    Align, Draw, FontChainHandle, ShapedHandle, Style, Text,
+    Align, Draw, FontChainHandle, ShapedHandle, Style, TextService,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -107,7 +107,7 @@ fn build_layout() -> Vec<RowLayout> {
 struct Viewer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    text: Text,
+    text: TextService,
     chain: FontChainHandle,
     format: wgpu::TextureFormat,
     layout: Vec<RowLayout>,
@@ -120,7 +120,7 @@ struct Viewer {
 
 impl Viewer {
     fn new(device: wgpu::Device, queue: wgpu::Queue, config: &wgpu::SurfaceConfiguration) -> Self {
-        let mut text = Text::new();
+        let mut text = TextService::new();
         let chain = font_chain(&mut text, UNICODE_FALLBACK);
         let layout = build_layout();
         let world_h = (layout.len() as f32 + 1.0) * CELL_H;
@@ -330,7 +330,7 @@ impl Viewer {
             return;
         };
         self.text
-            .set_transform(&self.queue, Text::pixel_ortho(w as u32, h as u32));
+            .set_transform(&self.queue, TextService::pixel_ortho(w as u32, h as u32));
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {

@@ -33,11 +33,11 @@ sanscale = { git = "https://github.com/xpjb/sanscale" }
 ## Quick start
 
 ```rust
-use sanscale::{Align, BlockKey, Color, ParagraphKey, Paragraphs, Style, Text, Vec2};
+use sanscale::{Align, BlockKey, Color, ParagraphKey, Paragraphs, Style, TextService, Vec2};
 
 // 1. One service holds every pool, every cache, and (lazily) the GPU resources.
 //    You hold `Copy` handles into it.
-let mut text = Text::new();
+let mut text = TextService::new();
 let font = text.map_font(sanscale::read_font_file("/path/to/font.ttf")?, 0)?;
 let chain = text.register_chain(&[font]);   // ordered fallback chain
 
@@ -57,7 +57,7 @@ let height_px = text.measure(block).height_em() * 32.0;
 // 4. Once per target format, then once per pass. Screen space is `pixel_ortho`
 //    (0,0 = top-left); world or 3D text is an MVP through the same call.
 text.set_target(&device, surface_format);
-text.set_transform(&queue, Text::pixel_ortho(width, height));
+text.set_transform(&queue, TextService::pixel_ortho(width, height));
 
 // 5. Draw into a render pass you own. Size and color enter here, not at shape
 //    time; `draw_batch` takes a `&[Draw]` for many blocks in one go.
@@ -87,7 +87,7 @@ atlas, is the one thing that pixelates when magnified.)
 ## Status
 
 Extracted from a shipping infinite-canvas app, where it renders live editable
-text across a zooming viewport. The crate-root re-exports (the `Text` service and
+text across a zooming viewport. The crate-root re-exports (`TextService` and
 its handles) are the stable surface; the pipeline internals may change. Not yet
 published to crates.io —
 depend on it via git.
@@ -102,14 +102,14 @@ font bytes ──► itemize + shape ──► flow into lines ──► outline
             text.rs                       vertex.rs                  shaders/*.wgsl
 ```
 
-`Text` is the surface; everything else is internal. `shape()` caches a block's
+`TextService` is the surface; everything else is internal. `shape()` caches a block's
 em-space layout, `measure()` and the caret/selection queries read it without
 touching a device, and `draw()` (or `draw_batch()`) rasterizes any newly needed
 glyphs into the atlas and records quads into your pass.
 
 | Module | Role |
 |---|---|
-| `text` | Public API (re-exported at the crate root): the `Text` service, handles, shaping, caret/selection geometry, draw |
+| `text` | Public API (re-exported at the crate root): the `TextService`, handles, shaping, caret/selection geometry, draw |
 | `font` | Face loading + fallback chain; metrics |
 | `layout` | Itemization (script/face runs) and shaping into positioned glyphs |
 | `flow` | Line breaking over shaped advances; caret stops. Em-space, so reflow never reshapes |

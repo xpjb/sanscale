@@ -4,7 +4,7 @@
 
 #![allow(dead_code)] // each example uses a different subset of these helpers.
 
-use sanscale::{FontChainHandle, FontData, Text};
+use sanscale::{FontChainHandle, FontData, TextService};
 
 pub mod emoji_data;
 
@@ -63,7 +63,7 @@ pub const UNICODE_FALLBACK: &[&str] = &[
 /// chain. Mirrors how a real app does it: **one** long-lived `Database`, and
 /// `make_shared_face_data` so a face used by two chains is the same `Arc` and
 /// the service dedups it into one font and one glyph cache.
-pub fn font_chain(text: &mut Text, families: &[&str]) -> FontChainHandle {
+pub fn font_chain(text: &mut TextService, families: &[&str]) -> FontChainHandle {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
     let mut handles = Vec::new();
@@ -165,16 +165,16 @@ impl Harness {
     /// a pass — exactly the seam a real consumer sits on.
     pub fn save_png(
         &self,
-        text: &mut Text,
+        text: &mut TextService,
         clear: wgpu::Color,
         path: &str,
-        draw: impl FnOnce(&mut Text, &wgpu::Device, &wgpu::Queue, &mut wgpu::RenderPass<'_>),
+        draw: impl FnOnce(&mut TextService, &wgpu::Device, &wgpu::Queue, &mut wgpu::RenderPass<'_>),
     ) {
         let (target, view) = self.offscreen();
         text.set_target(&self.device, self.config.format);
         text.set_transform(
             &self.queue,
-            Text::pixel_ortho(self.config.width, self.config.height),
+            TextService::pixel_ortho(self.config.width, self.config.height),
         );
 
         let mut encoder = self.device.create_command_encoder(&Default::default());

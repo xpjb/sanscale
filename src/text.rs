@@ -1,4 +1,4 @@
-//! The public surface: one `Text` service, `Copy` handles into its pools.
+//! The public surface: one `TextService`, `Copy` handles into its pools.
 //!
 //! Mental model: one service holding keyed pools with eviction. The consumer
 //! holds `Copy` handles and mints its own keys; nothing borrows the service
@@ -97,8 +97,11 @@ impl From<[f32; 4]> for Rect {
     }
 }
 
-/// Linear RGBA. A draw parameter only — never baked into shaping, so the same
-/// shaped block redraws in any color for free.
+/// Linear RGBA. A draw parameter only — never baked into shaping or the atlases,
+/// so a recolor reshapes and rasterizes nothing. It *is* baked into cached
+/// geometry (per-vertex color is what lets differently-colored blocks share one
+/// draw call), so a recolor re-emits that block's quads: a CPU walk, not a
+/// reshape.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Color(pub [f32; 4]);
 
@@ -270,9 +273,9 @@ struct LayoutLine {
 /// Laid-out geometry for one block, in em space, with block-global byte offsets
 /// across all of its paragraphs.
 ///
-/// Borrow this from [`Text::measure`] **at the point of use** — do not store it.
+/// Borrow this from [`TextService::measure`] **at the point of use** — do not store it.
 /// Every query returns `Copy` or owned data precisely so nothing needs to outlive
-/// the call, which is what keeps `&mut self` free for [`Text::draw`]. Pass the
+/// the call, which is what keeps `&mut self` free for [`TextService::draw`]. Pass the
 /// [`ShapedHandle`] around instead; that is what it is for.
 #[derive(Clone, Debug, Default)]
 pub struct Layout {
@@ -472,7 +475,7 @@ fn caret_x_on(line: &LayoutLine, byte_index: usize) -> f32 {
 /// A trait rather than a closure for one concrete reason: the returned `Cow`
 /// borrows from `&self`, so no lifetime has to be threaded through the caller's
 /// own structures. A closure would force its text lifetime to be a parameter of
-/// [`Text::shape`] and of anything storing it, which then unifies with the
+/// [`TextService::shape`] and of anything storing it, which then unifies with the
 /// caller's other borrows.
 ///
 /// This is not a heavyweight provider: `&self`, used as `&dyn`, never a generic.
@@ -516,9 +519,10 @@ struct Block {
     last_used: u64,
 }
 
-/// What the cached vertices were built for. Color and size are baked into the
-/// vertex format today, so they are part of the key; moving them to a per-draw
-/// uniform would reduce this to the clip alone.
+/// What the cached vertices were built for. Color is baked per-vertex — the
+/// price of letting differently-colored blocks share one draw call — so it is
+/// part of the key. `at` and `size` are deliberately absent: quads bake at the
+/// origin and unit size, and `place` applies both on the way out.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GeomKey {
     color: [u32; 4],
@@ -557,7 +561,7 @@ struct Geometry {
     emoji: Vec<EmojiVertex>,
 }
 
-/// One block to draw, for [`Text::draw_batch`].
+/// One block to draw, for [`TextService::draw_batch`].
 #[derive(Clone, Copy, Debug)]
 pub struct Draw {
     pub block: ShapedHandle,
@@ -592,11 +596,11 @@ const MAX_PARAGRAPHS: usize = 1 << 17;
 /// One text service: every pool, every cache, and the GPU resources.
 ///
 /// Lives *beside* the consumer's renderer, never inside it: nothing here needs a
-/// device except [`Text::draw`], which takes one as a parameter. That is what
-/// lets model code hold a `&Text` for measurement and hit-testing without
+/// device except [`TextService::draw`], which takes one as a parameter. That is what
+/// lets model code hold a `&TextService` for measurement and hit-testing without
 /// reaching for the GPU, and what makes shaping work headless.
 #[derive(Default)]
-pub struct Text {
+pub struct TextService {
     fonts: Vec<Font>,
     /// `None` for a dropped slot, so live handles stay valid across a reload.
     chains: Vec<Option<Vec<FontHandle>>>,
@@ -629,8 +633,8 @@ pub struct Text {
     batch_emoji: Vec<EmojiVertex>,
 }
 
-impl Text {
-    /// Takes nothing: pipelines are per-target and lazy (see [`Text::set_target`]),
+impl TextService {
+    /// Takes nothing: pipelines are per-target and lazy (see [`TextService::set_target`]),
     /// and the atlases size themselves.
     pub fn new() -> Self {
         Self::default()
@@ -794,7 +798,7 @@ impl Text {
         Some(handle)
     }
 
-    /// One-paragraph convenience over [`Text::shape`] — a title, a field.
+    /// One-paragraph convenience over [`TextService::shape`] — a title, a field.
     pub fn shape_one(
         &mut self,
         key: ParagraphKey,
@@ -865,7 +869,7 @@ impl Text {
     }
 
     /// Set the transform applied to the local-em quads this service emits. Call
-    /// once per pass. Screen-space is [`Text::pixel_ortho`]; world or 3D text is
+    /// once per pass. Screen-space is [`TextService::pixel_ortho`]; world or 3D text is
     /// an MVP — same call, no mode flag.
     pub fn set_transform(&mut self, queue: &wgpu::Queue, transform: [f32; 16]) {
         if let Some(gpu) = &self.gpu {
@@ -892,7 +896,7 @@ impl Text {
     /// Record glyph quads for `h` into `pass`.
     ///
     /// `at` and `size` are in the transform's source space — screen pixels under
-    /// [`Text::pixel_ortho`], world units under an MVP. `at` is the **top-left**
+    /// [`TextService::pixel_ortho`], world units under an MVP. `at` is the **top-left**
     /// of the block box; the baseline is internal, so hit-testing and rendering
     /// cannot disagree about it. `clip` culls lines and glyphs on the CPU before
     /// anything is emitted, which is what keeps a scrolled long document cheap.
@@ -1345,7 +1349,7 @@ fn glyph_intersects(info: &GlyphInfo, pen_x: f32, pen_y: f32, size: f32, clip: R
 
 /// Read-only introspection: font coverage and cache occupancy.
 pub struct Diagnostics<'a> {
-    text: &'a Text,
+    text: &'a TextService,
 }
 
 impl Diagnostics<'_> {
@@ -1540,19 +1544,19 @@ mod tests {
 
     /// Build a chain with the colour font **first**, which is how a real fallback
     /// chain is ordered (emoji high-priority, Latin primary before it).
-    fn emoji_first_chain() -> Option<(Text, FontChainHandle)> {
+    fn emoji_first_chain() -> Option<(TextService, FontChainHandle)> {
         let emoji = font(&["C:/Windows/Fonts/seguiemj.ttf"])?;
         let latin = font(&["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"])?;
-        let mut text = Text::new();
+        let mut text = TextService::new();
         let e = text.map_font(emoji, 0).ok()?;
         let l = text.map_font(latin, 0).ok()?;
         let chain = text.register_chain(&[e, l]);
         Some((text, chain))
     }
 
-    fn latin_chain() -> Option<(Text, FontChainHandle)> {
+    fn latin_chain() -> Option<(TextService, FontChainHandle)> {
         let latin = font(&["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"])?;
-        let mut text = Text::new();
+        let mut text = TextService::new();
         let h = text.map_font(latin, 0).ok()?;
         let chain = text.register_chain(&[h]);
         Some((text, chain))
@@ -1623,7 +1627,7 @@ mod tests {
         assert!(!d.is_single_glyph(chain, "AB"), "two letters shape to two glyphs");
     }
 
-    fn visible_count(text: &Text, h: ShapedHandle, clip: Option<Rect>) -> usize {
+    fn visible_count(text: &TextService, h: ShapedHandle, clip: Option<Rect>) -> usize {
         let mut n = 0;
         for_each_visible_glyph(text.measure(h), Vec2::new(0.0, 0.0), 16.0, clip, |_, _, _| n += 1);
         n

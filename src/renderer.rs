@@ -419,9 +419,13 @@ impl TextRenderer {
 /// already-recorded draw points at would make that draw sample the *new*
 /// vertices. A consumer records many draws into one pass before submitting
 /// (per-item scissor rects force this), so a single shared buffer written in
-/// place is not an option. Instead this bump-allocates: every allocation gets a
-/// fresh region, and the pointer only wraps after a full cycle of an arena sized
-/// to several frames of traffic — well beyond any pipeline's frames in flight.
+/// place is not an option. Instead this bump-allocates — every allocation gets a
+/// fresh region — but the sizing does **not** uphold the invariant: capacity
+/// tracks the largest single push, never per-frame traffic, so a frame of many
+/// small pushes wraps `offset` mid-frame and rewrites regions that draws already
+/// recorded into the open pass point at. That is the corruption
+/// `rfc-batch-cache.md` diagnoses; its Part 1 deletes this type rather than
+/// repairing it.
 /// Growing allocates a *new* buffer and leaves the old one to wgpu's refcount,
 /// so draws already recorded against it stay valid.
 pub(crate) struct VertexArena {

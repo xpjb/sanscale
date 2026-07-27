@@ -1,6 +1,7 @@
 # RFC: who owns the vertices
 
-**Status:** settled. Part 0 and Part 1 to build; Part 2 deferred with a trigger.
+**Status:** settled, API surface locked 2026-07-28 (segments first-class, staleness
+probe). Part 0 and Part 1 to build; Part 2 deferred with a trigger.
 **Supersedes:** the batch-*caching* draft, which asked whether to cache
 concatenation and how to key it. Wrong question — the defect is ownership, and
 once ownership is fixed most of the caching question dissolves.
@@ -63,10 +64,15 @@ question. The two have different invalidation conditions and do not belong in on
 entry (see *Rejected*).
 
 ```rust
-prepare(&[Draw]) -> Batch     // consumer owns it: grain, residency, when to rebuild
-draw_prepared(&Batch)         // draw what you own
-draw_batch(&[Draw])           // = prepare + draw + drop
-draw(block, at, size, …)      // = draw_batch(&[one])
+prepare(device, queue, &[Draw]) -> Batch  // consumer owns it: grain, residency, when to rebuild.
+                                          //   ALL mutation happens here: geometry rebuilds,
+                                          //   emoji raster, atlas sync, one buffer upload
+Batch::segments() -> &[Segment]           // where the clip changes; Segment { clip: Option<Rect>, .. }
+draw_segment(pass, &Batch, i)             // record one segment; sets no scissor
+draw_prepared(pass, &Batch)               // every segment in order — the uniform-clip path
+batch_live(&Batch) -> bool                // staleness probe; see below
+draw_batch(device, queue, pass, &[Draw])  // = prepare + draw_prepared + drop
+draw(block, at, size, …)                  // = draw_batch(&[one])
 ```
 
 The load-bearing property is that **the easy path is literally the hard path plus a
@@ -75,18 +81,62 @@ routes into one ring whose sizing assumes the second, and that divergence *is* t
 bug. One route, one lifetime rule, and the hazard becomes unrepresentable.
 
 A consumer who doesn't care never learns the word "batch" and keeps today's API; a
-consumer who does stops asking permission. Full control costs one public type with
-two methods.
+consumer who does stops asking permission. Full control costs two public types —
+`Batch` and its read-only `Segment` — and the methods above.
 
-**Segments.** A scissor is pass state, so items with differing clips still cannot
-share a draw call — unchanged by this RFC, that is Part 2. A `Batch` therefore
-records `(range, clip)` runs; the consumer sets its scissor per run and draws that
-range. Same draw-call count as today, zero per-frame upload. When Part 2 lands the
-runs collapse into one draw and nothing else about the design changes.
+**Segments are first-class.** A scissor is pass state, so items with differing clips
+still cannot share a draw call — unchanged by this RFC, that is Part 2. But a single
+`draw_prepared(&Batch)` call would give the consumer nowhere to set scissors
+*between* clip runs, so the batch must hand the run boundaries back:
+`Batch::segments()` exposes them, and the general loop is *map segment clip to
+framebuffer pixels, set scissor, `draw_segment(i)`*. `draw_prepared` draws every
+segment in order with no scissor changes — the uniform-clip fast path, and what
+`draw_batch` desugars to. Same draw-call count as today, zero per-frame upload.
+When Part 2 lands every batch has one segment and nothing else about the design
+changes — `Segment` is the one noun here designed to *decay*.
+
+Rules that make segments cheap rather than a new axis:
+- `prepare` **preserves input order** — order within a batch is z-order and the
+  consumer chose it — and coalesces only *adjacent* items with equal clip.
+  Reordering by clip to minimize segments would silently reshuffle z.
+- `draw_segment` takes an **index**, not a raw range. `Batch` stays opaque: buffer
+  layout and the text/emoji stride split remain private, and no consumer binds our
+  vertex format by hand.
+- The mutation/recording split is structural: everything that touches device state
+  happens at `prepare`; `draw_segment`/`draw_prepared` purely record. Today
+  `draw_batch` interleaves both, which is exactly how the atlas ordering invariant
+  got fragile — under this split "never recreate between a bind and its draw" holds
+  by construction, not by call-order discipline.
 
 The scissor stays consumer-side because under an arbitrary MVP the crate cannot map
 a source-space clip to framebuffer pixels without also knowing the viewport. That,
-not oversight, is why `draw` never set it.
+not oversight, is why `draw` never set it. A segment echoes its clip back in the
+space it was passed in; the mapping is the consumer's one job in the loop.
+
+**Staleness.** A retained batch bakes emoji atlas UVs, and the emoji atlas evicts;
+the "never evict a slot touched since the last submit" invariant does not see a
+batch prepared ten frames ago, so eviction can silently repoint its quads at a
+different glyph. The contract:
+
+- `prepare` records whether the batch contains emoji and the emoji-atlas epoch it
+  baked against. Text-only batches are immortal — that atlas grows but never evicts
+  or moves slots.
+- `batch_live(&Batch) -> bool` is two integer compares. Check per frame, re-prepare
+  on false. Drawing a stale batch is *defined* — it draws the old texels, which may
+  by then be a recycled emoji cell: wrong pixels until re-prepared, never UB.
+- **Rejected: auto-rebuild inside `draw_prepared`.** It would need `device`/`queue`
+  back, mutate during recording, and hide a rebuild on the hot path — the exact
+  magic the mutation/recording split removes.
+- **Rejected: pinning** (a live batch blocks eviction of slots it references). That
+  turns every retained batch into a hidden atlas lease; a consumer holding many
+  batches wedges eviction entirely. The epoch probe puts the choice where the
+  lifetime knowledge is.
+- Two soft-staleness notes, documented rather than mechanized: under an MVP zoom
+  the emoji raster bucket drifts, so a retained batch's emoji soften (the old
+  bucket's slot is still the right glyph until evicted) — re-prepare on bucket
+  crossing if it matters; and a recolor is a re-prepare, since color is baked
+  per-vertex (the price of differently-colored blocks sharing one draw call — see
+  the color lock's append in `decisions.md`).
 
 ## Part 0 — consumer moves to world-space `at` + MVP
 
@@ -153,19 +203,22 @@ per-item scissor. Not required for correctness and explicitly not scheduled.
 - **Teaching the arena a frame boundary.** Correct, and about ten lines, but it is a
   new contract a consumer can violate, and Part 1 deletes the arena anyway.
 
-## Open
+## Closed (were open)
 
-- **z-contiguity.** A batch spans a z-range and drawing it out of order is a bad
-  silent failure. Service-verified, or the consumer's responsibility? Leaning
-  consumer's, documented — the consumer chose the grain.
-- **Eviction.** Consumer-held means consumer-dropped, so there is no bound to pick,
-  but a consumer minting one batch per note in a 10k-note document still wants
-  guidance. Probably a README note rather than machinery.
+- **z-contiguity: the consumer's, documented.** A batch spans a z-range and drawing
+  it out of order is a bad silent failure — but the consumer chose the grain, and
+  verifying it would require the service to know a z-model it deliberately doesn't
+  have. Same reasoning as the scissor: the service records what it's told, the
+  consumer owns pass order.
+- **Eviction: a README paragraph, not machinery.** Consumer-held means
+  consumer-dropped, so there is no bound to pick; a consumer minting one batch per
+  note in a 10k-note document gets guidance, not an evictor.
 
 ---
 
 Four predictions in this area were wrong until measured — locality twice, epoch
 invalidation, and a clip normalisation that was invariant on paper and missed every
 frame in floats. The ownership defect above is the exception only because it was
-reproduced and its arithmetic checked. Everything under *Open* still deserves a
-measurement before it is built.
+reproduced and its arithmetic checked. The closed calls above are design calls, not
+performance predictions — where Part 1 meets a number (allocation per `prepare`,
+segment-loop overhead), measure before believing it.
