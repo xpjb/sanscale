@@ -78,6 +78,25 @@ is accepted deliberately.
 
 ---
 
+## Should caret placement be typed? (`Caret { byte, line }`)
+
+Wrap affinity is machinery today, not a contract: a byte at a soft break belongs
+to two visual lines, the crate answers it correctly (`line_for_byte`'s
+deterministic rule, `caret_rect_on_line`, the hint pattern) — but the hint is
+*droppable*. compendium consulted it at two of the seven sites that place or
+render a caret and the compiler said nothing; the result shipped as a visible
+caret regression. `examples/editor.rs` now demonstrates the discipline done
+right (`hint_for`, every placement decides its line), which is also the evidence
+that it *is* a discipline.
+
+The hardening: a small `Caret { byte, line }` value that placement returns and
+the caret queries take, so forgetting the line doesn't typecheck. `CaretHit`
+already has exactly this shape. Costs a slightly heavier signature on
+`caret_rect`/`caret_on_line`; parked until a second consumer (or the example
+growing an editor-state helper) shows where the ergonomics want to sit.
+
+---
+
 ## No measurement of reflow itself
 
 `flow_paragraph` — greedy first-fit line breaking — has no benchmark. compendium's

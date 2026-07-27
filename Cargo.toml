@@ -43,6 +43,9 @@ bytemuck = "1"
 arboard = "3"
 # Canonical Unicode character names for the unicode_zoom hover.
 unicode_names2 = "3"
+# The `editor` example: rope-backed document + native open/save dialogs.
+ropey = "1"
+rfd = "0.15"
 # Surface the library's atlas warnings on stderr during headless smoke tests.
 env_logger = "0.11"
 

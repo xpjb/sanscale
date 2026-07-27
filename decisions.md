@@ -560,6 +560,13 @@ worth litigating, just parked.
 - **Text editor as an example.** Dogfood the caret/selection/hit-test surface — the hardest
   consumer path — as a `sanscale` example, not just an app feature buried in compendium. `>:)`
 
+  **Shipped: `examples/editor.rs` (2026-07-28).** A rope-backed notepad — identity-keyed
+  shaping over `ropey`, one handle for hit-test and render, wrap-affinity discipline, native
+  dialogs. It paid for itself immediately: it drove `Layout::{next,prev}_caret_stop`
+  (cluster-true stepping, which compendium still does consumer-side with unicode
+  segmentation and should adopt), and it surfaced the typed-caret question now in
+  `backlog.md`.
+
 ---
 
 # Migration test (compendium, branch `text-api-migration`)

@@ -46,5 +46,5 @@ signatures by hand.
 
 ## Examples
 
-Headless (`hello_png`, `paragraph`, `unicode`) write PNGs; `unicode_zoom` and `emoji_zoom` open a
-window. Don't launch the windowed ones — pass `-- --dump` for PNG stills instead.
+Headless (`hello_png`, `paragraph`, `unicode`) write PNGs; `unicode_zoom`, `emoji_zoom` and
+`editor` open a window. Don't launch the windowed ones — pass `-- --dump` for PNG stills instead.

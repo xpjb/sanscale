@@ -76,6 +76,7 @@ cargo run --example paragraph      # wrapping, alignment, sizes   -> paragraph.p
 cargo run --example unicode        # color emoji + CJK + 12 scripts via fallback -> unicode.png
 cargo run --example unicode_zoom   # interactive: a zoomable map of the whole codespace
 cargo run --example emoji_zoom     # interactive: a zoomable board of every RGI emoji
+cargo run --example editor         # interactive: a minimal notepad (rope-backed, dark mode)
 ```
 
 The first three are headless (render to a PNG). `unicode_zoom` opens a window: a
@@ -86,6 +87,13 @@ visible cells, skips glyphs below a minimum size (labels only), and stays
 razor-sharp at any zoom. Scroll to zoom, drag to pan, `R` to reset, `Esc` to quit;
 `-- --dump` writes PNG stills instead of opening a window. (Color emoji, a raster
 atlas, is the one thing that pixelates when magnified.)
+
+`editor` is the editor surface dogfooded: a rope-backed notepad (`ropey` +
+native open/save dialogs) where hit-testing, caret, selection and rendering all
+read one `ShapedHandle`, Left/Right step by shaped caret stops (a ZWJ emoji
+family is one step), wrap affinity is handled the way a real editor must, and
+identity-keyed shaping means typing on one line reshapes one line. `--font
+<family>` picks the face; Ctrl+wheel zooms; `-- --dump` writes a PNG.
 
 ## Status
 

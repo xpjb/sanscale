@@ -429,6 +429,32 @@ impl Layout {
     }
 
     /// Highlight rects for a byte range, one per covered line.
+    /// The caret stop after `byte_index` in document order, if any.
+    ///
+    /// Cluster-true Left/Right stepping for an editor: stops come from shaping,
+    /// so they can't land inside a ligature or a ZWJ emoji sequence the way
+    /// external grapheme segmentation can. At a hard paragraph break the last
+    /// stop of one line and the first of the next straddle the newline byte,
+    /// which is exactly the step an editor wants.
+    pub fn next_caret_stop(&self, byte_index: usize) -> Option<usize> {
+        self.lines
+            .iter()
+            .flat_map(|line| line.carets.iter())
+            .map(|caret| caret.byte_index)
+            .filter(|&byte| byte > byte_index)
+            .min()
+    }
+
+    /// The caret stop before `byte_index` in document order, if any.
+    pub fn prev_caret_stop(&self, byte_index: usize) -> Option<usize> {
+        self.lines
+            .iter()
+            .flat_map(|line| line.carets.iter())
+            .map(|caret| caret.byte_index)
+            .filter(|&byte| byte < byte_index)
+            .max()
+    }
+
     pub fn selection(&self, range: Range<usize>) -> Vec<SelectionSpan> {
         if range.is_empty() {
             return Vec::new();
