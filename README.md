@@ -69,6 +69,23 @@ text.draw(&device, &queue, &mut pass, block, Vec2::new(40.0, 80.0), 32.0,
     Color([0.10, 0.11, 0.13, 1.0]), None);
 ```
 
+### Font loading
+
+Sanscale accepts shared font bytes rather than owning font discovery. This keeps
+bundled fonts straightforward:
+
+```rust
+use std::sync::Arc;
+
+let font = text.map_font(Arc::new(include_bytes!("Inter-Regular.ttf")), 0)?;
+```
+
+A normal desktop application will often want family-name lookup and system-font
+fallback instead. Use [`fontdb`](https://crates.io/crates/fontdb) for discovery,
+then pass the selected face bytes and face index to `TextService::map_font`.
+The examples' [`font_chain`](examples/common/mod.rs) helper shows the complete
+`fontdb` path, including system-font loading and fallback-chain construction.
+
 ## Examples
 
 ```

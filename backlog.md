@@ -95,3 +95,17 @@ It stops being fine the moment line breaking is touched. The Knuth-Plass item in
 categorically more expensive, and there is no number it could regress against.
 Whoever picks that up should add a reflow scenario that defeats the cache *first*,
 and take a baseline before changing anything.
+
+---
+
+## Add a minimal live paragraph-invalidation example
+
+The README's quick start uses a static `ParagraphKey`, while `editor.rs` shows
+the complete document-scale pattern. There is no small example between them
+showing the common live-data case: keep `BlockKey` and the paragraph slot
+stable, increment `ParagraphKey::generation` only when that paragraph's text
+changes, then call `shape` again.
+
+This is documentation/example work, not a renderer feature. Add it when the
+primary onboarding path is next revised; do not duplicate the editor's rope and
+line-splicing machinery.

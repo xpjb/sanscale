@@ -1,8 +1,8 @@
 [package]
 name = "sanscale"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.85"
 description = "Resolution-independent GPU text rendering on wgpu via the Slug algorithm (analytic Bézier coverage)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xpjb/sanscale"
