@@ -32,7 +32,6 @@ pub struct TextAtlas {
 }
 
 impl TextAtlas {
-
     /// A minimal atlas with no glyphs yet. The service creates this when it first
     /// learns a target format — before any text exists — and the first `sync`
     /// sizes it to whatever the glyph cache actually holds.
@@ -521,7 +520,6 @@ pub struct EmojiAtlas {
 }
 
 impl EmojiAtlas {
-
     /// An emoji atlas at the cache's fixed width with no rows uploaded yet; the
     /// first `sync` fills it.
     pub(crate) fn empty(
@@ -569,7 +567,14 @@ impl EmojiAtlas {
         } else if let Some((from_row, to_row)) = cache.take_dirty() {
             // Steady state: re-upload only the rows that changed — this covers cells
             // recycled by eviction, which an append-only upload would miss.
-            upload_emoji_rows(queue, &self.texture, width, from_row, to_row, cache.pixels());
+            upload_emoji_rows(
+                queue,
+                &self.texture,
+                width,
+                from_row,
+                to_row,
+                cache.pixels(),
+            );
         }
         self.synced_revision = cache.revision();
     }

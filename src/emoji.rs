@@ -1,10 +1,9 @@
-//! Color-emoji (`COLR` v0/v1) support.
+//! Color-emoji support: `COLR` v0/v1 and PNG-backed CBDT/sbix strikes.
 //!
 //! Color glyphs can't go through the monochrome Slug path, so they're rasterized
-//! once (per size bucket) into an RGBA atlas and drawn as textured quads. The
-//! rasterizer walks the ttf-parser paint tree — one path for v0 and v1 — into
-//! tiny-skia: solid + linear/radial gradients, per-layer transforms, composite
-//! modes.
+//! once (per size bucket) into an RGBA atlas and drawn as textured quads. COLR
+//! paint trees render through tiny-skia; embedded bitmap strikes are decoded and
+//! scaled into the same cache.
 //!
 //! Caching mirrors [`GlyphCache`](crate::cache): the CPU side is **append-only**
 //! with a `revision` counter; the GPU side ([`EmojiAtlas`](crate::renderer)) uploads
@@ -360,9 +359,9 @@ fn rasterize(face: &RustyFace, glyph_id: u16, size: u32) -> Option<Vec<u8>> {
 }
 
 /// Rasterize a bitmap color glyph (CBDT/sbix) into a `size`×`size` premultiplied-RGBA
-/// buffer. The embedded strike is always PNG per the OpenType spec; we decode it,
-/// aspect-fit it into the bucket square (centered), and premultiply. `None` if the
-/// glyph has no strike or the PNG can't be decoded. Fixed-resolution strikes go soft
+/// buffer. PNG-backed strikes are decoded, aspect-fitted into the bucket square,
+/// and premultiplied. `None` if the glyph has no supported strike or decoding fails.
+/// Fixed-resolution strikes go soft
 /// under deep zoom — acceptable for the "user sees the right thing" bar.
 fn rasterize_bitmap(face: &RustyFace, gid: GlyphId, size: u32) -> Option<Vec<u8>> {
     let img = face.glyph_raster_image(gid, size as u16)?;
@@ -403,7 +402,12 @@ fn rasterize_bitmap(face: &RustyFace, gid: GlyphId, size: u32) -> Option<Vec<u8>
 /// Decode a PNG into straight-alpha RGBA8 `(width, height, pixels)`. Handles the
 /// 8-bit RGBA / RGB / grayscale(+alpha) strikes emoji fonts ship; other formats bail.
 fn decode_png_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let mut reader = png::Decoder::new(data).read_info().ok()?;
+    let mut decoder = png::Decoder::new(data);
+    // Noto Color Emoji uses indexed PNG strikes. Expand palettes and tRNS into
+    // ordinary RGB/RGBA so the conversion below handles them like any other
+    // embedded image.
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).ok()?;
     if info.bit_depth != png::BitDepth::Eight {
@@ -565,7 +569,12 @@ impl BBoxPainter<'_> {
 impl<'a> Painter<'a> for BBoxPainter<'a> {
     fn outline_glyph(&mut self, glyph_id: GlyphId) {
         if let Some(r) = self.face.glyph_bounding_box(glyph_id) {
-            self.union_rect(r.x_min as f32, r.y_min as f32, r.x_max as f32, r.y_max as f32);
+            self.union_rect(
+                r.x_min as f32,
+                r.y_min as f32,
+                r.x_max as f32,
+                r.y_max as f32,
+            );
         }
     }
     fn paint(&mut self, _: Paint<'a>) {}
@@ -662,8 +671,13 @@ impl<'a, 'b> Painter<'a> for EmojiPainter<'a, 'b> {
             ..Default::default()
         };
         sk.anti_alias = true;
-        self.pm
-            .fill_path(&dev_path, &sk, FillRule::Winding, SkTransform::identity(), None);
+        self.pm.fill_path(
+            &dev_path,
+            &sk,
+            FillRule::Winding,
+            SkTransform::identity(),
+            None,
+        );
         self.painted = true;
     }
     fn push_clip(&mut self) {}
@@ -692,6 +706,24 @@ impl<'a, 'b> Painter<'a> for EmojiPainter<'a, 'b> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_png_strikes_expand_to_rgba() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 1, 1);
+            encoder.set_color(png::ColorType::Indexed);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_palette(vec![10, 20, 30]);
+            encoder.set_trns(vec![128]);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0]).unwrap();
+        }
+
+        let (width, height, rgba) = decode_png_rgba(&encoded).unwrap();
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(rgba, [10, 20, 30, 128]);
+    }
 
     /// Place-or-touch a synthetic glyph without a font, mirroring `get_or_insert`'s
     /// bookkeeping (the hit path bumps recency; the miss path allocates a cell).
@@ -733,7 +765,11 @@ mod tests {
 
         c.begin_frame();
         let reused = put(&mut c, 100, 256).expect("8th glyph recycles a cell");
-        assert_eq!(c.size().1, 256 + ATLAS_PAD, "atlas did not grow past its cap");
+        assert_eq!(
+            c.size().1,
+            256 + ATLAS_PAD,
+            "atlas did not grow past its cap"
+        );
         assert_eq!(c.epoch(), 1, "exactly one cell recycled");
         assert_eq!(c.dropped_glyphs(), 0);
         // The recycled cell's rows are dirty so the GPU re-uploads them.
@@ -755,7 +791,10 @@ mod tests {
         c.begin_frame();
         put(&mut c, 50, 256).expect("insert recycles a cell");
         assert!(!c.slots.contains_key(&(0, 0, 256)), "LRU glyph 0 evicted");
-        assert!(c.slots.contains_key(&(0, 3, 256)), "touched glyph 3 survives");
+        assert!(
+            c.slots.contains_key(&(0, 3, 256)),
+            "touched glyph 3 survives"
+        );
         assert!(c.slots.contains_key(&(0, 50, 256)), "new glyph is present");
     }
 

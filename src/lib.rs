@@ -1,8 +1,9 @@
 //! Resolution-independent GPU text rendering, via the Slug algorithm
 //! (Lengyel, 2017): glyph outlines are stored as quadratic Bézier curves and
 //! band tables, and coverage is computed analytically in the fragment shader.
-//! There is no glyph bitmap and no hinting, so text is exact at any scale — zoom
-//! is free, and rotated or perspective text is as sharp as upright text.
+//! Monochrome text has no glyph bitmap and no hinting, so it is exact at any
+//! scale — zoom is free, and rotated or perspective text is as sharp as upright
+//! text. Color emoji use a separate raster atlas.
 //!
 //! # The model
 //!
@@ -71,7 +72,7 @@
 //! - **wgpu 30** — [`TextService::draw`] borrows `wgpu::Device`, `Queue` and
 //!   `RenderPass` directly, so your application must use the same wgpu major
 //!   version. Bumping it here is a breaking change.
-//! - **MSRV: Rust 1.82.**
+//! - **MSRV: Rust 1.87.**
 
 mod bands;
 mod cache;
@@ -85,12 +86,11 @@ mod renderer;
 mod text;
 mod vertex;
 
-pub use font::{read_font_file, FontMetrics};
+pub use font::{FontMetrics, read_font_file};
 
 pub use text::{
     Align, Batch, BlockKey, Boundaries, Caret, CaretRect, CaretStop, Color, Diagnostics, Draw,
-    FontChainHandle, FontData,
-    FontError, FontHandle, Layout, LayoutLineSpec, LineMetrics, Motion, ParagraphKey,
-    ParagraphSource, Paragraphs, Rect, Segment, SelectionSpan, ShapedHandle, Style, TextService,
-    Vec2,
+    FontChainHandle, FontData, FontError, FontHandle, Layout, LayoutLineSpec, LineMetrics, Motion,
+    ParagraphKey, ParagraphSource, Paragraphs, Rect, Segment, SelectionSpan, ShapedHandle, Style,
+    TextService, Vec2,
 };

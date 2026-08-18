@@ -2,14 +2,14 @@
 name = "sanscale"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 description = "Resolution-independent GPU text rendering on wgpu via the Slug algorithm (analytic Bézier coverage)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xpjb/sanscale"
 readme = "README.md"
 keywords = ["font", "text", "gpu", "wgpu", "slug"]
 categories = ["graphics", "rendering", "text-processing"]
-exclude = ["/report", "/.github"]
+exclude = ["/report", "/.github", "/gallery", "/scripts"]
 
 [lib]
 path = "src/lib.rs"
@@ -24,7 +24,7 @@ half = { version = "2", features = ["bytemuck"] }
 unicode-segmentation = "1.12"
 # Color-emoji (COLR v0/v1) rasterizer for the emoji atlas. Pure Rust, no C deps.
 tiny-skia = "0.11"
-# Decode CBDT/sbix bitmap-emoji strikes (always PNG per the OpenType spec).
+# Decode PNG-backed CBDT/sbix bitmap-emoji strikes.
 png = "0.17"
 # Warn (once) when an atlas hits its cap — overflow must never be silent.
 log = "0.4"

@@ -2,10 +2,10 @@
 
 **Resolution-independent GPU text rendering for [wgpu](https://wgpu.rs).**
 
-sanscale draws each glyph directly from its quadratic Bézier outline with
-analytic per-pixel coverage — Eric Lengyel's [Slug](https://sluglibrary.com)
-algorithm. There is no glyph bitmap and no signed-distance field, so text stays
-razor-sharp at any zoom without ever re-rasterizing an atlas.
+sanscale draws monochrome glyphs directly from their quadratic Bézier outlines
+with Eric Lengyel's [Slug](https://sluglibrary.com) algorithm. Analytic
+per-pixel coverage replaces bitmaps and signed-distance fields, so text stays
+sharp at any zoom. Color emoji use a separate raster atlas.
 
 ```toml
 [dependencies]
@@ -28,7 +28,7 @@ sanscale = { git = "https://github.com/xpjb/sanscale" }
   the same machinery plus a drop.
 - **Real shaping** via [rustybuzz](https://crates.io/crates/rustybuzz), script
   itemization, and multi-font **fallback chains**.
-- **Color emoji** (COLR v0/v1) through a rasterized side atlas.
+- **Color emoji** (COLR v0/v1 and PNG-backed CBDT/sbix) through a rasterized side atlas.
 - **Layout**: line wrapping, left/center/right alignment, multi-paragraph runs.
 - **Editor geometry**: measurement, hit-testing, selection rectangles, and a
   typed caret with library-resolved motions (`caret_move`: cluster-true
@@ -86,18 +86,29 @@ then pass the selected face bytes and face index to `TextService::map_font`.
 The examples' [`font_chain`](examples/common/mod.rs) helper shows the complete
 `fontdb` path, including system-font loading and fallback-chain construction.
 
+On `wasm32-unknown-unknown`, `fontdb::load_system_fonts()` is a no-op because
+browsers do not expose system font files. Bundle or fetch fonts and pass their
+bytes to `map_font` instead.
+
 ## Examples
 
-```
-cargo run --example hello_png      # one line of text             -> hello.png
-cargo run --example paragraph      # wrapping, alignment, sizes   -> paragraph.png
-cargo run --example unicode        # color emoji + CJK + 12 scripts via fallback -> unicode.png
-cargo run --example unicode_zoom   # interactive: a zoomable map of the whole codespace
-cargo run --example emoji_zoom     # interactive: a zoomable board of every RGI emoji
-cargo run --example editor         # interactive: a minimal notepad (rope-backed, dark mode)
-```
+Run an example with `cargo run --example <name>`. The first three are headless;
+for the interactive examples, append `-- --dump` to render the preview frame
+without opening a window.
 
-The first three are headless (render to a PNG). `unicode_zoom` opens a window: a
+| preview | example / focus |
+|---|---|
+| [![Hello](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/hello.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/hello.png) | [`hello_png`](examples/hello_png.rs)<br>Minimal map → shape → draw path |
+| [![Paragraph](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/paragraph.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/paragraph.png) | [`paragraph`](examples/paragraph.rs)<br>Wrapping, alignment, measurement, and multi-paragraph blocks |
+| [![Unicode](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode.png) | [`unicode`](examples/unicode.rs)<br>CJK, Indic, RTL scripts, symbols, and color emoji through one fallback chain |
+| [![Unicode zoom](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode_zoom.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode_zoom.png) | [`unicode_zoom`](examples/unicode_zoom.rs)<br>Zoomable, lazily populated map of Unicode planes 0–2 |
+| [![Emoji zoom](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/emoji_zoom.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/emoji_zoom.png) | [`emoji_zoom`](examples/emoji_zoom.rs)<br>Every RGI emoji sequence, grouped like a picker |
+| [![Editor](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/editor.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/editor.png) | [`editor`](examples/editor.rs)<br>Rope-backed notepad dogfooding caret, selection, hit-testing, and invalidation |
+
+Regenerate every committed preview with `scripts/update-gallery.sh`; broad
+Latin, CJK, Indic, symbol, and color-emoji system fonts are required.
+
+`unicode_zoom` opens a window: a
 Unifont-style 256-column map of the entire Unicode codespace — code point =
 `row*256 + col`, a glyph where some font covers it and a tofu box where none does,
 block labels down the side. It never enumerates up front; each frame culls to the

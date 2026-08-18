@@ -64,7 +64,6 @@ impl GlyphOutlines {
         }
         (min_x, min_y, max_x, max_y)
     }
-
 }
 
 pub(crate) struct OutlineCollector {

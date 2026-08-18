@@ -6,11 +6,11 @@
 //! within the chain, so two chains sharing a face (typically the emoji font) key
 //! into one glyph cache entry instead of two.
 
-use rustybuzz::{shape, UnicodeBuffer};
+use rustybuzz::{UnicodeBuffer, shape};
 use ttf_parser::GlyphId;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::bands::{process_bands_with, BandsScratch};
+use crate::bands::{BandsScratch, process_bands_with};
 use crate::cache::{GlyphCache, GlyphInfo};
 use crate::font::Font;
 
@@ -208,11 +208,7 @@ fn itemize<'a>(chain: &[ChainFont<'_>], text: &'a str) -> Vec<(usize, &'a str, u
 /// Shape `text` across the fallback chain, ensuring every non-color glyph is
 /// populated in `cache` (keyed by `(font_id, glyph_id)`). Pen positions are
 /// em-space starting at the origin; clusters are byte offsets into `text`.
-pub(crate) fn shape_text(
-    chain: &[ChainFont<'_>],
-    cache: &mut GlyphCache,
-    text: &str,
-) -> ShapedRun {
+pub(crate) fn shape_text(chain: &[ChainFont<'_>], cache: &mut GlyphCache, text: &str) -> ShapedRun {
     if chain.is_empty() {
         return ShapedRun::default();
     }
@@ -283,9 +279,12 @@ mod tests {
         std::path::Path::new(p).exists()
     }
     fn latin_path() -> Option<&'static str> {
-        ["C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\arial.ttf"]
-            .into_iter()
-            .find(|p| exists(p))
+        [
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+        ]
+        .into_iter()
+        .find(|p| exists(p))
     }
     fn cjk_path() -> Option<&'static str> {
         [
@@ -309,10 +308,7 @@ mod tests {
         fonts
             .iter()
             .enumerate()
-            .map(|(i, font)| ChainFont {
-                id: i as u16,
-                font,
-            })
+            .map(|(i, font)| ChainFont { id: i as u16, font })
             .collect()
     }
 

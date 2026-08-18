@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{unicode_sections, Harness, UNICODE_FALLBACK};
+use common::{Harness, UNICODE_FALLBACK, unicode_sections};
 use sanscale::{Align, Color, ShapedHandle, Style, TextService, Vec2};
 
 fn main() {

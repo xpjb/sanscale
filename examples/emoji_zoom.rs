@@ -17,9 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{Mat4, Vec2, Vec3};
-use sanscale::{
-    Align, Draw, FontChainHandle, ShapedHandle, Style, TextService,
-};
+use sanscale::{Align, Draw, FontChainHandle, ShapedHandle, Style, TextService};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -28,7 +26,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use common::emoji_data::GROUPS;
-use common::{copy_to_clipboard, font_chain, Hover, UNICODE_FALLBACK};
+use common::{Hover, UNICODE_FALLBACK, copy_to_clipboard, font_chain};
 
 const COLS: usize = 40; // emoji per row
 const CELL_W: f32 = 44.0;
@@ -47,7 +45,9 @@ fn main() {
         dump();
         return;
     }
-    println!("scroll = zoom · drag = pan · left-click = copy emoji · right-click = copy code points · R = reset · Esc = quit");
+    println!(
+        "scroll = zoom · drag = pan · left-click = copy emoji · right-click = copy code points · R = reset · Esc = quit"
+    );
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App::default()).unwrap();
@@ -57,7 +57,8 @@ fn ortho(w: f32, h: f32) -> Mat4 {
     Mat4::orthographic_rh(0.0, w, h, 0.0, -1.0, 1.0)
 }
 fn model(offset: Vec2, scale: f32) -> Mat4 {
-    Mat4::from_translation(Vec3::new(offset.x, offset.y, 0.0)) * Mat4::from_scale(Vec3::splat(scale))
+    Mat4::from_translation(Vec3::new(offset.x, offset.y, 0.0))
+        * Mat4::from_scale(Vec3::splat(scale))
 }
 /// The replacement box drawn for a sequence the fonts can't ligate.
 const TOFU_BOX: &str = "\u{25A1}";
@@ -93,12 +94,21 @@ fn build_layout() -> Vec<RowLayout> {
         for ri in 0..rows {
             let mut cells = Vec::new();
             for ci in 0..COLS {
-                let Some(&(emoji, name)) = items.get(ri * COLS + ci) else { break };
+                let Some(&(emoji, name)) = items.get(ri * COLS + ci) else {
+                    break;
+                };
                 // The cell's origin. Centring within it is done at placement time,
                 // off the shaped block's measured box.
-                cells.push(Cell { x: GUTTER_W + ci as f32 * CELL_W, emoji, name });
+                cells.push(Cell {
+                    x: GUTTER_W + ci as f32 * CELL_W,
+                    emoji,
+                    name,
+                });
             }
-            layout.push(RowLayout { cells, title: (ri == 0).then_some(group) });
+            layout.push(RowLayout {
+                cells,
+                title: (ri == 0).then_some(group),
+            });
         }
     }
     layout
@@ -137,7 +147,12 @@ impl Viewer {
     }
 
     fn style(&self) -> Style {
-        Style { chain: self.chain, wrap_em: None, align: Align::Left, line_spacing: 1.0 }
+        Style {
+            chain: self.chain,
+            wrap_em: None,
+            align: Align::Left,
+            line_spacing: 1.0,
+        }
     }
 
     /// Shape and cache one row's emoji (each cell may be a multi-code-point
@@ -192,7 +207,12 @@ impl Viewer {
                     x + (CELL_W - size) * 0.5,
                     y + inset + size - baseline_em * size,
                 );
-                cells.push(PlacedCell { glyph, at, size, color });
+                cells.push(PlacedCell {
+                    glyph,
+                    at,
+                    size,
+                    color,
+                });
             }
         }
         self.rows.insert(r, cells);
@@ -270,8 +290,8 @@ impl Viewer {
     ) {
         let inv = 1.0 / scale;
         let r0 = ((((0.0 - offset.y) * inv) / CELL_H).floor() as i64).max(0);
-        let r1 = ((((h - offset.y) * inv) / CELL_H).floor() as i64)
-            .min(self.layout.len() as i64 - 1);
+        let r1 =
+            ((((h - offset.y) * inv) / CELL_H).floor() as i64).min(self.layout.len() as i64 - 1);
         let mut cells: Vec<PlacedCell> = Vec::new();
         for r in r0..=r1 {
             self.build_row(r);
@@ -370,7 +390,10 @@ fn device_descriptor(max_texture_dimension_2d: u32) -> wgpu::DeviceDescriptor<'s
     wgpu::DeviceDescriptor {
         label: Some("emoji_zoom"),
         required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits { max_texture_dimension_2d, ..Default::default() },
+        required_limits: wgpu::Limits {
+            max_texture_dimension_2d,
+            ..Default::default()
+        },
         memory_hints: wgpu::MemoryHints::default(),
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         trace: wgpu::Trace::Off,
@@ -494,11 +517,21 @@ impl Gfx {
             })
             .await
             .expect("adapter");
-        let (device, queue) = adapter.request_device(&device_descriptor(adapter.limits().max_texture_dimension_2d)).await.expect("device");
+        let (device, queue) = adapter
+            .request_device(&device_descriptor(
+                adapter.limits().max_texture_dimension_2d,
+            ))
+            .await
+            .expect("device");
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -554,7 +587,9 @@ impl Gfx {
     }
 
     fn on_click(&mut self, button: MouseButton) {
-        let Some(h) = self.viewer.hovered(self.cursor, self.offset, self.scale) else { return };
+        let Some(h) = self.viewer.hovered(self.cursor, self.offset, self.scale) else {
+            return;
+        };
         let s = match button {
             MouseButton::Left => h.text,
             MouseButton::Right => h.code,
@@ -592,7 +627,8 @@ impl Gfx {
 
     fn draw(&mut self) {
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.viewer.device, &self.config);
                 return;
@@ -634,7 +670,8 @@ impl Gfx {
 
         let now = Instant::now();
         self.samples.push((now, cost));
-        self.samples.retain(|(t, _)| now.duration_since(*t).as_secs_f32() < 5.0);
+        self.samples
+            .retain(|(t, _)| now.duration_since(*t).as_secs_f32() < 5.0);
         self.window.request_redraw();
     }
 }
@@ -672,24 +709,58 @@ fn dump() {
             })
             .await
             .expect("adapter");
-        adapter.request_device(&device_descriptor(adapter.limits().max_texture_dimension_2d)).await.expect("device")
+        adapter
+            .request_device(&device_descriptor(
+                adapter.limits().max_texture_dimension_2d,
+            ))
+            .await
+            .expect("device")
     });
     let mut viewer = Viewer::new(device, queue, &dummy_config());
-    println!("{} emoji in {} rows", GROUPS.iter().map(|(_, e)| e.len()).sum::<usize>(), viewer.layout.len());
+    println!(
+        "{} emoji in {} rows",
+        GROUPS.iter().map(|(_, e)| e.len()).sum::<usize>(),
+        viewer.layout.len()
+    );
 
     // Top of the board (Smileys & Emotion) at a readable zoom.
-    dump_png(&mut viewer, 1450, 920, Vec2::new(10.0, 16.0), 0.95, "emoji_board.png");
+    dump_png(
+        &mut viewer,
+        1450,
+        920,
+        Vec2::new(10.0, 16.0),
+        0.95,
+        "emoji_board.png",
+    );
 
     // Deep zoom on a few cells — big, crisp raster emoji.
-    dump_png(&mut viewer, 1000, 620, Vec2::new(10.0 - GUTTER_W * 3.0, 16.0), 3.0, "emoji_board_zoom.png");
+    dump_png(
+        &mut viewer,
+        1000,
+        620,
+        Vec2::new(10.0 - GUTTER_W * 3.0, 16.0),
+        3.0,
+        "emoji_board_zoom.png",
+    );
 
     // Pan the whole board a viewport at a time (each render() is a frame), filling the
     // bounded atlas and forcing cross-frame eviction, then dump the Flags category — the
     // regression the eviction work fixes (flags used to vanish after enough panning).
     sweep_board(&mut viewer, 920, 0.95);
-    let flags_row = viewer.layout.iter().position(|r| r.title == Some("Flags")).unwrap();
+    let flags_row = viewer
+        .layout
+        .iter()
+        .position(|r| r.title == Some("Flags"))
+        .unwrap();
     let flags_y = 16.0 - flags_row as f32 * CELL_H * 0.95;
-    dump_png(&mut viewer, 1450, 920, Vec2::new(10.0, flags_y), 0.95, "emoji_flags.png");
+    dump_png(
+        &mut viewer,
+        1450,
+        920,
+        Vec2::new(10.0, flags_y),
+        0.95,
+        "emoji_flags.png",
+    );
 
     let (_, _, (aw, ah)) = viewer.text.diagnostics().atlas_sizes();
     println!(
@@ -704,7 +775,11 @@ fn dump() {
 fn sweep_board(viewer: &mut Viewer, vh: u32, scale: f32) {
     let target = viewer.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("sweep"),
-        size: wgpu::Extent3d { width: 1450, height: vh, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: 1450,
+            height: vh,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -715,7 +790,14 @@ fn sweep_board(viewer: &mut Viewer, vh: u32, scale: f32) {
     let view = target.create_view(&Default::default());
     let mut y = 0.0;
     while y > -(viewer.world_h * scale) {
-        viewer.render(&view, 1450.0, vh as f32, Vec2::new(10.0, 16.0 + y), scale, None);
+        viewer.render(
+            &view,
+            1450.0,
+            vh as f32,
+            Vec2::new(10.0, 16.0 + y),
+            scale,
+            None,
+        );
         y -= vh as f32;
     }
 }
@@ -737,7 +819,11 @@ fn dummy_config() -> wgpu::SurfaceConfiguration {
 fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path: &str) {
     let target = viewer.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("dump"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -749,8 +835,8 @@ fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path:
     viewer.render(&view, w as f32, h as f32, offset, scale, None);
 
     let unpadded = w * 4;
-    let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded =
+        unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let readback = viewer.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: (padded * h) as u64,
@@ -773,12 +859,19 @@ fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path:
                 rows_per_image: Some(h),
             },
         },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
     );
     viewer.queue.submit([enc.finish()]);
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    viewer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    viewer
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
     let data = slice.get_mapped_range().unwrap();
     let mut pixels = Vec::with_capacity((unpadded * h) as usize);
     for row in 0..h {

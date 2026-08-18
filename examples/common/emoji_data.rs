@@ -2,6 +2,7 @@
 //! picker order, grouped by category. Generated — do not edit by hand.
 
 /// (category, [(emoji, name)]).
+#[rustfmt::skip]
 pub const GROUPS: &[(&str, &[(&str, &str)])] = &[
     ("Smileys & Emotion", &[
         ("😀", "grinning face"),

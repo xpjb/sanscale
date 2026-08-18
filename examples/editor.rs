@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use ropey::Rope;
 use sanscale::{
-    Align, BlockKey, Boundaries, Caret, Color, Layout, Motion, ParagraphKey, ParagraphSource,
-    Rect, ShapedHandle, Style, TextService, Vec2,
+    Align, BlockKey, Boundaries, Caret, Color, Layout, Motion, ParagraphKey, ParagraphSource, Rect,
+    ShapedHandle, Style, TextService, Vec2,
 };
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -49,7 +49,12 @@ use winit::window::{Window, WindowId};
 use common::font_chain;
 
 // Dark mode. Linear-space colors, matching the service's `Color`.
-const BG: wgpu::Color = wgpu::Color { r: 0.011, g: 0.012, b: 0.014, a: 1.0 };
+const BG: wgpu::Color = wgpu::Color {
+    r: 0.011,
+    g: 0.012,
+    b: 0.014,
+    a: 1.0,
+};
 const FG: [f32; 4] = [0.83, 0.85, 0.88, 1.0];
 const STATUS_FG: [f32; 4] = [0.45, 0.48, 0.54, 1.0];
 const STATUS_BG: [f32; 4] = [0.028, 0.030, 0.036, 1.0];
@@ -63,9 +68,18 @@ const PAGE_LINES: usize = 20;
 /// Mono first (the notepad default), then emoji + broad fallback so pasted
 /// CJK or emoji render instead of boxing. `--font` prepends a family.
 const MONO_CHAIN: &[&str] = &[
-    "Cascadia Mono", "Consolas", "Menlo", "DejaVu Sans Mono", "Courier New",
-    "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji",
-    "Segoe UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans",
+    "Cascadia Mono",
+    "Consolas",
+    "Menlo",
+    "DejaVu Sans Mono",
+    "Courier New",
+    "Segoe UI Emoji",
+    "Apple Color Emoji",
+    "Noto Color Emoji",
+    "Segoe UI",
+    "Microsoft YaHei",
+    "Noto Sans CJK SC",
+    "Noto Sans",
 ];
 
 fn main() {
@@ -89,7 +103,11 @@ fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop
-        .run_app(&mut App { gfx: None, font, path })
+        .run_app(&mut App {
+            gfx: None,
+            font,
+            path,
+        })
         .unwrap();
 }
 
@@ -158,7 +176,11 @@ impl Doc {
     fn keys(&self) -> Vec<ParagraphKey> {
         self.lines
             .iter()
-            .map(|&(slot, generation)| ParagraphKey { namespace: 1, slot, generation })
+            .map(|&(slot, generation)| ParagraphKey {
+                namespace: 1,
+                slot,
+                generation,
+            })
             .collect()
     }
 
@@ -224,7 +246,10 @@ impl Editor {
     fn new(doc: Doc) -> Self {
         Self {
             doc,
-            caret: Caret { byte_index: 0, line_index: 0 },
+            caret: Caret {
+                byte_index: 0,
+                line_index: 0,
+            },
             anchor: None,
             goal: None,
             scroll_y: 0.0,
@@ -410,8 +435,16 @@ impl RectPainter {
             immediate_size: 0,
         });
         let attrs = [
-            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-            wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 8,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("rects"),
@@ -445,19 +478,24 @@ impl RectPainter {
             multiview_mask: None,
             cache: None,
         });
-        Self { pipeline, verts: Vec::new() }
+        Self {
+            pipeline,
+            verts: Vec::new(),
+        }
     }
 
     fn push(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], screen: Vec2) {
-        let ndc = |px: f32, py: f32| {
-            [px / screen.x * 2.0 - 1.0, 1.0 - py / screen.y * 2.0]
-        };
+        let ndc = |px: f32, py: f32| [px / screen.x * 2.0 - 1.0, 1.0 - py / screen.y * 2.0];
         let [x0, y0] = ndc(x, y);
         let [x1, y1] = ndc(x + w, y + h);
         let v = |x: f32, y: f32| [x, y, color[0], color[1], color[2], color[3]];
         self.verts.extend([
-            v(x0, y0), v(x1, y0), v(x1, y1),
-            v(x0, y0), v(x1, y1), v(x0, y1),
+            v(x0, y0),
+            v(x1, y0),
+            v(x1, y1),
+            v(x0, y0),
+            v(x1, y1),
+            v(x0, y1),
         ]);
     }
 
@@ -522,7 +560,14 @@ fn render_frame(
             }
         }
     }
-    rects.push(0.0, screen.y - STATUS_H, screen.x, STATUS_H, STATUS_BG, screen);
+    rects.push(
+        0.0,
+        screen.y - STATUS_H,
+        screen.x,
+        STATUS_H,
+        STATUS_BG,
+        screen,
+    );
     rects.flush(device, pass);
 
     text.draw(
@@ -581,15 +626,17 @@ fn render_frame(
         let placed = layout.clamp_caret(editor.caret);
         let line = Some(placed.line_index);
         let caret = layout.caret_rect_on_line(line, placed.byte_index);
-        let height = if caret.height_em > 0.0 { caret.height_em } else { 1.2 };
+        let height = if caret.height_em > 0.0 {
+            caret.height_em
+        } else {
+            1.2
+        };
         if editor.caret_block {
             let width_em = line
                 .and_then(|l| layout.line_range(l))
                 .zip(layout.next_caret_stop(placed.byte_index))
                 .filter(|(range, next)| *next <= range.end)
-                .map(|(_, next)| {
-                    (layout.caret_rect_on_line(line, next).x_em - caret.x_em).abs()
-                })
+                .map(|(_, next)| (layout.caret_rect_on_line(line, next).x_em - caret.x_em).abs())
                 .filter(|w| *w > 0.05)
                 .unwrap_or(0.55);
             let mut color = CARET;
@@ -614,7 +661,9 @@ fn render_frame(
         }
     }
     rects.flush(device, pass);
-    Frame { handle: Some(handle) }
+    Frame {
+        handle: Some(handle),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -679,7 +728,11 @@ impl ApplicationHandler for App {
                 }
                 gfx.window.request_redraw();
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
                 ElementState::Pressed => {
                     let now = Instant::now();
                     let count = match gfx.last_click {
@@ -783,7 +836,12 @@ impl Gfx {
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -888,8 +946,12 @@ impl Gfx {
     /// Double-click word selection: the library composes the same `Boundaries`
     /// the word motions use ([`Layout::select_word_at`]).
     fn select_word_at_cursor(&mut self) {
-        let Some(hit) = self.hit_at_cursor() else { return };
-        let Some(handle) = self.last_handle else { return };
+        let Some(hit) = self.hit_at_cursor() else {
+            return;
+        };
+        let Some(handle) = self.last_handle else {
+            return;
+        };
         let layout = self.text.measure(handle);
         let range = layout.select_word_at(hit.byte_index, &self.editor.doc);
         self.select_range(range);
@@ -898,15 +960,21 @@ impl Gfx {
     /// Triple-click paragraph selection — pure geometry, hard break to hard
     /// break ([`Layout::select_paragraph_at`]).
     fn select_paragraph_at_cursor(&mut self) {
-        let Some(hit) = self.hit_at_cursor() else { return };
-        let Some(handle) = self.last_handle else { return };
+        let Some(hit) = self.hit_at_cursor() else {
+            return;
+        };
+        let Some(handle) = self.last_handle else {
+            return;
+        };
         let layout = self.text.measure(handle);
         let range = layout.select_paragraph_at(hit.byte_index);
         self.select_range(range);
     }
 
     fn select_range(&mut self, range: std::ops::Range<usize>) {
-        let Some(handle) = self.last_handle else { return };
+        let Some(handle) = self.last_handle else {
+            return;
+        };
         let layout = self.text.measure(handle);
         let caret = layout.caret_at(range.end);
         self.last_input = Instant::now();
@@ -922,7 +990,9 @@ impl Gfx {
         self.blink_phase = 0;
         let ctrl = self.mods.control_key();
         let shift = self.mods.shift_key();
-        let Some(handle) = self.last_handle else { return };
+        let Some(handle) = self.last_handle else {
+            return;
+        };
         // The borrow dance every consumer does: clone nothing, take the layout
         // queries you need while `&self.text` is shared, mutate after.
         let editor = &mut self.editor;
@@ -931,8 +1001,12 @@ impl Gfx {
 
         let mut edited = true;
         match event.logical_key {
-            Key::Named(NamedKey::ArrowLeft) if ctrl => editor.motion(layout, Motion::WordLeft, shift),
-            Key::Named(NamedKey::ArrowRight) if ctrl => editor.motion(layout, Motion::WordRight, shift),
+            Key::Named(NamedKey::ArrowLeft) if ctrl => {
+                editor.motion(layout, Motion::WordLeft, shift)
+            }
+            Key::Named(NamedKey::ArrowRight) if ctrl => {
+                editor.motion(layout, Motion::WordRight, shift)
+            }
             Key::Named(NamedKey::ArrowLeft) => editor.motion(layout, Motion::Left, shift),
             Key::Named(NamedKey::ArrowRight) => editor.motion(layout, Motion::Right, shift),
             Key::Named(NamedKey::ArrowUp) => editor.motion(layout, Motion::Up, shift),
@@ -941,7 +1015,9 @@ impl Gfx {
             Key::Named(NamedKey::End) if ctrl => editor.motion(layout, Motion::DocEnd, shift),
             Key::Named(NamedKey::Home) => editor.motion(layout, Motion::Home, shift),
             Key::Named(NamedKey::End) => editor.motion(layout, Motion::End, shift),
-            Key::Named(NamedKey::PageUp) => editor.motion(layout, Motion::PageUp(PAGE_LINES), shift),
+            Key::Named(NamedKey::PageUp) => {
+                editor.motion(layout, Motion::PageUp(PAGE_LINES), shift)
+            }
             Key::Named(NamedKey::PageDown) => {
                 editor.motion(layout, Motion::PageDown(PAGE_LINES), shift)
             }
@@ -1002,7 +1078,10 @@ impl Gfx {
             // coexist — the same shape compendium's port proved out.
             let keys = self.editor.doc.keys();
             let style = self.style();
-            if let Some(handle) = self.text.shape(BlockKey(1), &style, &keys, &self.editor.doc) {
+            if let Some(handle) = self
+                .text
+                .shape(BlockKey(1), &style, &keys, &self.editor.doc)
+            {
                 self.last_handle = Some(handle);
                 let view_h = self.config.height as f32;
                 let layout = self.text.measure(handle);
@@ -1051,7 +1130,8 @@ impl Gfx {
 
     fn draw(&mut self) {
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 return;
@@ -1086,8 +1166,7 @@ impl Gfx {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let caret_visible =
-                (self.last_input.elapsed().as_millis() as u64 / BLINK_MS) % 2 == 0;
+            let caret_visible = (self.last_input.elapsed().as_millis() as u64 / BLINK_MS) & 1 == 0;
             let result = render_frame(
                 &mut self.text,
                 &mut self.rects,
@@ -1134,7 +1213,10 @@ fn dump_png(font: Option<&str>) {
     let start = DUMP_TEXT.find("a notepad").unwrap();
     let end = DUMP_TEXT.find("disagree").unwrap();
     editor.anchor = Some(start);
-    editor.caret = Caret { byte_index: end, line_index: usize::MAX }; // clamped at render
+    editor.caret = Caret {
+        byte_index: end,
+        line_index: usize::MAX,
+    }; // clamped at render
     let style = Style {
         chain,
         wrap_em: Some((900.0 - 2.0 * MARGIN) / editor.font_px),

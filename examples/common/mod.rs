@@ -36,33 +36,48 @@ pub const FONT_CANDIDATES: &[&str] = &[
 /// symbols. Families absent on this OS are skipped, so the same list works across
 /// platforms — the emoji/CJK samples simply need *some* covering face installed.
 ///
-/// Color emoji fonts are placed **near the front** so that codepoints a text font
-/// would also cover (☺ ❤ ✈ ★ …) resolve to the color face rather than a mono text
-/// glyph. The primary Latin font still precedes them so ASCII digits/letters stay
-/// text (emoji fonts also map 0-9 # * for keycap sequences). Note: this is a
-/// coarse fix — there is no Unicode emoji-presentation / VS16 handling yet, so
-/// text-default symbols the primary font covers can still come out monochrome.
+/// Keep a Latin face first for line metrics and whitespace: emoji fonts also map
+/// keycap characters and make poor primary faces. Presentation-aware fallback
+/// still selects a later color face for emoji-default code points and VS16.
 pub const UNICODE_FALLBACK: &[&str] = &[
-    // Primary Latin first (keeps digits/letters as text).
+    // Primary Latin candidates (keeps line metrics, spaces, digits, and letters text).
     "Segoe UI",
-    // Color emoji, high priority. Twemoji (COLR) is a fallback for sequences the
-    // platform emoji font can't form — notably flags, which Segoe UI Emoji omits.
-    "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", "Twemoji Mozilla",
-    // More Latin.
-    "Helvetica Neue", "Arial", "Noto Sans", "DejaVu Sans",
+    "Helvetica Neue",
+    "Arial",
+    "Noto Sans",
+    "DejaVu Sans",
+    // Color emoji. Twemoji (COLR) is a fallback for sequences the platform emoji
+    // font can't form — notably flags, which Segoe UI Emoji omits.
+    "Segoe UI Emoji",
+    "Apple Color Emoji",
+    "Noto Color Emoji",
+    "Twemoji Mozilla",
     // CJK.
-    "Microsoft YaHei", "Malgun Gothic", "Yu Gothic", "Noto Sans CJK SC",
-    "Noto Sans CJK KR", "Noto Sans CJK JP", "PingFang SC", "Hiragino Sans",
+    "Microsoft YaHei",
+    "Malgun Gothic",
+    "Yu Gothic",
+    "Noto Sans CJK SC",
+    "Noto Sans CJK KR",
+    "Noto Sans CJK JP",
+    "PingFang SC",
+    "Hiragino Sans",
     // Indic / SE-Asia / African.
-    "Nirmala UI", "Noto Sans Devanagari", "Leelawadee UI", "Noto Sans Thai", "Ebrima",
+    "Nirmala UI",
+    "Noto Sans Devanagari",
+    "Leelawadee UI",
+    "Noto Sans Thai",
+    "Ebrima",
     // Symbols / math / historic — broad coverage to reduce tofu.
-    "Segoe UI Symbol", "Noto Sans Symbols 2", "Cambria Math", "Segoe UI Historic", "Sylfaen",
+    "Segoe UI Symbol",
+    "Noto Sans Symbols 2",
+    "Cambria Math",
+    "Segoe UI Historic",
+    "Sylfaen",
 ];
 
-/// Resolve family names (or explicit file paths) into a registered fallback
-/// chain. Mirrors how a real app does it: **one** long-lived `Database`, and
-/// `make_shared_face_data` so a face used by two chains is the same `Arc` and
-/// the service dedups it into one font and one glyph cache.
+/// Resolve family names (or paths) into a fallback chain. These examples build
+/// one chain; applications building several should reuse the `Database` so
+/// `make_shared_face_data` returns shared `Arc`s that sanscale can deduplicate.
 pub fn font_chain(text: &mut TextService, families: &[&str]) -> FontChainHandle {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
@@ -97,18 +112,39 @@ pub fn font_chain(text: &mut TextService, families: &[&str]) -> FontChainHandle 
 /// Labelled multilingual samples, shared by the Unicode examples.
 pub fn unicode_sections() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("Latin + accents", "The quick brown fox — jüber naïve Æsop, coöperate £€$¥."),
-        ("Greek", "Ζεύς· ἀλήθεια καὶ σοφία. Μαθηματικά: αβγδ ΔΣΩ π≈3.14159."),
-        ("Cyrillic", "Съешь ещё этих мягких французских булок да выпей чаю."),
-        ("Chinese 中文", "床前明月光，疑是地上霜。举头望明月，低头思故乡。"),
-        ("Japanese 日本語", "いろはにほへと ちりぬるを — 平仮名・片仮名・漢字。"),
+        (
+            "Latin + accents",
+            "The quick brown fox — jüber naïve Æsop, coöperate £€$¥.",
+        ),
+        (
+            "Greek",
+            "Ζεύς· ἀλήθεια καὶ σοφία. Μαθηματικά: αβγδ ΔΣΩ π≈3.14159.",
+        ),
+        (
+            "Cyrillic",
+            "Съешь ещё этих мягких французских булок да выпей чаю.",
+        ),
+        (
+            "Chinese 中文",
+            "床前明月光，疑是地上霜。举头望明月，低头思故乡。",
+        ),
+        (
+            "Japanese 日本語",
+            "いろはにほへと ちりぬるを — 平仮名・片仮名・漢字。",
+        ),
         ("Korean 한국어", "다람쥐 헌 쳇바퀴에 타고파. 훈민정음 한글."),
         ("Arabic العربية", "العربية لغة جميلة ومعقدة."),
         ("Hebrew עברית", "עברית: שלום עולם."),
         ("Devanagari", "नमस्ते दुनिया — देवनागरी लिपि।"),
         ("Thai", "ภาษาไทย สวัสดีชาวโลก"),
-        ("Symbols & math", "∀x∈ℝ ∃y: x²≥0 ∑∫√∞ ← ↑ → ↓ ↔ ⇒ ✓ ✗ ★ ☆ ♠♥♦♣"),
-        ("Emoji 🎨", "😀 😆 😅 🤣 😍 😎 🤖 🎉 🚀 🌍 ❤️ 🔥 ✨ 🐙 🍜 👋"),
+        (
+            "Symbols & math",
+            "∀x∈ℝ ∃y: x²≥0 ∑∫√∞ ← ↑ → ↓ ↔ ⇒ ✓ ✗ ★ ☆ ♠♥♦♣",
+        ),
+        (
+            "Emoji 🎨",
+            "😀 😆 😅 🤣 😍 😎 🤖 🎉 🚀 🌍 ❤️ 🔥 ✨ 🐙 🍜 👋",
+        ),
     ]
 }
 
@@ -237,7 +273,9 @@ impl Harness {
         self.queue.submit([encoder.finish()]);
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let data = slice.get_mapped_range().unwrap();
         let mut pixels = Vec::with_capacity((unpadded * height) as usize);
         for row in 0..height {

@@ -18,12 +18,12 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::cache::{GlyphCache, GlyphInfo};
-use crate::emoji::{bucket_for, EmojiCache};
-use crate::flow::{flow_paragraph, FlowLine};
+use crate::emoji::{EmojiCache, bucket_for};
+use crate::flow::{FlowLine, flow_paragraph};
 use crate::font::Font;
-use crate::layout::{shape_text, ChainFont, ShapedGlyph};
+use crate::layout::{ChainFont, ShapedGlyph, shape_text};
 use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer};
-use crate::vertex::{push_emoji_quad, push_glyph_quad_pixels, EmojiVertex, TextVertex};
+use crate::vertex::{EmojiVertex, TextVertex, push_emoji_quad, push_glyph_quad_pixels};
 
 /// Shared font bytes. Deliberately fontdb's `make_shared_face_data` return type,
 /// so bytes a consumer already discovered pass straight through — no copy, no
@@ -183,7 +183,7 @@ pub struct BlockKey(pub u64);
 
 /// Everything that affects shaping. Zero pixels and no color, so the cache is
 /// zoom-invariant: moving the camera re-runs nothing.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Style {
     pub chain: FontChainHandle,
     /// Wrap width in em (`pane_px / font_px`), or `None` for no wrapping.
@@ -191,6 +191,15 @@ pub struct Style {
     pub align: Align,
     /// Multiplier on the font's metric line height.
     pub line_spacing: f32,
+}
+
+impl PartialEq for Style {
+    fn eq(&self, other: &Self) -> bool {
+        self.chain == other.chain
+            && self.wrap_em.map(f32::to_bits) == other.wrap_em.map(f32::to_bits)
+            && self.align == other.align
+            && self.line_spacing.to_bits() == other.line_spacing.to_bits()
+    }
 }
 
 impl Eq for Style {}
@@ -441,7 +450,11 @@ impl Layout {
         let local_x = x_em - line.align_em;
         line.carets
             .iter()
-            .min_by(|a, b| (a.x_em - local_x).abs().total_cmp(&(b.x_em - local_x).abs()))
+            .min_by(|a, b| {
+                (a.x_em - local_x)
+                    .abs()
+                    .total_cmp(&(b.x_em - local_x).abs())
+            })
             .map(|caret| caret.byte_index)
     }
 
@@ -514,7 +527,10 @@ impl Layout {
             .map(|_| caret.line_index)
             .or_else(|| self.line_for_byte(byte_index))
             .unwrap_or(0);
-        Caret { byte_index, line_index }
+        Caret {
+            byte_index,
+            line_index,
+        }
     }
 
     /// The caret for a byte, with the layout's default (start-affine) line.
@@ -535,7 +551,10 @@ impl Layout {
         } else {
             natural
         };
-        Caret { byte_index, line_index }
+        Caret {
+            byte_index,
+            line_index,
+        }
     }
 
     /// The caret for a byte placed by an **edit**: end-affine at a soft break,
@@ -583,7 +602,10 @@ impl Layout {
     ) -> Caret {
         if self.lines.is_empty() {
             *goal = None;
-            return Caret { byte_index: 0, line_index: 0 };
+            return Caret {
+                byte_index: 0,
+                line_index: 0,
+            };
         }
         let caret = self.clamp_caret(caret);
 
@@ -593,7 +615,10 @@ impl Layout {
             let byte_index = byte_index.min(self.len_bytes());
             if let Some(range) = self.line_range(caret.line_index) {
                 if byte_index == range.start || byte_index == range.end {
-                    return Caret { byte_index, line_index: caret.line_index };
+                    return Caret {
+                        byte_index,
+                        line_index: caret.line_index,
+                    };
                 }
             }
             self.caret_at(byte_index)
@@ -601,8 +626,8 @@ impl Layout {
 
         let vertical = |goal: &mut Option<f32>, delta: isize| -> Caret {
             let current = caret.line_index;
-            let target = (current as isize + delta)
-                .clamp(0, self.lines.len() as isize - 1) as usize;
+            let target =
+                (current as isize + delta).clamp(0, self.lines.len() as isize - 1) as usize;
             if target == current {
                 // Boundary line: Up snaps to its start, Down to its end.
                 let range = self.line_range(current);
@@ -611,34 +636,49 @@ impl Layout {
                 } else {
                     range.map(|r| r.end).unwrap_or_else(|| self.len_bytes())
                 };
-                return Caret { byte_index, line_index: current };
+                return Caret {
+                    byte_index,
+                    line_index: current,
+                };
             }
             let x = *goal.get_or_insert_with(|| {
-                self.caret_rect_on_line(Some(current), caret.byte_index).x_em
+                self.caret_rect_on_line(Some(current), caret.byte_index)
+                    .x_em
             });
             let byte_index = self.caret_on_line(target, x).unwrap_or(caret.byte_index);
-            Caret { byte_index, line_index: target }
+            Caret {
+                byte_index,
+                line_index: target,
+            }
         };
 
         match motion {
             Motion::Left => {
                 *goal = None;
-                place(self.prev_caret_stop(caret.byte_index).unwrap_or(caret.byte_index))
+                place(
+                    self.prev_caret_stop(caret.byte_index)
+                        .unwrap_or(caret.byte_index),
+                )
             }
             Motion::Right => {
                 *goal = None;
-                place(self.next_caret_stop(caret.byte_index).unwrap_or(caret.byte_index))
+                place(
+                    self.next_caret_stop(caret.byte_index)
+                        .unwrap_or(caret.byte_index),
+                )
             }
             Motion::WordLeft => {
                 *goal = None;
                 place(text.prev_word(caret.byte_index).unwrap_or_else(|| {
-                    self.prev_caret_stop(caret.byte_index).unwrap_or(caret.byte_index)
+                    self.prev_caret_stop(caret.byte_index)
+                        .unwrap_or(caret.byte_index)
                 }))
             }
             Motion::WordRight => {
                 *goal = None;
                 place(text.next_word(caret.byte_index).unwrap_or_else(|| {
-                    self.next_caret_stop(caret.byte_index).unwrap_or(caret.byte_index)
+                    self.next_caret_stop(caret.byte_index)
+                        .unwrap_or(caret.byte_index)
                 }))
             }
             Motion::Home => {
@@ -667,7 +707,10 @@ impl Layout {
             Motion::PageDown(lines) => vertical(goal, lines as isize),
             Motion::DocStart => {
                 *goal = None;
-                Caret { byte_index: 0, line_index: 0 }
+                Caret {
+                    byte_index: 0,
+                    line_index: 0,
+                }
             }
             Motion::DocEnd => {
                 *goal = None;
@@ -684,12 +727,12 @@ impl Layout {
     /// declining classifier degrades to the cluster around the byte.
     pub fn select_word_at(&self, byte_index: usize, text: &impl Boundaries) -> Range<usize> {
         let byte_index = byte_index.min(self.len_bytes());
-        let start = text.prev_word(byte_index).unwrap_or_else(|| {
-            self.prev_caret_stop(byte_index).unwrap_or(byte_index)
-        });
-        let end = text.next_word(byte_index).unwrap_or_else(|| {
-            self.next_caret_stop(byte_index).unwrap_or(byte_index)
-        });
+        let start = text
+            .prev_word(byte_index)
+            .unwrap_or_else(|| self.prev_caret_stop(byte_index).unwrap_or(byte_index));
+        let end = text
+            .next_word(byte_index)
+            .unwrap_or_else(|| self.next_caret_stop(byte_index).unwrap_or(byte_index));
         start.min(byte_index)..end.max(byte_index)
     }
 
@@ -743,15 +786,18 @@ impl Layout {
                 .lines
                 .get(index + 1)
                 .is_some_and(|next| next.byte_range.start > line.byte_range.end);
-            let newline_selected = hard_break
-                && range.start <= line.byte_range.end
-                && range.end > line.byte_range.end;
+            let newline_selected =
+                hard_break && range.start <= line.byte_range.end && range.end > line.byte_range.end;
             if start >= end && !newline_selected {
                 continue;
             }
             let x0 = caret_x_on(line, start.min(end));
             let x1 = caret_x_on(line, end.max(start));
-            let stub = if newline_selected { NEWLINE_STUB_EM } else { 0.0 };
+            let stub = if newline_selected {
+                NEWLINE_STUB_EM
+            } else {
+                0.0
+            };
             spans.push(SelectionSpan {
                 line: index,
                 x_em: x0.min(x1) + line.align_em,
@@ -1140,7 +1186,10 @@ impl TextService {
             _ => match self.free_blocks.pop() {
                 Some(slot) => slot as usize,
                 None => {
-                    self.blocks.push(BlockSlot { block: None, revision: 0 });
+                    self.blocks.push(BlockSlot {
+                        block: None,
+                        revision: 0,
+                    });
                     self.generations.push(0);
                     self.geometry.push(None);
                     self.blocks.len() - 1
@@ -1303,7 +1352,13 @@ impl TextService {
             device,
             queue,
             pass,
-            &[Draw { block: h, at, size, color, clip }],
+            &[Draw {
+                block: h,
+                at,
+                size,
+                color,
+                clip,
+            }],
         );
     }
 
@@ -1321,12 +1376,7 @@ impl TextService {
     /// meaningful if `at`/`size` are stable across frames — under a camera,
     /// pass world units with the camera in the transform (`set_transform`),
     /// not pre-projected pixels, or every pan invalidates every batch.
-    pub fn prepare(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        items: &[Draw],
-    ) -> Batch {
+    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, items: &[Draw]) -> Batch {
         self.ensure_gpu(device);
         if self.gpu.is_none() {
             // No target format was ever set, so there is no pipeline to bind
@@ -1364,7 +1414,11 @@ impl TextService {
                 let Some(index) = self.block_index(item.block) else {
                     continue;
                 };
-                let baked = (item.block.slot, item.block.generation, self.blocks[index].revision);
+                let baked = (
+                    item.block.slot,
+                    item.block.generation,
+                    self.blocks[index].revision,
+                );
                 if blocks.last() != Some(&baked) {
                     blocks.push(baked);
                 }
@@ -1552,7 +1606,10 @@ impl TextService {
         // the block is borrowed; collect the requests, then service them.
         let mut emoji_requests: Vec<(u16, u32, f32, f32)> = Vec::new();
         {
-            let block = self.blocks[index].block.as_ref().expect("checked by caller");
+            let block = self.blocks[index]
+                .block
+                .as_ref()
+                .expect("checked by caller");
             for_each_visible_glyph(&block.layout, at, size, clip, |glyph, pen_x, pen_y| {
                 if glyph.is_color {
                     emoji_requests.push((glyph.font_id, glyph.glyph_id, pen_x, pen_y));
@@ -1748,7 +1805,8 @@ impl TextService {
             let cut = self.paragraphs.len() - MAX_PARAGRAPHS * 3 / 4;
             ages.select_nth_unstable(cut);
             let threshold = ages[cut];
-            self.paragraphs.retain(|_, entry| entry.last_used > threshold);
+            self.paragraphs
+                .retain(|_, entry| entry.last_used > threshold);
         }
 
         let live = self.blocks.len() - self.free_blocks.len();
@@ -1918,7 +1976,10 @@ impl Diagnostics<'_> {
     pub fn family_for(&self, chain: FontChainHandle, c: char) -> Option<String> {
         let view = self.text.chain_view(chain);
         let mut buf = [0u8; 4];
-        let entry = view.get(crate::layout::face_for_grapheme(&view, c.encode_utf8(&mut buf)))?;
+        let entry = view.get(crate::layout::face_for_grapheme(
+            &view,
+            c.encode_utf8(&mut buf),
+        ))?;
         entry.font.has_glyph(c).then(|| entry.font.family_name())?
     }
 
@@ -1930,7 +1991,10 @@ impl Diagnostics<'_> {
         let mut buf = [0u8; 4];
         // The face the shaper picks, not the first one holding a glyph — this
         // feeds cell fit-scaling, so a wrong face moves geometry, not just text.
-        let entry = view.get(crate::layout::face_for_grapheme(&view, c.encode_utf8(&mut buf)))?;
+        let entry = view.get(crate::layout::face_for_grapheme(
+            &view,
+            c.encode_utf8(&mut buf),
+        ))?;
         let id = entry.font.face().glyph_index(c)?;
         // A colour glyph reports nothing, as documented. COLR faces layer real
         // outlines under the colour, so asking for an outline *succeeds* and hands
@@ -2091,6 +2155,20 @@ mod tests {
     use super::*;
     use crate::font::read_font_file;
 
+    #[test]
+    fn style_float_equality_is_bitwise() {
+        let style = |wrap_em, line_spacing| Style {
+            chain: FontChainHandle(0),
+            wrap_em,
+            align: Align::Left,
+            line_spacing,
+        };
+        assert_ne!(style(Some(0.0), 0.0), style(Some(-0.0), -0.0));
+
+        let nan = style(Some(f32::NAN), f32::NAN);
+        assert_eq!(nan, nan);
+    }
+
     /// Three hard-broken lines — "ab" (0..2), blank (3..3), "cd" (4..6) — with
     /// unit-advance caret stops, GPU- and font-free via `from_lines`.
     fn three_line_layout() -> Layout {
@@ -2099,7 +2177,10 @@ mod tests {
                 .clone()
                 .chain([bytes.end])
                 .enumerate()
-                .map(|(i, byte_index)| CaretStop { byte_index, x_em: i as f32 })
+                .map(|(i, byte_index)| CaretStop {
+                    byte_index,
+                    x_em: i as f32,
+                })
                 .collect(),
             metrics: LineMetrics {
                 top_em: top,
@@ -2118,11 +2199,24 @@ mod tests {
     fn selection_shows_newline_stubs_and_blank_lines() {
         let layout = three_line_layout();
         let spans = layout.selection(1..5);
-        assert_eq!(spans.len(), 3, "every line the selection touches has a span");
-        assert!(spans[0].width_em > 1.0, "line 0: one glyph plus the newline stub");
+        assert_eq!(
+            spans.len(),
+            3,
+            "every line the selection touches has a span"
+        );
+        assert!(
+            spans[0].width_em > 1.0,
+            "line 0: one glyph plus the newline stub"
+        );
         assert_eq!(spans[1].line, 1);
-        assert!(spans[1].width_em > 0.0, "blank line: a visible stub, not nothing");
-        assert!((spans[2].width_em - 1.0).abs() < 1e-6, "line 2: one glyph, newline not selected");
+        assert!(
+            spans[1].width_em > 0.0,
+            "blank line: a visible stub, not nothing"
+        );
+        assert!(
+            (spans[2].width_em - 1.0).abs() < 1e-6,
+            "line 2: one glyph, newline not selected"
+        );
         // Selection ending exactly at a line's end selects no newline: no stub.
         let spans = layout.selection(0..2);
         assert_eq!(spans.len(), 1);
@@ -2136,7 +2230,10 @@ mod tests {
                 .clone()
                 .chain([bytes.end])
                 .enumerate()
-                .map(|(i, byte_index)| CaretStop { byte_index, x_em: i as f32 })
+                .map(|(i, byte_index)| CaretStop {
+                    byte_index,
+                    x_em: i as f32,
+                })
                 .collect(),
             metrics: LineMetrics {
                 top_em: top,
@@ -2161,13 +2258,29 @@ mod tests {
         let caret = layout.caret_move(caret, Motion::Right, &mut goal, &());
         assert_eq!((caret.byte_index, caret.line_index), (4, 0));
         // ...and Left from inside line 1 onto the same byte keeps line 1.
-        let caret = layout.caret_move(Caret { byte_index: 5, line_index: 1 }, Motion::Left, &mut goal, &());
+        let caret = layout.caret_move(
+            Caret {
+                byte_index: 5,
+                line_index: 1,
+            },
+            Motion::Left,
+            &mut goal,
+            &(),
+        );
         assert_eq!((caret.byte_index, caret.line_index), (4, 1));
 
         // Up on the top line snaps to its start; Down on the bottom to its end.
         let caret = layout.caret_move(layout.caret_at(2), Motion::Up, &mut goal, &());
         assert_eq!((caret.byte_index, caret.line_index), (0, 0));
-        let caret = layout.caret_move(Caret { byte_index: 5, line_index: 1 }, Motion::Down, &mut goal, &());
+        let caret = layout.caret_move(
+            Caret {
+                byte_index: 5,
+                line_index: 1,
+            },
+            Motion::Down,
+            &mut goal,
+            &(),
+        );
         assert_eq!((caret.byte_index, caret.line_index), (7, 1));
 
         // The goal column seeds on the first vertical and survives the trip:
@@ -2229,8 +2342,17 @@ mod tests {
         let Some((mut text, chain)) = latin_chain() else {
             return;
         };
-        let style = Style { chain, wrap_em: None, align: Align::Left, line_spacing: 1.0 };
-        let key = |generation| ParagraphKey { namespace: 9, slot: 1, generation };
+        let style = Style {
+            chain,
+            wrap_em: None,
+            align: Align::Left,
+            line_spacing: 1.0,
+        };
+        let key = |generation| ParagraphKey {
+            namespace: 9,
+            slot: 1,
+            generation,
+        };
         let h1 = text
             .shape(BlockKey(77), &style, &[key(0)], &Paragraphs(&["one"]))
             .expect("shaped");
@@ -2291,14 +2413,22 @@ mod tests {
     }
 
     fn style_of(chain: FontChainHandle, wrap_em: Option<f32>) -> Style {
-        Style { chain, wrap_em, align: Align::Left, line_spacing: 1.0 }
+        Style {
+            chain,
+            wrap_em,
+            align: Align::Left,
+            line_spacing: 1.0,
+        }
     }
 
     /// A `Draw` that differs from its neighbours only in `clip` — enough for
     /// the segmentation rule, which reads nothing else. No font, no device.
     fn clipped(clip: Option<Rect>) -> Draw {
         Draw {
-            block: ShapedHandle { slot: 0, generation: 0 },
+            block: ShapedHandle {
+                slot: 0,
+                generation: 0,
+            },
             at: Vec2::new(0.0, 0.0),
             size: 16.0,
             color: Color([1.0, 1.0, 1.0, 1.0]),
@@ -2312,7 +2442,10 @@ mod tests {
     #[test]
     fn adjacent_equal_clips_coalesce() {
         let clip = Some(Rect::new(0.0, 0.0, 10.0, 10.0));
-        assert_eq!(clip_runs(&[clipped(clip), clipped(clip), clipped(clip)]), vec![0..3]);
+        assert_eq!(
+            clip_runs(&[clipped(clip), clipped(clip), clipped(clip)]),
+            vec![0..3]
+        );
         assert_eq!(clip_runs(&[clipped(None), clipped(None)]), vec![0..2]);
         assert_eq!(clip_runs(&[]), Vec::<Range<usize>>::new());
     }
@@ -2352,7 +2485,10 @@ mod tests {
         assert!(epoch_live(None, 0));
         assert!(epoch_live(None, u64::MAX));
         assert!(epoch_live(Some(4), 4));
-        assert!(!epoch_live(Some(4), 5), "an eviction since the bake is staleness");
+        assert!(
+            !epoch_live(Some(4), 5),
+            "an eviction since the bake is staleness"
+        );
     }
 
     /// Counts how often the service asks for a paragraph's bytes.
@@ -2380,7 +2516,11 @@ mod tests {
             return;
         };
         let style = style_of(chain, Some(12.0));
-        let key = ParagraphKey { namespace: 7, slot: 11, generation: 13 };
+        let key = ParagraphKey {
+            namespace: 7,
+            slot: 11,
+            generation: 13,
+        };
         let src = CountingSource {
             text: "cached paragraph should only ever be fetched once",
             calls: std::cell::Cell::new(0),
@@ -2391,7 +2531,11 @@ mod tests {
 
         // Same block, same parts: the block-level comparison short-circuits.
         text.shape(BlockKey(1), &style, &[key], &src);
-        assert_eq!(src.calls.get(), 1, "re-shaping an unchanged block must not fetch");
+        assert_eq!(
+            src.calls.get(),
+            1,
+            "re-shaping an unchanged block must not fetch"
+        );
 
         // A *different* block over the same paragraph: the block is new, so this
         // reaches the paragraph pool — which must still hit.
@@ -2399,7 +2543,10 @@ mod tests {
         assert_eq!(src.calls.get(), 1, "a paragraph-cache hit must not fetch");
 
         // Bumping the generation is what invalidation looks like, and must fetch.
-        let edited = ParagraphKey { generation: 14, ..key };
+        let edited = ParagraphKey {
+            generation: 14,
+            ..key
+        };
         text.shape(BlockKey(3), &style, &[edited], &src);
         assert_eq!(src.calls.get(), 2, "a new generation must fetch");
     }
@@ -2413,12 +2560,21 @@ mod tests {
         };
         let d = text.diagnostics();
         assert!(d.is_single_glyph(chain, "A"), "one letter is one glyph");
-        assert!(!d.is_single_glyph(chain, "AB"), "two letters shape to two glyphs");
+        assert!(
+            !d.is_single_glyph(chain, "AB"),
+            "two letters shape to two glyphs"
+        );
     }
 
     fn visible_count(text: &TextService, h: ShapedHandle, clip: Option<Rect>) -> usize {
         let mut n = 0;
-        for_each_visible_glyph(text.measure(h), Vec2::new(0.0, 0.0), 16.0, clip, |_, _, _| n += 1);
+        for_each_visible_glyph(
+            text.measure(h),
+            Vec2::new(0.0, 0.0),
+            16.0,
+            clip,
+            |_, _, _| n += 1,
+        );
         n
     }
 
@@ -2452,7 +2608,10 @@ mod tests {
         let one_line = Rect::new(0.0, 0.0, 10_000.0, first.height_em * 16.0 * 0.9);
         let clipped = visible_count(&text, h, Some(one_line));
         assert!(clipped > 0, "the first line is inside the clip");
-        assert!(clipped < all, "later lines must be culled, got {clipped} of {all}");
+        assert!(
+            clipped < all,
+            "later lines must be culled, got {clipped} of {all}"
+        );
     }
 
     #[test]
@@ -2499,15 +2658,23 @@ mod tests {
         };
         let mut buf = [0u8; 4];
         for c in [
-            '\u{2600}', '\u{263A}', '\u{2640}', '\u{2328}', // text presentation
-            '\u{1F600}', '\u{1F308}', // emoji presentation
-            'A', '1', '\u{00E9}', // plain text
+            '\u{2600}',
+            '\u{263A}',
+            '\u{2640}',
+            '\u{2328}', // text presentation
+            '\u{1F600}',
+            '\u{1F308}', // emoji presentation
+            'A',
+            '1',
+            '\u{00E9}', // plain text
         ] {
             let s = c.encode_utf8(&mut buf);
             let view = chain_view(&text.fonts, &text.chains, chain);
             let mut cache = GlyphCache::new();
             let run = shape_text(&view, &mut cache, s);
-            let Some(glyph) = run.glyphs.first() else { continue };
+            let Some(glyph) = run.glyphs.first() else {
+                continue;
+            };
             if glyph.glyph_id == 0 {
                 continue; // tofu; nothing to agree about
             }
@@ -2536,15 +2703,25 @@ mod tests {
             let view = chain_view(&text.fonts, &text.chains, chain);
             let mut cache = GlyphCache::new();
             let run = shape_text(&view, &mut cache, s);
-            let Some(glyph) = run.glyphs.first() else { continue };
+            let Some(glyph) = run.glyphs.first() else {
+                continue;
+            };
             if glyph.glyph_id == 0 {
                 continue;
             }
             let bbox = text.diagnostics().glyph_bbox(chain, c);
             if glyph.is_color {
-                assert!(bbox.is_none(), "U+{:04X} resolves to colour: no outline", c as u32);
+                assert!(
+                    bbox.is_none(),
+                    "U+{:04X} resolves to colour: no outline",
+                    c as u32
+                );
             } else {
-                assert!(bbox.is_some(), "U+{:04X} resolves to an outline face", c as u32);
+                assert!(
+                    bbox.is_some(),
+                    "U+{:04X} resolves to an outline face",
+                    c as u32
+                );
             }
         }
     }

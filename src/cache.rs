@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::bands::{BandData, BAND_TEXTURE_WIDTH, CURVE_TEXTURE_WIDTH};
+use crate::bands::{BAND_TEXTURE_WIDTH, BandData, CURVE_TEXTURE_WIDTH};
 
 /// Cache key: `(face_id, glyph_id)`. `glyph_id` alone is ambiguous across a
 /// fallback chain — glyph 5 in Noto Sans is not glyph 5 in an emoji font — so the
@@ -100,8 +100,7 @@ impl GlyphCache {
         let row = (origin / w) as u32;
 
         // Reserve the header texels; each is patched once its list is placed.
-        self.band_texels
-            .resize(origin + header_count, [0, 0]);
+        self.band_texels.resize(origin + header_count, [0, 0]);
 
         for b in 0..header_count {
             let count = texels[b][0] as usize;
@@ -211,8 +210,7 @@ mod tests {
         );
 
         for info in cache.glyphs.values() {
-            let header_count =
-                (info.band_max.0 + 1 + info.band_max.1 + 1) as usize;
+            let header_count = (info.band_max.0 + 1 + info.band_max.1 + 1) as usize;
             let origin = info.band_start.1 as usize * w + info.band_start.0 as usize;
 
             assert!(

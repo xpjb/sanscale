@@ -83,7 +83,14 @@ fn wrap(paragraph: &str, glyphs: &[ShapedGlyph], max_width_em: f32, out: &mut Ve
         // A single token wider than the line gets broken mid-word.
         if token_width > max_width_em && token_glyphs.len() > 1 {
             if let Some(start) = current_start.take() {
-                flush(start, current_end, current_origin, current_width, &mut current_glyphs, out);
+                flush(
+                    start,
+                    current_end,
+                    current_origin,
+                    current_width,
+                    &mut current_glyphs,
+                    out,
+                );
             }
             flush_broken_token(
                 token_start,
@@ -140,7 +147,14 @@ fn wrap(paragraph: &str, glyphs: &[ShapedGlyph], max_width_em: f32, out: &mut Ve
     }
 
     if let Some(start) = current_start {
-        flush(start, current_end, current_origin, current_width, &mut current_glyphs, out);
+        flush(
+            start,
+            current_end,
+            current_origin,
+            current_width,
+            &mut current_glyphs,
+            out,
+        );
     }
 }
 
@@ -171,7 +185,14 @@ fn flush_broken_token(
                 line_glyphs.push(glyph);
                 continue;
             }
-            flush(line_start, break_byte, line_origin, line_width, &mut line_glyphs, out);
+            flush(
+                line_start,
+                break_byte,
+                line_origin,
+                line_width,
+                &mut line_glyphs,
+                out,
+            );
             line_start = break_byte;
             line_origin = glyph.x;
             line_width = glyph.advance_x;
@@ -183,7 +204,14 @@ fn flush_broken_token(
     }
 
     if !line_glyphs.is_empty() {
-        flush(line_start, line_end, line_origin, line_width, &mut line_glyphs, out);
+        flush(
+            line_start,
+            line_end,
+            line_origin,
+            line_width,
+            &mut line_glyphs,
+            out,
+        );
     }
 }
 

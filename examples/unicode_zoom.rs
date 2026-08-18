@@ -28,7 +28,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use common::{copy_to_clipboard, font_chain, Hover, UNICODE_FALLBACK};
+use common::{Hover, UNICODE_FALLBACK, copy_to_clipboard, font_chain};
 
 const COLS: i64 = 256;
 const CELL_W: f32 = 20.0;
@@ -46,23 +46,65 @@ const TITLE: [f32; 4] = [0.16, 0.40, 0.82, 1.0];
 /// Major Unicode blocks (start, short name), ascending. Names are kept short so
 /// they fit the title gutter at the world-space title size.
 const BLOCKS: &[(u32, &str)] = &[
-    (0x0000, "Basic Latin"), (0x0080, "Latin-1 Suppl."), (0x0100, "Latin Ext-A"),
-    (0x0180, "Latin Ext-B"), (0x0250, "IPA Extensions"), (0x0300, "Combining Marks"),
-    (0x0370, "Greek"), (0x0400, "Cyrillic"), (0x0530, "Armenian"), (0x0590, "Hebrew"),
-    (0x0600, "Arabic"), (0x0700, "Syriac"), (0x0900, "Devanagari"), (0x0980, "Bengali"),
-    (0x0B80, "Tamil"), (0x0C00, "Telugu"), (0x0D00, "Malayalam"), (0x0E00, "Thai"),
-    (0x0E80, "Lao"), (0x0F00, "Tibetan"), (0x1000, "Myanmar"), (0x10A0, "Georgian"),
-    (0x1100, "Hangul Jamo"), (0x1200, "Ethiopic"), (0x13A0, "Cherokee"), (0x1780, "Khmer"),
-    (0x1800, "Mongolian"), (0x1E00, "Latin Ext. Add'l"), (0x1F00, "Greek Ext."),
-    (0x2000, "Punctuation"), (0x20A0, "Currency"), (0x2100, "Letterlike"), (0x2190, "Arrows"),
-    (0x2200, "Math Operators"), (0x2300, "Misc Technical"), (0x2460, "Enclosed Alnum"),
-    (0x2500, "Box Drawing"), (0x2600, "Misc Symbols"), (0x2700, "Dingbats"), (0x2800, "Braille"),
-    (0x2E80, "CJK Radicals"), (0x3000, "CJK Symbols"), (0x3040, "Hiragana"), (0x30A0, "Katakana"),
-    (0x3100, "Bopomofo"), (0x3130, "Hangul Compat."), (0x3400, "CJK Ext-A"),
-    (0x4E00, "CJK Ideographs"), (0xA000, "Yi Syllables"), (0xAC00, "Hangul Syllables"),
-    (0xF900, "CJK Compat."), (0xFB00, "Present. Forms"), (0xFF00, "Half/Fullwidth"),
-    (0x10000, "Linear B (pl.1)"), (0x1D400, "Math Alnum."), (0x1F300, "Pictographs"),
-    (0x1F600, "Emoticons"), (0x1F680, "Transport"), (0x20000, "CJK Ext-B (pl.2)"),
+    (0x0000, "Basic Latin"),
+    (0x0080, "Latin-1 Suppl."),
+    (0x0100, "Latin Ext-A"),
+    (0x0180, "Latin Ext-B"),
+    (0x0250, "IPA Extensions"),
+    (0x0300, "Combining Marks"),
+    (0x0370, "Greek"),
+    (0x0400, "Cyrillic"),
+    (0x0530, "Armenian"),
+    (0x0590, "Hebrew"),
+    (0x0600, "Arabic"),
+    (0x0700, "Syriac"),
+    (0x0900, "Devanagari"),
+    (0x0980, "Bengali"),
+    (0x0B80, "Tamil"),
+    (0x0C00, "Telugu"),
+    (0x0D00, "Malayalam"),
+    (0x0E00, "Thai"),
+    (0x0E80, "Lao"),
+    (0x0F00, "Tibetan"),
+    (0x1000, "Myanmar"),
+    (0x10A0, "Georgian"),
+    (0x1100, "Hangul Jamo"),
+    (0x1200, "Ethiopic"),
+    (0x13A0, "Cherokee"),
+    (0x1780, "Khmer"),
+    (0x1800, "Mongolian"),
+    (0x1E00, "Latin Ext. Add'l"),
+    (0x1F00, "Greek Ext."),
+    (0x2000, "Punctuation"),
+    (0x20A0, "Currency"),
+    (0x2100, "Letterlike"),
+    (0x2190, "Arrows"),
+    (0x2200, "Math Operators"),
+    (0x2300, "Misc Technical"),
+    (0x2460, "Enclosed Alnum"),
+    (0x2500, "Box Drawing"),
+    (0x2600, "Misc Symbols"),
+    (0x2700, "Dingbats"),
+    (0x2800, "Braille"),
+    (0x2E80, "CJK Radicals"),
+    (0x3000, "CJK Symbols"),
+    (0x3040, "Hiragana"),
+    (0x30A0, "Katakana"),
+    (0x3100, "Bopomofo"),
+    (0x3130, "Hangul Compat."),
+    (0x3400, "CJK Ext-A"),
+    (0x4E00, "CJK Ideographs"),
+    (0xA000, "Yi Syllables"),
+    (0xAC00, "Hangul Syllables"),
+    (0xF900, "CJK Compat."),
+    (0xFB00, "Present. Forms"),
+    (0xFF00, "Half/Fullwidth"),
+    (0x10000, "Linear B (pl.1)"),
+    (0x1D400, "Math Alnum."),
+    (0x1F300, "Pictographs"),
+    (0x1F600, "Emoticons"),
+    (0x1F680, "Transport"),
+    (0x20000, "CJK Ext-B (pl.2)"),
 ];
 
 fn main() {
@@ -71,7 +113,9 @@ fn main() {
         dump();
         return;
     }
-    println!("scroll = zoom · drag = pan · left-click = copy char · right-click = copy code point · R = reset · Esc = quit");
+    println!(
+        "scroll = zoom · drag = pan · left-click = copy char · right-click = copy code point · R = reset · Esc = quit"
+    );
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App::default()).unwrap();
@@ -81,7 +125,8 @@ fn ortho(w: f32, h: f32) -> Mat4 {
     Mat4::orthographic_rh(0.0, w, h, 0.0, -1.0, 1.0)
 }
 fn model(offset: Vec2, scale: f32) -> Mat4 {
-    Mat4::from_translation(Vec3::new(offset.x, offset.y, 0.0)) * Mat4::from_scale(Vec3::splat(scale))
+    Mat4::from_translation(Vec3::new(offset.x, offset.y, 0.0))
+        * Mat4::from_scale(Vec3::splat(scale))
 }
 /// One placed cell: a shaped handle plus where and how big to draw it. The
 /// service caches the shaping; this caches only the placement, which is what the
@@ -135,7 +180,12 @@ impl Viewer {
     }
 
     fn style(&self) -> Style {
-        Style { chain: self.chain, wrap_em: None, align: Align::Left, line_spacing: 1.0 }
+        Style {
+            chain: self.chain,
+            wrap_em: None,
+            align: Align::Left,
+            line_spacing: 1.0,
+        }
     }
 
     /// Shape and cache one row's cells (covered -> glyph, else -> tofu box).
@@ -153,7 +203,9 @@ impl Viewer {
             if (0xD800..=0xDFFF).contains(&cp) {
                 continue;
             }
-            let Some(ch) = char::from_u32(cp) else { continue };
+            let Some(ch) = char::from_u32(cp) else {
+                continue;
+            };
             if ch.is_control() || ch.is_whitespace() {
                 continue;
             }
@@ -161,7 +213,12 @@ impl Viewer {
             let y = r as f32 * CELL_H;
             if !self.text.diagnostics().covers(self.chain, ch) {
                 if let Some(glyph) = self.text.shape_transient(TOFU_BOX, &style) {
-                    cells.push(Cell { glyph, at: Vec2::new(x, y), size: GLYPH_PX, color: TOFU });
+                    cells.push(Cell {
+                        glyph,
+                        at: Vec2::new(x, y),
+                        size: GLYPH_PX,
+                        color: TOFU,
+                    });
                 }
                 continue;
             }
@@ -179,7 +236,12 @@ impl Viewer {
                 _ => (Vec2::new(x, y), GLYPH_PX),
             };
             if let Some(glyph) = self.text.shape_transient(ch.encode_utf8(&mut buf), &style) {
-                cells.push(Cell { glyph, at, size, color: INK });
+                cells.push(Cell {
+                    glyph,
+                    at,
+                    size,
+                    color: INK,
+                });
             }
         }
         self.rows.insert(r, cells);
@@ -230,15 +292,26 @@ impl Viewer {
             return None;
         }
         let ch = char::from_u32(cp)?;
-        let block = BLOCKS.iter().rev().find(|(s, _)| *s <= cp).map(|(_, n)| *n).unwrap_or("—");
+        let block = BLOCKS
+            .iter()
+            .rev()
+            .find(|(s, _)| *s <= cp)
+            .map(|(_, n)| *n)
+            .unwrap_or("—");
         let family = self
             .text
             .diagnostics()
             .family_for(self.chain, ch)
             .unwrap_or_else(|| "—".into());
         // Canonical Unicode name (handles algorithmic CJK/Hangul ranges too).
-        let name = unicode_names2::name(ch).map(|n| n.to_string()).unwrap_or_else(|| "—".into());
-        let shown = if ch.is_control() || ch.is_whitespace() { ' ' } else { ch };
+        let name = unicode_names2::name(ch)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "—".into());
+        let shown = if ch.is_control() || ch.is_whitespace() {
+            ' '
+        } else {
+            ch
+        };
         // Stable/short fields first (padded so they hold their columns); the noisy
         // variable-length name goes last so it never shoves the rest around.
         Some(Hover {
@@ -372,7 +445,10 @@ fn device_descriptor(max_texture_dimension_2d: u32) -> wgpu::DeviceDescriptor<'s
     wgpu::DeviceDescriptor {
         label: Some("unicode_zoom"),
         required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits { max_texture_dimension_2d, ..Default::default() },
+        required_limits: wgpu::Limits {
+            max_texture_dimension_2d,
+            ..Default::default()
+        },
         memory_hints: wgpu::MemoryHints::default(),
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         trace: wgpu::Trace::Off,
@@ -497,11 +573,21 @@ impl Gfx {
             })
             .await
             .expect("adapter");
-        let (device, queue) = adapter.request_device(&device_descriptor(adapter.limits().max_texture_dimension_2d)).await.expect("device");
+        let (device, queue) = adapter
+            .request_device(&device_descriptor(
+                adapter.limits().max_texture_dimension_2d,
+            ))
+            .await
+            .expect("device");
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -560,7 +646,9 @@ impl Gfx {
 
     /// Copy the hovered character (left) or its code point (right) to the clipboard.
     fn on_click(&mut self, button: MouseButton) {
-        let Some(h) = self.viewer.hovered(self.cursor, self.offset, self.scale) else { return };
+        let Some(h) = self.viewer.hovered(self.cursor, self.offset, self.scale) else {
+            return;
+        };
         let s = match button {
             MouseButton::Left => h.text,
             MouseButton::Right => h.code,
@@ -594,7 +682,8 @@ impl Gfx {
 
     fn draw(&mut self) {
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.viewer.device, &self.config);
                 return;
@@ -630,7 +719,8 @@ impl Gfx {
 
         let now = Instant::now();
         self.samples.push((now, cost));
-        self.samples.retain(|(t, _)| now.duration_since(*t).as_secs_f32() < 5.0);
+        self.samples
+            .retain(|(t, _)| now.duration_since(*t).as_secs_f32() < 5.0);
         // Keep sampling continuously so the p99 window stays live.
         self.window.request_redraw();
     }
@@ -670,21 +760,39 @@ fn dump() {
             })
             .await
             .expect("adapter");
-        adapter.request_device(&device_descriptor(adapter.limits().max_texture_dimension_2d)).await.expect("device")
+        adapter
+            .request_device(&device_descriptor(
+                adapter.limits().max_texture_dimension_2d,
+            ))
+            .await
+            .expect("device")
     });
     let mut viewer = Viewer::new(device, queue, &dummy_config());
 
     // Regional: Latin → CJK-radicals, big world-space titles + glyph grid + tofu.
-    dump_png(&mut viewer, 1450, 920, Vec2::new(10.0, 16.0), 0.9, "unicode_map.png");
+    dump_png(
+        &mut viewer,
+        1450,
+        920,
+        Vec2::new(10.0, 16.0),
+        0.9,
+        "unicode_map.png",
+    );
 
     // Deep zoom on the CJK Unified Ideographs block — big, crisp curves.
     let row = (0x4E00i64 / COLS) as f32;
     let scale = 2.6;
     let offset = Vec2::new(40.0 - GUTTER_W * scale, 40.0 - row * CELL_H * scale);
-    dump_png(&mut viewer, 1000, 620, offset, scale, "unicode_map_zoom.png");
+    dump_png(
+        &mut viewer,
+        1000,
+        620,
+        offset,
+        scale,
+        "unicode_map_zoom.png",
+    );
 
     println!("wrote unicode_map.png (regional) and unicode_map_zoom.png (CJK deep zoom)");
-
 
     // Perf probe: time the per-frame CPU render cost (emit + buffer upload +
     // encode + submit) for a dense, fully zoomed-out frame — the worst case now
@@ -692,7 +800,11 @@ fn dump() {
     let (w, h) = (1600u32, 1000u32);
     let target = viewer.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("probe"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -742,7 +854,11 @@ fn dummy_config() -> wgpu::SurfaceConfiguration {
 fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path: &str) {
     let target = viewer.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("dump"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -754,8 +870,8 @@ fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path:
     viewer.render(&view, w as f32, h as f32, offset, scale, None);
 
     let unpadded = w * 4;
-    let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded =
+        unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let readback = viewer.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: (padded * h) as u64,
@@ -778,12 +894,19 @@ fn dump_png(viewer: &mut Viewer, w: u32, h: u32, offset: Vec2, scale: f32, path:
                 rows_per_image: Some(h),
             },
         },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
     );
     viewer.queue.submit([enc.finish()]);
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    viewer.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    viewer
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
     let data = slice.get_mapped_range().unwrap();
     let mut pixels = Vec::with_capacity((unpadded * h) as usize);
     for row in 0..h {
