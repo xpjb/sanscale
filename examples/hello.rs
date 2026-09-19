@@ -2,7 +2,7 @@
 //!
 //! Two large multilingual lines move every frame without reshaping. The FPS line
 //! changes through one stable block and paragraph slot; only its generation moves
-//! when the displayed EMA value changes.
+//! when the displayed value changes.
 //!
 //! Interactive: `cargo run --example hello`
 //! Preview PNG: `cargo run --example hello -- --dump`
@@ -90,7 +90,7 @@ impl Scene {
             )
             .expect("no usable system font found");
 
-        let fps_text = "60.0 FPS  ·  16.67 ms EMA".to_string();
+        let fps_text = "60.00 FPS".to_string();
         let fps_key = ParagraphKey {
             namespace: 0,
             slot: 2,
@@ -123,11 +123,7 @@ impl Scene {
         elapsed: f32,
         frame_seconds_ema: f32,
     ) -> [Draw; 3] {
-        let next_fps = format!(
-            "{:5.1} FPS  ·  {:5.2} ms EMA",
-            frame_seconds_ema.recip(),
-            frame_seconds_ema * 1000.0
-        );
+        let next_fps = format!("{:6.2} FPS", frame_seconds_ema.recip());
         if next_fps != self.fps_text {
             self.fps_text = next_fps;
             self.fps_generation = self.fps_generation.wrapping_add(1);
