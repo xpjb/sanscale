@@ -812,4 +812,5 @@ Still compendium's job (unchanged):
 
 **Naming update:** the interactive `unicode_zoom` and `emoji_zoom` examples are now
 `unicode` and `emoji`. The one-shot `paragraph` and static `unicode` PNG examples were
-removed so the shipped examples represent application use.
+removed so the shipped examples represent application use. `hello_png` was replaced by a
+live `hello` window that also demonstrates identity-keyed rapid text updates.

@@ -1,6 +1,5 @@
-//! Shared headless-wgpu boilerplate for the examples. Not part of the library —
-//! it spins up a GPU device with no window, discovers system fonts, and draws
-//! sanscale vertices (glyphs + color emoji) so the examples can focus on the API.
+//! Shared support for the examples. Not part of the library: system-font
+//! discovery, clipboard access, and an offscreen harness for preview images.
 
 #![allow(dead_code)] // each example uses a different subset of these helpers.
 
@@ -8,7 +7,7 @@ use sanscale::{FontChainHandle, FontData, TextService};
 
 pub mod emoji_data;
 
-/// What's under the cursor in the zoomable examples: a human-readable `label` for
+/// What's under the cursor in the viewer examples: a human-readable `label` for
 /// the debug line, the `text` to copy on left-click, and the `code` (code points)
 /// to copy on right-click.
 pub struct Hover {

@@ -46,5 +46,5 @@ signatures by hand.
 
 ## Examples
 
-`hello_png` writes a PNG; `unicode`, `emoji`, and `editor` open a window. Don't launch the
-windowed ones — pass `-- --dump` for PNG stills instead.
+`hello`, `unicode`, `emoji`, and `editor` open a window. Don't launch them during automated
+checks — pass `-- --dump` for PNG stills instead.

@@ -30,7 +30,7 @@ png = "0.17"
 log = "0.4"
 
 [dev-dependencies]
-# Headless examples/benches: block on the async wgpu device request and dump PNGs.
+# Block on async device requests and write optional example preview PNGs.
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # System-font discovery for the fallback-chain examples (CJK, emoji, etc.).

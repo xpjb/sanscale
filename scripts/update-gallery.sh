@@ -3,14 +3,14 @@ set -eu
 
 # The multilingual previews need broad system coverage. On Arch Linux:
 #   pacman -S ttf-dejavu noto-fonts noto-fonts-cjk noto-fonts-emoji
-# Other platforms need equivalent Latin, CJK, symbol, and color-emoji fonts.
+# Other platforms need equivalent Latin, CJK, Indic, symbol, and color-emoji fonts.
 
 rm -f \
   hello.png unicode_map.png unicode_map_zoom.png \
   emoji_board.png emoji_board_zoom.png emoji_flags.png \
   editor.png
 
-cargo run --example hello_png
+cargo run --example hello -- --dump
 cargo run --example unicode -- --dump
 cargo run --example emoji -- --dump
 cargo run --example editor -- --dump
