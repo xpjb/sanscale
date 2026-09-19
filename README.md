@@ -92,23 +92,21 @@ bytes to `map_font` instead.
 
 ## Examples
 
-Run an example with `cargo run --example <name>`. The first three are headless;
-for the interactive examples, append `-- --dump` to render the preview frame
-without opening a window.
+Run an example with `cargo run --example <name>`. `hello_png` is headless; for
+the interactive examples, append `-- --dump` to render a preview frame without
+opening a window.
 
 | preview | example / focus |
 |---|---|
 | [![Hello](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/hello.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/hello.png) | [`hello_png`](examples/hello_png.rs)<br>Minimal map → shape → draw path |
-| [![Paragraph](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/paragraph.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/paragraph.png) | [`paragraph`](examples/paragraph.rs)<br>Wrapping, alignment, measurement, and multi-paragraph blocks |
-| [![Unicode](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode.png) | [`unicode`](examples/unicode.rs)<br>CJK, Indic, RTL scripts, symbols, and color emoji through one fallback chain |
-| [![Unicode zoom](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode_zoom.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode_zoom.png) | [`unicode_zoom`](examples/unicode_zoom.rs)<br>Zoomable, lazily populated map of Unicode planes 0–2 |
-| [![Emoji zoom](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/emoji_zoom.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/emoji_zoom.png) | [`emoji_zoom`](examples/emoji_zoom.rs)<br>Every RGI emoji sequence, grouped like a picker |
+| [![Unicode](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode.png) | [`unicode`](examples/unicode.rs)<br>Zoomable, lazily populated map of Unicode planes 0–2 |
+| [![Emoji](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/emoji.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/emoji.png) | [`emoji`](examples/emoji.rs)<br>Every RGI emoji sequence, grouped like a picker |
 | [![Editor](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/editor.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/editor.png) | [`editor`](examples/editor.rs)<br>Rope-backed notepad dogfooding caret, selection, hit-testing, and invalidation |
 
 Regenerate every committed preview with `scripts/update-gallery.sh`; broad
 Latin, CJK, Indic, symbol, and color-emoji system fonts are required.
 
-`unicode_zoom` opens a window: a
+`unicode` opens a window: a
 Unifont-style 256-column map of the entire Unicode codespace — code point =
 `row*256 + col`, a glyph where some font covers it and a tofu box where none does,
 block labels down the side. It never enumerates up front; each frame culls to the

@@ -109,45 +109,6 @@ pub fn font_chain(text: &mut TextService, families: &[&str]) -> FontChainHandle 
     text.register_chain(&handles)
 }
 
-/// Labelled multilingual samples, shared by the Unicode examples.
-pub fn unicode_sections() -> Vec<(&'static str, &'static str)> {
-    vec![
-        (
-            "Latin + accents",
-            "The quick brown fox — jüber naïve Æsop, coöperate £€$¥.",
-        ),
-        (
-            "Greek",
-            "Ζεύς· ἀλήθεια καὶ σοφία. Μαθηματικά: αβγδ ΔΣΩ π≈3.14159.",
-        ),
-        (
-            "Cyrillic",
-            "Съешь ещё этих мягких французских булок да выпей чаю.",
-        ),
-        (
-            "Chinese 中文",
-            "床前明月光，疑是地上霜。举头望明月，低头思故乡。",
-        ),
-        (
-            "Japanese 日本語",
-            "いろはにほへと ちりぬるを — 平仮名・片仮名・漢字。",
-        ),
-        ("Korean 한국어", "다람쥐 헌 쳇바퀴에 타고파. 훈민정음 한글."),
-        ("Arabic العربية", "العربية لغة جميلة ومعقدة."),
-        ("Hebrew עברית", "עברית: שלום עולם."),
-        ("Devanagari", "नमस्ते दुनिया — देवनागरी लिपि।"),
-        ("Thai", "ภาษาไทย สวัสดีชาวโลก"),
-        (
-            "Symbols & math",
-            "∀x∈ℝ ∃y: x²≥0 ∑∫√∞ ← ↑ → ↓ ↔ ⇒ ✓ ✗ ★ ☆ ♠♥♦♣",
-        ),
-        (
-            "Emoji 🎨",
-            "😀 😆 😅 🤣 😍 😎 🤖 🎉 🚀 🌍 ❤️ 🔥 ✨ 🐙 🍜 👋",
-        ),
-    ]
-}
-
 /// A headless GPU device plus the offscreen surface config the renderer needs.
 pub struct Harness {
     pub device: wgpu::Device,

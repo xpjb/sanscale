@@ -809,3 +809,7 @@ Still compendium's job (unchanged):
 - `is_single_glyph` / `glyph_bbox` / `family_for` were example-only escape hatches leaked
   into the public API — become a `diagnostics()` accessor or get inlined into the examples.
 - `common/mod.rs` `Harness` save-PNG helpers retarget the new `draw`.
+
+**Naming update:** the interactive `unicode_zoom` and `emoji_zoom` examples are now
+`unicode` and `emoji`. The one-shot `paragraph` and static `unicode` PNG examples were
+removed so the shipped examples represent application use.

@@ -14,7 +14,7 @@ what's owed.
 `Vec<ChainFont<'_>>` each time, pairing every handle in the chain with its
 `&Font`. Twelve call sites, including all six `Diagnostics` methods.
 
-The visible cost today is startup, not frames: `unicode_zoom`'s `build_row` calls
+The visible cost today is startup, not frames: `unicode`'s `build_row` calls
 `covers()` and `glyph_bbox()` per cell, so populating every row does roughly 83k
 throwaway allocations. Rows are cached, so it never recurs, and it does not appear
 in the frame probe at all. `shape()` is clean on its early-out path — it checks

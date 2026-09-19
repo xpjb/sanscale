@@ -1,17 +1,14 @@
-//! The ultimate example: a zoomable map of the whole Unicode codespace.
+//! A zoomable board of every RGI emoji — the sibling of `unicode`, identical in
+//! every respect (pan/zoom, world-space category titles, per-row vertex cache,
+//! p99 debug line, headless `--dump`) but the content is the full emoji set from
+//! Unicode's `emoji-test.txt`, in canonical picker order and grouped by category.
 //!
-//! Fixed Unifont-style grid — 256 columns, `code point = row*256 + col` — across
-//! planes 0–2. Nothing is enumerated up front: each frame culls to the visible
-//! cells and only shapes/draws those. Covered code points draw their glyph; the
-//! rest draw a faint tofu box. A reserved left gutter holds big **world-space**
-//! block titles that scale with the map like everything else. Below a minimum
-//! on-screen cell size the glyphs are culled (the titles carry navigation). It
-//! all stays razor-sharp at any zoom because coverage is analytic — only the
-//! color-emoji raster atlas pixelates.
+//! Unlike the codespace map, each cell shapes a whole **sequence** (ZWJ, flags,
+//! skin-tone, keycaps), so this also exercises multi-code-point emoji shaping.
 //!
-//! Interactive:  `cargo run --example unicode_zoom`
+//! Interactive:  `cargo run --example emoji`
 //!     scroll = zoom at cursor · drag (any button) = pan · R = reset · Esc = quit
-//! Headless PNGs: `cargo run --example unicode_zoom -- --dump`
+//! Headless PNGs: `cargo run --example emoji -- --dump`
 
 mod common;
 
@@ -28,93 +25,28 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use common::emoji_data::GROUPS;
 use common::{Hover, UNICODE_FALLBACK, copy_to_clipboard, font_chain};
 
-const COLS: i64 = 256;
-const CELL_W: f32 = 20.0;
-const CELL_H: f32 = 22.0;
-const GLYPH_PX: f32 = 15.0;
-const MAX_ROW: i64 = 0x2_FFFF / COLS; // planes 0–2
+const COLS: usize = 40; // emoji per row
+const CELL_W: f32 = 44.0;
+const CELL_H: f32 = 44.0;
+const GLYPH_PX: f32 = 34.0;
 const GUTTER_W: f32 = 560.0; // world-space column reserved on the left for titles
 const TITLE_PX: f32 = 52.0; // world-space title height (scales with zoom)
 const WORLD_W: f32 = GUTTER_W + COLS as f32 * CELL_W;
-const WORLD_H: f32 = (MAX_ROW as f32 + 1.0) * CELL_H;
 const INK: [f32; 4] = [0.12, 0.13, 0.16, 1.0];
-const TOFU: [f32; 4] = [0.80, 0.81, 0.84, 1.0];
 const TITLE: [f32; 4] = [0.16, 0.40, 0.82, 1.0];
 
-/// Major Unicode blocks (start, short name), ascending. Names are kept short so
-/// they fit the title gutter at the world-space title size.
-const BLOCKS: &[(u32, &str)] = &[
-    (0x0000, "Basic Latin"),
-    (0x0080, "Latin-1 Suppl."),
-    (0x0100, "Latin Ext-A"),
-    (0x0180, "Latin Ext-B"),
-    (0x0250, "IPA Extensions"),
-    (0x0300, "Combining Marks"),
-    (0x0370, "Greek"),
-    (0x0400, "Cyrillic"),
-    (0x0530, "Armenian"),
-    (0x0590, "Hebrew"),
-    (0x0600, "Arabic"),
-    (0x0700, "Syriac"),
-    (0x0900, "Devanagari"),
-    (0x0980, "Bengali"),
-    (0x0B80, "Tamil"),
-    (0x0C00, "Telugu"),
-    (0x0D00, "Malayalam"),
-    (0x0E00, "Thai"),
-    (0x0E80, "Lao"),
-    (0x0F00, "Tibetan"),
-    (0x1000, "Myanmar"),
-    (0x10A0, "Georgian"),
-    (0x1100, "Hangul Jamo"),
-    (0x1200, "Ethiopic"),
-    (0x13A0, "Cherokee"),
-    (0x1780, "Khmer"),
-    (0x1800, "Mongolian"),
-    (0x1E00, "Latin Ext. Add'l"),
-    (0x1F00, "Greek Ext."),
-    (0x2000, "Punctuation"),
-    (0x20A0, "Currency"),
-    (0x2100, "Letterlike"),
-    (0x2190, "Arrows"),
-    (0x2200, "Math Operators"),
-    (0x2300, "Misc Technical"),
-    (0x2460, "Enclosed Alnum"),
-    (0x2500, "Box Drawing"),
-    (0x2600, "Misc Symbols"),
-    (0x2700, "Dingbats"),
-    (0x2800, "Braille"),
-    (0x2E80, "CJK Radicals"),
-    (0x3000, "CJK Symbols"),
-    (0x3040, "Hiragana"),
-    (0x30A0, "Katakana"),
-    (0x3100, "Bopomofo"),
-    (0x3130, "Hangul Compat."),
-    (0x3400, "CJK Ext-A"),
-    (0x4E00, "CJK Ideographs"),
-    (0xA000, "Yi Syllables"),
-    (0xAC00, "Hangul Syllables"),
-    (0xF900, "CJK Compat."),
-    (0xFB00, "Present. Forms"),
-    (0xFF00, "Half/Fullwidth"),
-    (0x10000, "Linear B (pl.1)"),
-    (0x1D400, "Math Alnum."),
-    (0x1F300, "Pictographs"),
-    (0x1F600, "Emoticons"),
-    (0x1F680, "Transport"),
-    (0x20000, "CJK Ext-B (pl.2)"),
-];
-
 fn main() {
+    // Surface sanscale's atlas warnings on stderr.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     if std::env::args().any(|a| a == "--dump") {
         dump();
         return;
     }
     println!(
-        "scroll = zoom · drag = pan · left-click = copy char · right-click = copy code point · R = reset · Esc = quit"
+        "scroll = zoom · drag = pan · left-click = copy emoji · right-click = copy code points · R = reset · Esc = quit"
     );
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -128,53 +60,88 @@ fn model(offset: Vec2, scale: f32) -> Mat4 {
     Mat4::from_translation(Vec3::new(offset.x, offset.y, 0.0))
         * Mat4::from_scale(Vec3::splat(scale))
 }
-/// One placed cell: a shaped handle plus where and how big to draw it. The
-/// service caches the shaping; this caches only the placement, which is what the
-/// per-row vertex cache used to do by hand.
-/// The replacement character drawn for an uncovered code point.
+/// The replacement box drawn for a sequence the fonts can't ligate.
 const TOFU_BOX: &str = "\u{25A1}";
 
+/// One placed cell: a shaped handle plus where and how big to draw it.
 #[derive(Clone, Copy)]
-struct Cell {
+struct PlacedCell {
     glyph: ShapedHandle,
     at: Vec2,
     size: f32,
     color: [f32; 4],
 }
 
-/// Largest size (≤ `GLYPH_PX`) at which a glyph of this em bbox fits its cell.
-fn fit_scale(mnx: f32, mny: f32, mxx: f32, mxy: f32) -> f32 {
-    let gw = (mxx - mnx).max(1e-3);
-    let gh = (mxy - mny).max(1e-3);
-    GLYPH_PX.min((CELL_W - 3.0) / gw).min((CELL_H - 5.0) / gh)
+/// One emoji cell: world x, the (possibly multi-code-point) string, and its name.
+struct Cell {
+    x: f32,
+    emoji: &'static str,
+    name: &'static str,
 }
 
-/// Owns the text service and renders one culled frame on demand.
-///
-/// Gone with the old API: two GPU renderers, two atlases, three growable vertex
-/// buffers, the per-row *vertex* cache, and the `emoji_epoch` invalidation that
-/// existed only because those cached vertices had atlas UVs baked into them.
+/// One laid-out row of emoji, optionally introducing a category (title in gutter).
+struct RowLayout {
+    cells: Vec<Cell>,
+    title: Option<&'static str>,
+}
+
+/// Flatten the grouped emoji list into rows: each category starts on a fresh row
+/// with its name in the gutter, then flows `COLS` emoji per row.
+fn build_layout() -> Vec<RowLayout> {
+    let mut layout = Vec::new();
+    for &(group, items) in GROUPS {
+        let rows = items.len().div_ceil(COLS);
+        for ri in 0..rows {
+            let mut cells = Vec::new();
+            for ci in 0..COLS {
+                let Some(&(emoji, name)) = items.get(ri * COLS + ci) else {
+                    break;
+                };
+                // The cell's origin. Centring within it is done at placement time,
+                // off the shaped block's measured box.
+                cells.push(Cell {
+                    x: GUTTER_W + ci as f32 * CELL_W,
+                    emoji,
+                    name,
+                });
+            }
+            layout.push(RowLayout {
+                cells,
+                title: (ri == 0).then_some(group),
+            });
+        }
+    }
+    layout
+}
+
 struct Viewer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     text: TextService,
     chain: FontChainHandle,
     format: wgpu::TextureFormat,
-    /// Per-row cached *placements*. A cell's position and glyph are fixed by its
-    /// code point, so a row is shaped once and then just re-drawn.
-    rows: HashMap<i64, Vec<Cell>>,
+    layout: Vec<RowLayout>,
+    world_h: f32,
+    /// Per-row cached *placements*; the service caches the shaping and the quads.
+    /// Gone with it: the `emoji_epoch` invalidation, which existed only because
+    /// these used to be atlas-baked vertices held out here.
+    rows: HashMap<i64, Vec<PlacedCell>>,
 }
 
 impl Viewer {
     fn new(device: wgpu::Device, queue: wgpu::Queue, config: &wgpu::SurfaceConfiguration) -> Self {
         let mut text = TextService::new();
         let chain = font_chain(&mut text, UNICODE_FALLBACK);
+        let layout = build_layout();
+        let world_h = (layout.len() as f32 + 1.0) * CELL_H;
         Self {
             device,
             queue,
             text,
             chain,
             format: config.format,
+            layout,
+            world_h,
             rows: HashMap::new(),
         }
     }
@@ -188,88 +155,93 @@ impl Viewer {
         }
     }
 
-    /// Shape and cache one row's cells (covered -> glyph, else -> tofu box).
-    /// Cheap no-op once the row is cached.
+    /// Shape and cache one row's emoji (each cell may be a multi-code-point
+    /// sequence). Cheap no-op once cached.
     fn build_row(&mut self, r: i64) {
         if self.rows.contains_key(&r) {
             return;
         }
-        let style = self.style();
         let mut cells = Vec::new();
-        let mut buf = [0u8; 4];
-        let base = r * COLS;
-        for c in 0..COLS {
-            let cp = (base + c) as u32;
-            if (0xD800..=0xDFFF).contains(&cp) {
-                continue;
-            }
-            let Some(ch) = char::from_u32(cp) else {
-                continue;
-            };
-            if ch.is_control() || ch.is_whitespace() {
-                continue;
-            }
-            let x = GUTTER_W + c as f32 * CELL_W + 3.0;
+        if r >= 0 && (r as usize) < self.layout.len() {
+            let style = self.style();
             let y = r as f32 * CELL_H;
-            if !self.text.diagnostics().covers(self.chain, ch) {
-                if let Some(glyph) = self.text.shape_transient(TOFU_BOX, &style) {
-                    cells.push(Cell {
-                        glyph,
-                        at: Vec2::new(x, y),
-                        size: GLYPH_PX,
-                        color: TOFU,
-                    });
-                }
-                continue;
-            }
-            // Some glyphs (PUA icons, Cuneiform, ...) extend well past 1em; shrink
-            // and center those to their cell so they don't overflow into
-            // neighbors. Normal glyphs keep the baseline grid.
-            let bbox = self.text.diagnostics().glyph_bbox(self.chain, ch);
-            let (at, size) = match bbox {
-                Some((mnx, mny, mxx, mxy)) if fit_scale(mnx, mny, mxx, mxy) < GLYPH_PX => {
-                    let s = fit_scale(mnx, mny, mxx, mxy);
-                    let ccx = GUTTER_W + c as f32 * CELL_W + CELL_W * 0.5;
-                    let ccy = r as f32 * CELL_H + CELL_H * 0.5;
-                    (Vec2::new(ccx - (mnx + mxx) * 0.5 * s, ccy - s * 0.5), s)
-                }
-                _ => (Vec2::new(x, y), GLYPH_PX),
-            };
-            if let Some(glyph) = self.text.shape_transient(ch.encode_utf8(&mut buf), &style) {
-                cells.push(Cell {
+            let row: Vec<(f32, &'static str)> = self.layout[r as usize]
+                .cells
+                .iter()
+                .map(|cell| (cell.x, cell.emoji))
+                .collect();
+            for (x, emoji) in row {
+                // Sequences the fonts can't ligate (a missing ZWJ/flag component)
+                // shape to several glyphs that overflow the cell — show one tofu
+                // box instead of the overlapping pieces. `is_single_glyph` asks
+                // the face the shaper will actually pick, so this agrees with what
+                // gets drawn.
+                let single = self.text.diagnostics().is_single_glyph(self.chain, emoji);
+                let (content, size, color) = if single {
+                    (emoji, GLYPH_PX, INK)
+                } else {
+                    (TOFU_BOX, GLYPH_PX * 0.72, [0.72, 0.73, 0.77, 1.0])
+                };
+                let Some(glyph) = self.text.shape_transient(content, &style) else {
+                    continue;
+                };
+                // Centre the glyph's `size`x`size` em box in the cell. Not the
+                // measured *advance*: that varies per emoji, and centring on it
+                // makes the columns ragged — the grid wants every cell on the same
+                // x, which is what the old fixed pad was doing.
+                //
+                // Vertically the service owns the baseline, so ask it where the
+                // baseline sits within the block (`baseline_em`) and place `at` so
+                // the glyph box lands centred. This is the compensation the port
+                // dropped when `at` became the block's top-left instead of a
+                // baseline — recovered from metrics rather than a tuned constant,
+                // so the smaller tofu box centres by the same rule.
+                let inset = (CELL_H - size) * 0.5;
+                let baseline_em = self
+                    .text
+                    .measure(glyph)
+                    .line(0)
+                    .map(|m| m.baseline_em)
+                    .unwrap_or(1.0);
+                let at = Vec2::new(
+                    x + (CELL_W - size) * 0.5,
+                    y + inset + size - baseline_em * size,
+                );
+                cells.push(PlacedCell {
                     glyph,
                     at,
                     size,
-                    color: INK,
+                    color,
                 });
             }
         }
         self.rows.insert(r, cells);
     }
 
-    /// World-space block titles in the gutter — big, scaling with the map. Kept
-    /// from overlapping via a *screen-space* gap so zooming in reveals more of
-    /// them. The winner set is decided over *all* blocks (the gap test is
-    /// offset-invariant, since baseline differences cancel `offset.y`), and only
-    /// drawing is gated on visibility — so panning a title off-screen no longer
-    /// reshuffles which of the others show.
-    fn title_cells(&mut self, offset: Vec2, scale: f32, h: f32) -> Vec<Cell> {
+    /// World-space category titles in the gutter — same offset-invariant dedup as
+    /// `unicode` so panning doesn't reshuffle which show.
+    fn title_cells(&mut self, offset: Vec2, scale: f32, h: f32) -> Vec<PlacedCell> {
         let style = self.style();
-        let min_gap = TITLE_PX * scale * 1.1; // screen px between title baselines
+        let min_gap = TITLE_PX * scale * 1.1;
         let mut last_kept = f32::MIN;
         let mut cells = Vec::new();
-        for &(start, name) in BLOCKS {
-            let r = (start as i64 / COLS) as f32;
-            let screen_y = r * CELL_H * scale + offset.y;
+        let titles: Vec<(i64, &'static str)> = self
+            .layout
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| row.title.map(|t| (i as i64, t)))
+            .collect();
+        for (r, name) in titles {
+            let screen_y = r as f32 * CELL_H * scale + offset.y;
             if screen_y < last_kept + min_gap {
-                continue; // loses its slot to a nearby title above it
+                continue;
             }
-            last_kept = screen_y; // wins its slot whether or not it's on-screen
+            last_kept = screen_y;
             if screen_y >= -TITLE_PX * scale && screen_y <= h {
                 if let Some(glyph) = self.text.shape_transient(name, &style) {
-                    cells.push(Cell {
+                    cells.push(PlacedCell {
                         glyph,
-                        at: Vec2::new(10.0, r * CELL_H),
+                        at: Vec2::new(10.0, r as f32 * CELL_H),
                         size: TITLE_PX,
                         color: TITLE,
                     });
@@ -279,50 +251,31 @@ impl Viewer {
         cells
     }
 
-    /// The code point under the cursor (with its resolved font family), or `None`.
     fn hovered(&self, cursor: Vec2, offset: Vec2, scale: f32) -> Option<Hover> {
         let world = (cursor - offset) / scale;
         let col = ((world.x - GUTTER_W) / CELL_W).floor() as i64;
         let row = (world.y / CELL_H).floor() as i64;
-        if !(0..COLS).contains(&col) || !(0..=MAX_ROW).contains(&row) {
+        if col < 0 || row < 0 {
             return None;
         }
-        let cp = (row * COLS + col) as u32;
-        if (0xD800..=0xDFFF).contains(&cp) {
-            return None;
-        }
-        let ch = char::from_u32(cp)?;
-        let block = BLOCKS
-            .iter()
-            .rev()
-            .find(|(s, _)| *s <= cp)
-            .map(|(_, n)| *n)
-            .unwrap_or("—");
-        let family = self
-            .text
-            .diagnostics()
-            .family_for(self.chain, ch)
+        let cell = self.layout.get(row as usize)?.cells.get(col as usize)?;
+        let code = cell
+            .emoji
+            .chars()
+            .map(|c| format!("U+{:04X}", c as u32))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let family = cell
+            .emoji
+            .chars()
+            .next()
+            .and_then(|c| self.text.diagnostics().family_for(self.chain, c))
             .unwrap_or_else(|| "—".into());
-        // Canonical Unicode name (handles algorithmic CJK/Hangul ranges too).
-        let name = unicode_names2::name(ch)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "—".into());
-        let shown = if ch.is_control() || ch.is_whitespace() {
-            ' '
-        } else {
-            ch
-        };
-        // Stable/short fields first (padded so they hold their columns); the noisy
-        // variable-length name goes last so it never shoves the rest around.
+        // Stable fields first (padded); the noisy variable-length name goes last.
         Some(Hover {
-            label: format!(
-                "{:<9}{shown}   ·   {:<15}   ·   {:<20}   ·   {name}",
-                format!("U+{cp:04X}"),
-                block,
-                family,
-            ),
-            text: ch.to_string(),
-            code: format!("U+{cp:04X}"),
+            label: format!("{:<18}   ·   {:<26}   ·   {}", family, code, cell.name),
+            text: cell.emoji.to_string(),
+            code,
         })
     }
 
@@ -335,31 +288,38 @@ impl Viewer {
         scale: f32,
         hud: Option<&str>,
     ) {
-        // No epoch check: the service owns its geometry, so an atlas eviction can
-        // no longer invalidate anything cached out here.
         let inv = 1.0 / scale;
-        let r0 = ((((0.0 - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, MAX_ROW);
-        let r1 = ((((h - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, MAX_ROW);
-        let mut cells: Vec<Cell> = Vec::new();
+        let r0 = ((((0.0 - offset.y) * inv) / CELL_H).floor() as i64).max(0);
+        let r1 =
+            ((((h - offset.y) * inv) / CELL_H).floor() as i64).min(self.layout.len() as i64 - 1);
+        let mut cells: Vec<PlacedCell> = Vec::new();
         for r in r0..=r1 {
             self.build_row(r);
             cells.extend_from_slice(&self.rows[&r]);
         }
-        // Titles depend on the camera, so they are gathered fresh each frame.
         cells.extend(self.title_cells(offset, scale, h));
 
         self.text.set_target(&self.device, self.format);
-
-        // The pan/zoom camera goes straight in as the transform — the same call
-        // screen-space text uses, just a different matrix. Quads are emitted in
-        // local em, so nothing here is baked at a zoom level.
+        // The pan/zoom camera is just the transform — same call screen-space text
+        // uses, different matrix.
         let cam = ortho(w, h) * model(offset, scale);
         self.text.set_transform(&self.queue, cam.to_cols_array());
+
+        let batch: Vec<Draw> = cells
+            .iter()
+            .map(|cell| Draw {
+                block: cell.glyph,
+                at: sanscale::Vec2::new(cell.at.x, cell.at.y),
+                size: cell.size,
+                color: sanscale::Color(cell.color),
+                clip: None,
+            })
+            .collect();
 
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("map"),
+                label: Some("board"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     depth_slice: None,
@@ -379,26 +339,11 @@ impl Viewer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // One call for the whole visible grid: the service concatenates the
-            // cached quads and issues a single draw per pipeline, instead of one
-            // draw per cell.
-            let batch: Vec<Draw> = cells
-                .iter()
-                .map(|cell| Draw {
-                    block: cell.glyph,
-                    at: sanscale::Vec2::new(cell.at.x, cell.at.y),
-                    size: cell.size,
-                    color: sanscale::Color(cell.color),
-                    clip: None,
-                })
-                .collect();
             self.text
                 .draw_batch(&self.device, &self.queue, &mut pass, &batch);
         }
         self.queue.submit([enc.finish()]);
 
-        // Screen-space debug line (bottom-left), drawn over the map in a second
-        // pass with the plain pixel ortho.
         let Some(hud) = hud else { return };
         let style = self.style();
         let Some(overlay) = self.text.shape_transient(hud, &style) else {
@@ -440,10 +385,10 @@ impl Viewer {
 }
 
 /// Request the adapter's full 2D texture size (default limits cap it at 8192,
-/// which the glyph atlas can exceed with a large script like CJK).
+/// which the emoji atlas can exceed) so more color glyphs fit before overflow.
 fn device_descriptor(max_texture_dimension_2d: u32) -> wgpu::DeviceDescriptor<'static> {
     wgpu::DeviceDescriptor {
-        label: Some("unicode_zoom"),
+        label: Some("emoji"),
         required_features: wgpu::Features::empty(),
         required_limits: wgpu::Limits {
             max_texture_dimension_2d,
@@ -497,8 +442,7 @@ impl ApplicationHandler for App {
                 gfx.zoom_at_cursor(1.15f32.powf(dy));
                 gfx.window.request_redraw();
             }
-            // Any button drags to pan; a button *click* (no drag) copies — left
-            // copies the character, right copies the code point.
+            // Drag to pan; a click (no drag) copies — left the emoji, right its code points.
             WindowEvent::MouseInput {
                 state,
                 button: button @ (MouseButton::Left | MouseButton::Right | MouseButton::Middle),
@@ -544,9 +488,9 @@ struct Gfx {
     cursor: Vec2,
     dragging: bool,
     press_pos: Vec2,
-    moved: bool, // did the cursor move since the button went down (drag vs click)
-    copied: Option<(String, Instant)>, // last copied string, for brief HUD feedback
-    samples: Vec<(Instant, f32)>, // (timestamp, render-cost ms) over ~5s
+    moved: bool,
+    copied: Option<(String, Instant)>,
+    samples: Vec<(Instant, f32)>,
 }
 
 impl Gfx {
@@ -555,7 +499,7 @@ impl Gfx {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("sanscale · the whole of Unicode")
+                        .with_title("sanscale · the whole of emoji")
                         .with_inner_size(PhysicalSize::new(1280, 820)),
                 )
                 .unwrap(),
@@ -594,8 +538,6 @@ impl Gfx {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
-            // Lowest-latency present mode available (Mailbox → drag tracks the
-            // cursor without buffering extra frames), and only 1 frame in flight.
             present_mode: caps
                 .present_modes
                 .iter()
@@ -629,7 +571,7 @@ impl Gfx {
     }
 
     fn reset_view(&mut self) {
-        self.scale = 0.6;
+        self.scale = 0.9;
         self.offset = Vec2::new(10.0, 16.0);
         self.clamp_camera();
     }
@@ -644,7 +586,6 @@ impl Gfx {
         self.clamp_camera();
     }
 
-    /// Copy the hovered character (left) or its code point (right) to the clipboard.
     fn on_click(&mut self, button: MouseButton) {
         let Some(h) = self.viewer.hovered(self.cursor, self.offset, self.scale) else {
             return;
@@ -660,24 +601,28 @@ impl Gfx {
         self.window.request_redraw();
     }
 
+    /// Minimum zoom: far enough out that the whole board (width *or* height,
+    /// whichever binds) fits — so you can always see the full set.
+    fn min_scale(&self) -> f32 {
+        let (w, h) = (self.config.width as f32, self.config.height as f32);
+        (w / WORLD_W).min(h / self.viewer.world_h)
+    }
+
     fn zoom_at_cursor(&mut self, factor: f32) {
-        let w = self.config.width as f32;
-        let min_scale = w / WORLD_W; // never zoom out past the full map width
-        let new_scale = (self.scale * factor).clamp(min_scale, 60.0);
+        let new_scale = (self.scale * factor).clamp(self.min_scale(), 60.0);
         let world = (self.cursor - self.offset) / self.scale;
         self.offset = self.cursor - world * new_scale;
         self.scale = new_scale;
         self.clamp_camera();
     }
 
-    /// Keep the camera over the map (plus a small margin), never off in the void.
     fn clamp_camera(&mut self) {
         let (w, h) = (self.config.width as f32, self.config.height as f32);
-        self.scale = self.scale.clamp(w / WORLD_W, 60.0);
+        self.scale = self.scale.clamp(self.min_scale(), 60.0);
         let s = self.scale;
         let margin = 40.0;
         self.offset.x = clamp_axis(self.offset.x, w - WORLD_W * s - margin, margin);
-        self.offset.y = clamp_axis(self.offset.y, h - WORLD_H * s - margin, margin);
+        self.offset.y = clamp_axis(self.offset.y, h - self.viewer.world_h * s - margin, margin);
     }
 
     fn draw(&mut self) {
@@ -692,8 +637,6 @@ impl Gfx {
         };
         let view = frame.texture.create_view(&Default::default());
 
-        // Debug line: p99 of the last ~5s of per-frame CPU render cost, the hovered
-        // code point (+ its font), and a brief note after a copy.
         let p99 = p99(&self.samples);
         let mut hud = match self.viewer.hovered(self.cursor, self.offset, self.scale) {
             Some(h) => format!("p99 {p99:6.2} ms   ·   {}", h.label),
@@ -703,6 +646,14 @@ impl Gfx {
             if t.elapsed().as_secs_f32() < 2.0 {
                 hud = format!("{hud}   ·   copied {s}");
             }
+        }
+        // Atlas pressure, so overflow is never invisible: current height and, if the
+        // working set ever exceeds the budget, the count of glyphs it had to drop.
+        let (_, _, (_, atlas_h)) = self.viewer.text.diagnostics().atlas_sizes();
+        hud = format!("{hud}   ·   atlas {atlas_h}px");
+        let dropped = self.viewer.text.diagnostics().dropped_glyphs();
+        if dropped > 0 {
+            hud = format!("{hud}   ·   DROPPED {dropped}");
         }
 
         let t0 = Instant::now();
@@ -721,12 +672,10 @@ impl Gfx {
         self.samples.push((now, cost));
         self.samples
             .retain(|(t, _)| now.duration_since(*t).as_secs_f32() < 5.0);
-        // Keep sampling continuously so the p99 window stays live.
         self.window.request_redraw();
     }
 }
 
-/// p99 of the sample costs, in ms.
 fn p99(samples: &[(Instant, f32)]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -738,14 +687,14 @@ fn p99(samples: &[(Instant, f32)]) -> f32 {
 
 fn clamp_axis(v: f32, min: f32, max: f32) -> f32 {
     if min > max {
-        (min + max) * 0.5 // content smaller than viewport on this axis: center it
+        (min + max) * 0.5
     } else {
         v.clamp(min, max)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Headless dump: a regional view + a deep zoom (no window)
+// Headless dump
 // ---------------------------------------------------------------------------
 
 fn dump() {
@@ -768,41 +717,67 @@ fn dump() {
             .expect("device")
     });
     let mut viewer = Viewer::new(device, queue, &dummy_config());
+    println!(
+        "{} emoji in {} rows",
+        GROUPS.iter().map(|(_, e)| e.len()).sum::<usize>(),
+        viewer.layout.len()
+    );
 
-    // Regional: Latin → CJK-radicals, big world-space titles + glyph grid + tofu.
+    // Top of the board (Smileys & Emotion) at a readable zoom.
     dump_png(
         &mut viewer,
         1450,
         920,
         Vec2::new(10.0, 16.0),
-        0.9,
-        "unicode_map.png",
+        0.95,
+        "emoji_board.png",
     );
 
-    // Deep zoom on the CJK Unified Ideographs block — big, crisp curves.
-    let row = (0x4E00i64 / COLS) as f32;
-    let scale = 2.6;
-    let offset = Vec2::new(40.0 - GUTTER_W * scale, 40.0 - row * CELL_H * scale);
+    // Deep zoom on a few cells — big, crisp raster emoji.
     dump_png(
         &mut viewer,
         1000,
         620,
-        offset,
-        scale,
-        "unicode_map_zoom.png",
+        Vec2::new(10.0 - GUTTER_W * 3.0, 16.0),
+        3.0,
+        "emoji_board_zoom.png",
     );
 
-    println!("wrote unicode_map.png (regional) and unicode_map_zoom.png (CJK deep zoom)");
+    // Pan the whole board a viewport at a time (each render() is a frame), filling the
+    // bounded atlas and forcing cross-frame eviction, then dump the Flags category — the
+    // regression the eviction work fixes (flags used to vanish after enough panning).
+    sweep_board(&mut viewer, 920, 0.95);
+    let flags_row = viewer
+        .layout
+        .iter()
+        .position(|r| r.title == Some("Flags"))
+        .unwrap();
+    let flags_y = 16.0 - flags_row as f32 * CELL_H * 0.95;
+    dump_png(
+        &mut viewer,
+        1450,
+        920,
+        Vec2::new(10.0, flags_y),
+        0.95,
+        "emoji_flags.png",
+    );
 
-    // Perf probe: time the per-frame CPU render cost (emit + buffer upload +
-    // encode + submit) for a dense, fully zoomed-out frame — the worst case now
-    // that there is no LOD cull. Warm the caches first, then report percentiles.
-    let (w, h) = (1600u32, 1000u32);
+    let (_, _, (aw, ah)) = viewer.text.diagnostics().atlas_sizes();
+    println!(
+        "wrote emoji_board.png, emoji_board_zoom.png, emoji_flags.png \
+         (emoji atlas {aw}x{ah} after full sweep, dropped {})",
+        viewer.text.diagnostics().dropped_glyphs()
+    );
+}
+
+/// Render every viewport slice of the board once, off-screen, so the bounded atlas
+/// fills and starts evicting — the churn a real pan produces. No read-back.
+fn sweep_board(viewer: &mut Viewer, vh: u32, scale: f32) {
     let target = viewer.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("probe"),
+        label: Some("sweep"),
         size: wgpu::Extent3d {
-            width: w,
-            height: h,
+            width: 1450,
+            height: vh,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -813,28 +788,18 @@ fn dump() {
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    let scale = w as f32 / WORLD_W; // fit whole width → most cells on screen
-    let offset = Vec2::new(0.0, 0.0);
-    let cells = {
-        let cols = COLS;
-        let rows = (h as f32 / (CELL_H * scale)).ceil() as i64;
-        cols * rows
-    };
-    for _ in 0..5 {
-        viewer.render(&view, w as f32, h as f32, offset, scale, None);
+    let mut y = 0.0;
+    while y > -(viewer.world_h * scale) {
+        viewer.render(
+            &view,
+            1450.0,
+            vh as f32,
+            Vec2::new(10.0, 16.0 + y),
+            scale,
+            None,
+        );
+        y -= vh as f32;
     }
-    let mut times = Vec::new();
-    for _ in 0..60 {
-        let t = Instant::now();
-        viewer.render(&view, w as f32, h as f32, offset, scale, None);
-        times.push(t.elapsed().as_secs_f32() * 1000.0);
-    }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = times[times.len() / 2];
-    let p99 = times[((times.len() - 1) as f32 * 0.99) as usize];
-    println!(
-        "perf probe: ~{cells} cells/frame at fit-width, CPU render median {med:.2} ms · p99 {p99:.2} ms"
-    );
 }
 
 fn dummy_config() -> wgpu::SurfaceConfiguration {
