@@ -46,5 +46,10 @@ signatures by hand.
 
 ## Examples
 
-`hello`, `unicode`, `emoji`, and `editor` open a window. Don't launch them during automated
-checks — pass `-- --dump` for PNG stills instead.
+`hello`, `unicode`, `emoji`, `editor`, `code-editor`, and `markdown-editor` open a window. Don't launch
+them during automated checks — pass `-- --dump` for PNG stills instead.
+
+The experimental Markdown parser/model and sanscale adapter stay under
+`examples/markdown-editor/`; its component README documents the dialect, source
+mapping, streaming contracts and deliberately broad work. Do not move Markdown
+or font/window discovery into the core crate as an incidental example change.

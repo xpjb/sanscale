@@ -95,3 +95,72 @@ It stops being fine the moment line breaking is touched. The Knuth-Plass item in
 categorically more expensive, and there is no number it could regress against.
 Whoever picks that up should add a reflow scenario that defeats the cache *first*,
 and take a baseline before changing anything.
+
+**Pipeline baseline added:** [the pathological suite](performance.md) now has
+`cpu.cache.width_fresh` (genuine misses) separately from `width_cycle_cached`, plus
+flow-call/token/glyph-test counters. This measures the current shape+flow pipeline,
+not isolated `flow_paragraph` time: the combined cache still reshapes on a width
+miss. A pure-flow timing probe remains separate work if the breaking algorithm
+itself is changed. Do not relabel a warmed width cycle as that measurement.
+
+---
+
+## Rich text: preserve the route to finer invalidation
+
+The [inline-style design note](rfc-inline-styles.md) records the proposed C-editor
+milestone and the subsequent incremental Markdown renderer, including tables.
+Neither is implemented by that note.
+
+Separate shaping/flow caches and context-safe run reuse remain candidates, not
+prerequisites for spans. The current combined cache can reshape on a width-only
+miss, a changed paragraph reassembles its whole block, geometry has one cached
+variant per block, and preparing again uploads the requested batch. Those are
+specific costs, not grounds for claiming the whole pipeline is incremental just
+because unchanged paragraphs hit their cache.
+
+**Trigger:** implement rich spans with explicit work counters/baselines, then
+revisit the costs that measure in style-only changes, long paragraphs, pane
+resizing, or table-column updates. A font change may need different glyphs without
+needing different flow; preserve the ability to reuse unaffected shaping and
+unchanged layout. Do not introduce global invalidation to avoid tracking these
+dependencies. Any intentionally coarser behavior needs its scope, reason, cost,
+and path to finer reuse written down as required by the note.
+
+
+**C-editor milestone landed:** font spans, the immutable paint pool, defaults, and
+the styled C editor now implement the first part of the note. The lexer is
+line-state incremental; flat paint reconstruction and block assembly remain broad
+work, explicitly documented there. `*.spans.*` cases now measure font density,
+tiny font changes, paint density/recoloring, pool churn and retained paint release.
+Markdown/table rendering has since reached an example-local prototype (below).
+Stable component packaging and context-safe finer shaping/flow reuse remain owed. Tall inline faces retain base-style line
+metrics (including existing line-culling assumptions), rather than introducing a
+new line-height policy in this milestone.
+
+
+**Example placement clarified:** the C example is `code-editor`; `editor` remains
+the plain notepad. This does not change the next product target: a reusable
+incremental Markdown renderer including GFM-style tables, with retained block/cell
+identities and explicit layout dependency invalidation.
+
+
+**Markdown first slice landed:** `markdown-editor` adds split source/preview and an
+example-local custom parser/model + separate sanscale adapter. It handles streamed
+UTF-8, prefix-equivalent parsing, stable table cell projections, source mapping,
+real font spans, bounded delta replay and indexed table heights/visibility. Body
+content cannot change column widths; this is deliberate streaming policy, not
+intrinsic table sizing. See its [contract](examples/markdown-editor/markdown/README.md).
+
+Still owed before a reusable published component: dialect/conformance fixtures,
+recursive containers/reference dependencies and desired syntax extensions;
+capacity/error/lifecycle APIs; preview selection/copy and bidirectional mapping;
+configurable table column sizing; and extraction into an optional companion
+component. Do not pull Markdown, Rope, fontdb or windowing into `TextService`.
+
+Measured coarse costs remain visible: initial/all-new-width table layout, middle
+structural metadata shifts, active paragraph projection, code-line metadata walks,
+top-level block placement, composed source-pane assembly and visible-batch uploads.
+Use the local `--bench` probe and work assertions to identify the next worthwhile
+refinement, rather than assuming all work is local because parsing/layout identities
+are retained. The editor itself still lacks undo, IME, unsaved-change confirmation,
+and preview selection; these are not silently supplied by the Markdown component.

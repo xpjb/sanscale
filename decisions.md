@@ -500,6 +500,39 @@ Things we were pretty confident on, phrased as if we'd do them — but might nee
   font). *But maybe* it reshapes the "one Key = one paragraph" story — today's `Style` is
   uniform-per-run. A markdown renderer makes this real, so it's likely in scope but undesigned.
 
+  **Design follow-up, not yet implemented:** [the inline-style note](rfc-inline-styles.md)
+  records the bounded first milestone: a **C** editor with colors and real bold/italic,
+  paragraph-local font spans, and a service-owned paint pool addressed by an optional
+  `Draw.paint` handle. The small literal migration is accepted; keep named-field literals,
+  with no constructor prerequisite. A builder is a separate future ergonomics choice.
+  Preserve base-style line metrics and the consumer-owned retained-Batch contract.
+
+  **Construction clarification:** deferring the builder was the reviewing agent's scope
+  preference, not a user requirement. A builder can accompany the optional field and keep
+  literals available; its exact shape is still open. The rejected middle step is a standalone
+  positional constructor, not a builder. Construction convenience need not allocate or
+  change any rendering/cache contract.
+
+  **Subsequent user choice:** prefer **struct literals with `Default`**, not a builder
+  (the phrase "literal with builder" in discussion was corrected to "literal with default").
+  Transparent fields and occasional source churn between pinned versions are acceptable.
+  This supersedes the constructor/builder recommendations above. Defaults must not register
+  resources; a default draw must never accidentally select pool slot zero. The design note
+  records the proposed explicit invalid/no-op block sentinel and its tradeoff.
+
+  The product destination is reusable incremental Markdown rendering **including tables**,
+  not just a preview demonstration. That does not make a new shaping cache a prerequisite.
+  The note distinguishes necessary invalidation from current or proposed coarse work:
+  extra reshaping, block reassembly, geometry replacement, and batch upload must be disclosed
+  and measured, not hidden behind "simpler bookkeeping" or an ambiguous cache-hit claim.
+
+  **Measurement foundation added before spans:** [performance.md](performance.md) records
+  a headless pathological suite, separate uninstrumented timing and opt-in work/allocation
+  runs, and a before/after HTML report. It exercises real public paths and production cache
+  limits without new cache algorithms. The `perf-counters` probes compile out normally;
+  their thread-local diagnostics are not per-service state. Inline-span cases are explicitly
+  pending, not simulated by splitting token blocks or mislabeled whole-chain toggles.
+
 - **`FontError` enum replacing `Result<_, String>`.** In the sketch as `map_font -> Result`;
   stringly errors are wrong for a published crate. *But* exact variants (Io / Parse /
   NoCoverage / …) TBD.
@@ -814,3 +847,96 @@ Still compendium's job (unchanged):
 `unicode` and `emoji`. The one-shot `paragraph` and static `unicode` PNG examples were
 removed so the shipped examples represent application use. `hello_png` was replaced by a
 live `hello` window that also demonstrates identity-keyed rapid text updates.
+
+
+## C editor and inline spans: implementation follow-up
+
+The C-editor milestone in [rfc-inline-styles.md](rfc-inline-styles.md) is now built.
+`ParagraphSource::paragraph_fonts` supplies validated paragraph-local `FontSpan`s;
+actual equal faces coalesce before shaping. Foreground `PaintSpan`s are copied into
+an immutable generational pool, selected by `Draw.paint`, and never become shaping
+boundaries. Defaults are ordinary struct-update defaults with an invalid block,
+not resource registration or a builder. Plain `draw(...)` signatures are unchanged.
+
+`drop_chain` tracks span-only dependencies in both paragraph and block records,
+not by globally clearing layouts. The implementation found and fixed an inherited
+release/eviction bug: tombstoning a block without immediately changing its dense
+slot generation could let prepare reuse its old geometry or dereference the empty
+block. Generations now change on removal as well as later reuse.
+
+Accepted coarse work is explicit in the style note: whole-paragraph font reshaping
+and flow, whole-block assembly, one geometry variant, whole requested-batch uploads.
+The editor lexes a changed-line suffix until lexical state rejoins cached state,
+but rebuilds/diffs its flat paint spans over all tokens after text/palette changes.
+Only effective font-span changes bump otherwise unchanged paragraph generations;
+F2/F3 never reparse for a theme change or mark source dirty. The editor retains its
+body/chrome batches and applies real viewport scissors. Opening a new file also
+gets a new document namespace; resetting slots to one must not alias the prior file.
+
+No monospace specialization, new run cache, Markdown renderer, or full C preprocessor
+was introduced. Baseline workloads stay intact; span density/restyle/lifetime cases
+are additive, with before/after timing separated from work instrumentation.
+
+
+### Follow-up: keep the plain editor; add `code-editor`
+
+The first implementation replaced `examples/editor.rs`; that was the wrong example
+placement. The original plain notepad and its gallery preview are restored, and the
+C implementation lives separately in `examples/code-editor.rs` with its lexer/font
+helpers under `examples/code-editor/`. Its headless output is `code-editor.png`.
+The gallery and regeneration script include both examples. Core spans, paint pools,
+and the C example's correctness/performance work are unchanged; Markdown/tables
+remain the next product milestone rather than another change to the plain editor.
+
+
+## Markdown follow-up: a separate editor and a reusable component prototype
+
+`markdown-editor` now supplies split source editing/live preview, a custom parser,
+and a simulated streaming agent reply including tables. Neither plain `editor` nor
+`code-editor` was replaced. This stage adds no library modules or runtime dependencies:
+the parser/model is window/GPU/sanscale-independent under the example, and a separate
+adapter supplies spans, cell layouts, paint ownership and draw/rectangle commands.
+Font discovery, clipboard, files, streaming demo policy and windowing remain UI code.
+The intended future home is an optional reusable companion, not Markdown inside
+`TextService`. It is not a stable exported API yet.
+
+The authoritative source is LF-based and UTF-8-addressed. Line-state checkpoints
+restart with one line of lookbehind and stop at matching suffix state. The parser
+produces immutable projected text, inline roles and explicit source mappings; the
+renderer never guesses source locations by subtracting delimiter lengths. Streamed
+prefixes use the same grammar as cold parses. Incomplete constructs can legitimately
+change interpretation; reference links and recursive containers are not quietly
+approximated as fully supported. Invalid byte chunks are rejected transactionally.
+
+Table cells have line/column identity independent of source byte shifts. Table-body
+and code-body edits splice changed rows/lines without repeatedly copying completed
+prefixes. The adapter reuses unchanged layouts and updates indexed row heights;
+later blocks can move without reshaping their contents. Sixty-four delta records
+support multiple edits between frames; missed history triggers reconciliation, not
+lost updates. A view changing documents also changes shaping generations rather
+than aliasing old source keys. Paint snapshots are explicitly released.
+
+**Table sizing is deliberately stable:** equal columns based on viewport/schema,
+with a six-em minimum per column and horizontal overflow. Incoming longer body
+values wrap, rather than resizing completed columns. Intrinsic/user-set sizing is
+future policy. Real bold/italic/combined faces use projected grapheme-safe spans;
+color-only changes do not parse, shape or flow. Existing base-font line metrics
+are unchanged.
+
+The limits are explicit in the [component contract](examples/markdown-editor/markdown/README.md):
+not full CommonMark/GFM, no active HTML/URLs/images, no general nested containers.
+Active paragraphs/changed physical rows still re-project/re-scan broadly; middle
+structural edits move metadata; header/schema changes reconcile tables; code layout
+visits line metadata; top-level block placement visits block metadata. Initial and
+new-width cell layout is broad, and the plain source pane still composes one block.
+Visible text batches are retained, but changed inputs re-upload that requested
+batch; rectangle overlays are separate work. No new core cache/run reuse was snuck
+in under the word “incremental”.
+
+Prefix/chunk/edit differential tests, explicit syntax fixtures, source-map and
+layout equivalence tests, tall-table/fence work guards and headless retained-frame
+GPU assertions accompany the prototype. Its small CPU probe reports append/edit,
+actual recoloring, uncached-width and full-parse control samples; it is not a
+replacement for the library's fingerprinted before/after suite or a claim about
+whole-frame latency. Broad width work remains measurable rather than hidden behind
+a warmed width-cache hit.
