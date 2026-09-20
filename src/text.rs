@@ -12,7 +12,7 @@
 //!   hit-test and draw.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
@@ -21,8 +21,11 @@ use crate::cache::{GlyphCache, GlyphInfo};
 use crate::emoji::{EmojiCache, bucket_for};
 use crate::flow::{FlowLine, flow_paragraph};
 use crate::font::Font;
-use crate::layout::{ChainFont, ShapedGlyph, shape_text};
+use crate::layout::{ChainFont, ShapedGlyph, shape_spanned, shape_text};
 use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer};
+use crate::spans::{
+    FontSpan, PaintCursor, PaintError, PaintHandle, PaintPool, PaintSpan, valid_font_spans,
+};
 use crate::vertex::{EmojiVertex, TextVertex, push_emoji_quad, push_glyph_quad_pixels};
 
 /// Shared font bytes. Deliberately fontdb's `make_shared_face_data` return type,
@@ -162,7 +165,16 @@ pub struct ShapedHandle {
     generation: u32,
 }
 
+impl ShapedHandle {
+    /// An unallocated sentinel that measures empty and draws nothing.
+    pub const INVALID: Self = Self {
+        slot: u32::MAX,
+        generation: 0,
+    };
+}
+
 /// The consumer's identity for one paragraph: the unit of *invalidation*.
+/// Its generation covers text **and effective font spans**, never paint.
 ///
 /// `namespace` keeps two documents' pool slots from colliding in the shared
 /// cache. It stays a separate field rather than being hashed into `slot` because
@@ -181,8 +193,9 @@ pub struct ParagraphKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockKey(pub u64);
 
-/// Everything that affects shaping. Zero pixels and no color, so the cache is
-/// zoom-invariant: moving the camera re-runs nothing.
+/// Base font and paragraph layout policy. Inline font spans are separate source
+/// inputs covered by the paragraph generation. No pixels or color: moving the
+/// camera re-runs nothing.
 #[derive(Clone, Copy, Debug)]
 pub struct Style {
     pub chain: FontChainHandle,
@@ -325,6 +338,9 @@ struct LayoutLine {
     align_em: f32,
     /// Glyphs with `x` relative to the line origin. Empty for a synthetic layout.
     glyphs: Vec<ShapedGlyph>,
+    /// Paragraph origin for block-local paint lookup. Keep it per line rather
+    /// than rebasing every copied glyph on the plain-text assembly path.
+    paragraph_byte: usize,
 }
 
 /// Laid-out geometry for one block, in em space, with block-global byte offsets
@@ -365,6 +381,7 @@ impl Layout {
                     carets: line.carets,
                     align_em: 0.0,
                     glyphs: Vec::new(),
+                    paragraph_byte: 0,
                 })
                 .collect(),
             width_em,
@@ -841,6 +858,15 @@ fn caret_x_on(line: &LayoutLine, byte_index: usize) -> f32 {
 /// holding its text positionally needs the index to find it.
 pub trait ParagraphSource {
     fn paragraph_text(&self, index: usize, key: ParagraphKey) -> Option<Cow<'_, str>>;
+
+    /// Inline font inputs, consulted only on the same cache misses as text.
+    /// Sorted, nonoverlapping, nonempty grapheme-safe ranges; gaps use the base
+    /// style. Invalid ranges or unavailable chains make `shape` return `None`.
+    /// Bump the paragraph generation when these effective inputs change, even
+    /// when text is unchanged. Color-only changes belong to a paint snapshot.
+    fn paragraph_fonts(&self, _index: usize, _key: ParagraphKey) -> Cow<'_, [FontSpan]> {
+        Cow::Borrowed(&[])
+    }
 }
 
 /// A source over already-materialized paragraphs, for consumers holding strings.
@@ -858,6 +884,7 @@ impl ParagraphSource for Paragraphs<'_> {
 
 /// Level-2 result for one paragraph at one style.
 struct ParaLayout {
+    span_chains: Box<[FontChainHandle]>,
     lines: Vec<FlowLine>,
     len_bytes: usize,
     last_used: u64,
@@ -875,6 +902,8 @@ struct Block {
     key: BlockKey,
     style: Style,
     parts: Vec<ParagraphKey>,
+    // Retained independently of paragraph-cache residency for drop_chain.
+    span_chains: Box<[FontChainHandle]>,
     layout: Layout,
     last_used: u64,
 }
@@ -886,6 +915,7 @@ struct Block {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GeomKey {
     color: [u32; 4],
+    paint: Option<PaintHandle>,
     /// Normalised into the block's own space, `(clip - at) / size`, because the
     /// quads are. An absolute clip would reintroduce exactly the position and
     /// scale dependence this key exists without: under a camera move `at`, `size`
@@ -932,6 +962,25 @@ pub struct Draw {
     pub size: f32,
     pub color: Color,
     pub clip: Option<Rect>,
+    /// Optional immutable foreground snapshot. A stale handle skips this item
+    /// on prepare, even if old CPU geometry exists. Already-prepared batches
+    /// own their baked colors and do not depend on paint-pool lifetime.
+    pub paint: Option<PaintHandle>,
+}
+
+/// No registration/allocation: invalid block, origin (0,0), size 1, opaque black,
+/// and no paint or clip. Supply a real `block` with ordinary struct-update syntax.
+impl Default for Draw {
+    fn default() -> Self {
+        Self {
+            block: ShapedHandle::INVALID,
+            at: Vec2::default(),
+            size: 1.,
+            color: Color([0., 0., 0., 1.]),
+            clip: None,
+            paint: None,
+        }
+    }
 }
 
 /// One clip-uniform run inside a [`Batch`]: the vertices between two scissor
@@ -1035,6 +1084,7 @@ pub struct TextService {
     block_lookup: HashMap<BlockKey, ShapedHandle>,
     paragraphs: HashMap<(ParagraphKey, Style), ParaLayout>,
 
+    paints: PaintPool,
     glyphs: GlyphCache,
     emoji: EmojiCache,
     gpu: Option<Gpu>,
@@ -1107,22 +1157,42 @@ impl TextService {
             return;
         };
         *slot = None;
-        self.paragraphs.retain(|(_, style), _| style.chain != chain);
+        self.paragraphs
+            .retain(|(_, style), para| style.chain != chain && !para.span_chains.contains(&chain));
         for (index, slot) in self.blocks.iter_mut().enumerate() {
-            let stale = slot
-                .block
-                .as_ref()
-                .is_some_and(|block| block.style.chain == chain);
+            let stale = slot.block.as_ref().is_some_and(|block| {
+                block.style.chain == chain || block.span_chains.contains(&chain)
+            });
             if stale {
                 if let Some(block) = slot.block.take() {
                     self.block_lookup.remove(&block.key);
+                    // Tombstones must invalidate immediately, not only on slot
+                    // reuse: prepare and batch_live use the dense generation array.
+                    self.generations[index] = self.generations[index].wrapping_add(1);
+                    self.geometry[index] = None;
                     self.free_blocks.push(index as u32);
                 }
             }
         }
     }
 
-    /// Drop every font, chain and cached layout. Atlas textures are retained —
+    // -- immutable foreground paint ------------------------------------------
+
+    /// Copy a sorted, nonoverlapping foreground snapshot into the paint pool.
+    /// No interning or implicit eviction. Keep the old handle for unchanged
+    /// spans; independent equal registrations remain different draw inputs.
+    pub fn register_paint(&mut self, spans: &[PaintSpan]) -> Result<PaintHandle, PaintError> {
+        self.paints.register(spans)
+    }
+
+    /// Release a snapshot. Future prepares with this handle skip the item;
+    /// retained batches still contain their baked colors. No layout invalidation.
+    /// Exhausted slot generations are retired rather than wrapping.
+    pub fn drop_paint(&mut self, paint: PaintHandle) {
+        self.paints.drop(paint);
+    }
+
+    /// Drop every font, chain, paint snapshot and cached layout. Atlas textures are retained —
     /// they are sized, not populated, state.
     pub fn clear(&mut self) {
         self.fonts.clear();
@@ -1133,6 +1203,7 @@ impl TextService {
         self.free_blocks.clear();
         self.block_lookup.clear();
         self.paragraphs.clear();
+        self.paints.clear();
         self.glyphs = GlyphCache::new();
         self.emoji = EmojiCache::new();
     }
@@ -1145,9 +1216,14 @@ impl TextService {
     ///
     /// `source` is consulted only for parts that miss the cache; `None` from it
     /// means a stale identity and the whole block is skipped. Re-calling with an
-    /// unchanged `parts` slice at the same style is a comparison, not a reflow —
-    /// so an unedited paragraph is never reshaped, and a camera move never
-    /// reshapes anything at all.
+    /// unchanged `parts` slice at the same style is a comparison, not a reflow,
+    /// while the block remains cached. A camera transform does not require this
+    /// call at all.
+    ///
+    /// The paragraph cache currently includes the entire [`Style`]: a new width,
+    /// alignment, or line spacing reshapes as well as reflows on a cache miss.
+    /// Changing one paragraph at the same style reuses the others' cached results,
+    /// but block assembly still copies all paragraphs' glyphs and carets.
     pub fn shape(
         &mut self,
         block: BlockKey,
@@ -1155,6 +1231,7 @@ impl TextService {
         parts: &[ParagraphKey],
         source: &dyn ParagraphSource,
     ) -> Option<ShapedHandle> {
+        crate::work::count!(block_requests, 1);
         self.clock += 1;
         if parts.is_empty() || self.chain_fonts(style.chain).is_none() {
             return None;
@@ -1166,6 +1243,7 @@ impl TextService {
             if let Some(index) = self.block_index(handle) {
                 if let Some(existing) = self.blocks[index].block.as_mut() {
                     if existing.style == *style && existing.parts == parts {
+                        crate::work::count!(block_hits, 1);
                         existing.last_used = self.clock;
                         return Some(handle);
                     }
@@ -1176,7 +1254,7 @@ impl TextService {
         for (index, key) in parts.iter().enumerate() {
             self.ensure_paragraph(*key, style, index, source)?;
         }
-        let layout = self.assemble(style, parts);
+        let (layout, span_chains) = self.assemble(style, parts);
 
         // Reuse this block's own slot if it still holds one; otherwise take a
         // free slot and bump its generation so any handle to the old occupant
@@ -1203,6 +1281,7 @@ impl TextService {
             key: block,
             style: *style,
             parts: parts.to_vec(),
+            span_chains,
             layout,
             last_used: self.clock,
         });
@@ -1358,6 +1437,7 @@ impl TextService {
                 size,
                 color,
                 clip,
+                ..Default::default()
             }],
         );
     }
@@ -1377,6 +1457,8 @@ impl TextService {
     /// pass world units with the camera in the transform (`set_transform`),
     /// not pre-projected pixels, or every pan invalidates every batch.
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, items: &[Draw]) -> Batch {
+        crate::work::count!(prepares, 1);
+        crate::work::count!(prepared_items, items.len());
         self.ensure_gpu(device);
         if self.gpu.is_none() {
             // No target format was ever set, so there is no pipeline to bind
@@ -1414,6 +1496,9 @@ impl TextService {
                 let Some(index) = self.block_index(item.block) else {
                     continue;
                 };
+                if item.paint.is_some_and(|h| self.paints.get(h).is_none()) {
+                    continue;
+                }
                 let baked = (
                     item.block.slot,
                     item.block.generation,
@@ -1427,6 +1512,7 @@ impl TextService {
                 let bucket = bucket_for(item.size * pixel_scale);
                 let key = GeomKey {
                     color: item.color.0.map(f32::to_bits),
+                    paint: item.paint,
                     clip: normalized_clip(item)
                         .map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
                 };
@@ -1438,6 +1524,7 @@ impl TextService {
                     let emoji_still_valid =
                         geom.emoji.is_empty() || (geom.epoch == epoch && geom.bucket == bucket);
                     if geom.key == key && emoji_still_valid {
+                        crate::work::count!(geometry_hits, 1);
                         place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
                         continue;
                     }
@@ -1476,6 +1563,8 @@ impl TextService {
         let emoji_data: &[u8] = bytemuck::cast_slice(&emoji_verts);
         let split = text_data.len() as u64;
         let total = split + emoji_data.len() as u64;
+        crate::work::count!(vertex_upload_bytes, total);
+        crate::work::count!(prepared_segments, segments.len());
         let buffer = batch_buffer(device, total);
         if !text_data.is_empty() {
             queue.write_buffer(&buffer, 0, text_data);
@@ -1592,7 +1681,12 @@ impl TextService {
         epoch: u64,
         bucket: u32,
     ) {
+        crate::work::count!(geometry_builds, 1);
         let color = item.color;
+        let mut paint = item
+            .paint
+            .and_then(|h| self.paints.get(h))
+            .map(|spans| PaintCursor::new(spans, color));
         // Bake at the origin *and* at unit size, with the clip normalised to
         // match, so the build depends on everything about this draw except where
         // it lands and how big it is. `place` applies both on the way out.
@@ -1610,13 +1704,31 @@ impl TextService {
                 .block
                 .as_ref()
                 .expect("checked by caller");
-            for_each_visible_glyph(&block.layout, at, size, clip, |glyph, pen_x, pen_y| {
-                if glyph.is_color {
-                    emoji_requests.push((glyph.font_id, glyph.glyph_id, pen_x, pen_y));
-                } else if let Some(info) = glyph.info {
-                    push_glyph_quad_pixels(&mut text_verts, &info, pen_x, pen_y, size, color.0);
-                }
-            });
+            for_each_visible_glyph(
+                &block.layout,
+                at,
+                size,
+                clip,
+                |glyph, pen_x, pen_y, paragraph_byte| {
+                    if glyph.is_color {
+                        emoji_requests.push((glyph.font_id, glyph.glyph_id, pen_x, pen_y));
+                    } else if let Some(info) = glyph.info {
+                        crate::work::count!(text_quads, 1);
+                        let foreground = paint
+                            .as_mut()
+                            .map(|p| p.at(paragraph_byte + glyph.cluster))
+                            .unwrap_or(color);
+                        push_glyph_quad_pixels(
+                            &mut text_verts,
+                            &info,
+                            pen_x,
+                            pen_y,
+                            size,
+                            foreground.0,
+                        );
+                    }
+                },
+            );
         }
 
         for (font_id, glyph_id, pen_x, pen_y) in emoji_requests {
@@ -1627,6 +1739,7 @@ impl TextService {
                 .emoji
                 .get_or_insert(font.face(), font_id, glyph_id, bucket)
             {
+                crate::work::count!(emoji_quads, 1);
                 let uv_min = [slot.x as f32, slot.y as f32];
                 let uv_max = [(slot.x + slot.size) as f32, (slot.y + slot.size) as f32];
                 push_emoji_quad(&mut emoji_verts, pen_x, pen_y, size, uv_min, uv_max);
@@ -1688,13 +1801,22 @@ impl TextService {
         index: usize,
         source: &dyn ParagraphSource,
     ) -> Option<()> {
+        crate::work::count!(paragraph_requests, 1);
         let clock = self.clock;
         if let Some(entry) = self.paragraphs.get_mut(&(key, *style)) {
+            crate::work::count!(paragraph_hits, 1);
             entry.last_used = self.clock;
             return Some(());
         }
         // The only place text is ever pulled from the consumer.
+        crate::work::count!(source_reads, 1);
         let text = source.paragraph_text(index, key)?;
+        crate::work::count!(source_bytes, text.len());
+        let spans = source.paragraph_fonts(index, key);
+        if !valid_font_spans(&text, &spans) {
+            return None;
+        }
+        crate::work::count!(font_spans, spans.len());
         // Split the borrow: the chain view reads `fonts`, shaping writes
         // `glyphs`. They are disjoint fields, but a `&self` helper would tie them
         // together.
@@ -1709,11 +1831,32 @@ impl TextService {
         if chain.is_empty() {
             return None;
         }
-        let run = shape_text(&chain, glyphs, text.as_ref());
+        let mut dependencies = Vec::new();
+        let run = if spans.is_empty() {
+            shape_text(&chain, glyphs, text.as_ref())
+        } else {
+            let mut views = vec![chain];
+            let mut indices = HashMap::from([(style.chain, 0usize)]);
+            let mut resolved = Vec::with_capacity(spans.len());
+            for span in spans.iter() {
+                let next = views.len();
+                let position = *indices.entry(span.chain).or_insert_with(|| {
+                    views.push(chain_view(fonts, chains, span.chain));
+                    dependencies.push(span.chain);
+                    next
+                });
+                if views[position].is_empty() {
+                    return None;
+                }
+                resolved.push((span.range.clone(), position));
+            }
+            shape_spanned(&views, &resolved, glyphs, text.as_ref())
+        };
         let lines = flow_paragraph(text.as_ref(), &run.glyphs, style.max_width_em());
         paragraphs.insert(
             (key, *style),
             ParaLayout {
+                span_chains: dependencies.into_boxed_slice(),
                 lines,
                 len_bytes: text.len(),
                 last_used: clock,
@@ -1726,12 +1869,14 @@ impl TextService {
     /// byte offsets rebased, tops accumulated, alignment resolved against the
     /// final block width.
     ///
-    /// This is the whole of "a block is many paragraphs": no reshaping, just
-    /// addition — which is why an edit costs one paragraph, not the document.
-    fn assemble(&self, style: &Style, parts: &[ParagraphKey]) -> Layout {
+    /// Reuse paragraph shaping/flow, but copy all glyphs and carets into a new
+    /// composed layout. A one-paragraph edit avoids reshaping the other paragraphs;
+    /// assembly is still proportional to the whole block, not the edited range.
+    fn assemble(&self, style: &Style, parts: &[ParagraphKey]) -> (Layout, Box<[FontChainHandle]>) {
+        crate::work::count!(assemblies, 1);
         let chain = self.chain_view(style.chain);
         let Some(primary) = chain.first() else {
-            return Layout::default();
+            return (Layout::default(), Box::default());
         };
         let metrics = primary.font.metrics();
         let line_height_em = metrics.line_height() * style.line_spacing;
@@ -1742,11 +1887,16 @@ impl TextService {
         let mut top_em = 0.0f32;
         let mut width_em = 0.0f32;
 
+        let mut dependencies = HashSet::new();
         for key in parts {
             let Some(para) = self.paragraphs.get(&(*key, *style)) else {
                 continue;
             };
+            dependencies.extend(para.span_chains.iter().copied());
             for flow in &para.lines {
+                crate::work::count!(assembled_lines, 1);
+                crate::work::count!(assembled_glyphs, flow.glyphs.len());
+                crate::work::count!(assembled_carets, flow.carets.len());
                 width_em = width_em.max(flow.advance);
                 lines.push(LayoutLine {
                     byte_range: flow.source.start + byte_offset..flow.source.end + byte_offset,
@@ -1766,6 +1916,7 @@ impl TextService {
                         .collect(),
                     align_em: 0.0,
                     glyphs: flow.glyphs.clone(),
+                    paragraph_byte: byte_offset,
                 });
                 top_em += line_height_em;
             }
@@ -1789,11 +1940,14 @@ impl TextService {
             .last()
             .map(|line| line.metrics.top_em + line.metrics.height_em)
             .unwrap_or(0.0);
-        Layout {
-            lines,
-            width_em,
-            height_em,
-        }
+        (
+            Layout {
+                lines,
+                width_em,
+                height_em,
+            },
+            dependencies.into_iter().collect(),
+        )
     }
 
     /// Drop least-recently-used entries once a pool is over its bound. A block
@@ -1805,8 +1959,11 @@ impl TextService {
             let cut = self.paragraphs.len() - MAX_PARAGRAPHS * 3 / 4;
             ages.select_nth_unstable(cut);
             let threshold = ages[cut];
-            self.paragraphs
-                .retain(|_, entry| entry.last_used > threshold);
+            self.paragraphs.retain(|_, entry| {
+                let keep = entry.last_used > threshold;
+                crate::work::count!(paragraph_evictions, usize::from(!keep));
+                keep
+            });
         }
 
         let live = self.blocks.len() - self.free_blocks.len();
@@ -1828,7 +1985,12 @@ impl TextService {
                 .is_some_and(|block| block.last_used <= threshold);
             if cold {
                 if let Some(block) = slot.block.take() {
+                    crate::work::count!(block_evictions, 1);
                     self.block_lookup.remove(&block.key);
+                    // Tombstones must invalidate immediately, not only on slot
+                    // reuse: prepare and batch_live use the dense generation array.
+                    self.generations[index] = self.generations[index].wrapping_add(1);
+                    self.geometry[index] = None;
                     self.free_blocks.push(index as u32);
                 }
             }
@@ -1872,14 +2034,17 @@ fn for_each_visible_glyph(
     at: Vec2,
     size: f32,
     clip: Option<Rect>,
-    mut f: impl FnMut(&ShapedGlyph, f32, f32),
+    mut f: impl FnMut(&ShapedGlyph, f32, f32, usize),
 ) {
     for line in &layout.lines {
+        crate::work::count!(visited_lines, 1);
         let top = at.y + line.metrics.top_em * size;
         let bottom = top + line.metrics.height_em * size;
         if clip.is_some_and(|clip| bottom < clip.y || top > clip.max_y()) {
+            crate::work::count!(culled_lines, 1);
             continue;
         }
+        crate::work::count!(visited_glyphs, line.glyphs.len());
         let baseline = at.y + line.metrics.baseline_em * size;
         let origin_x = at.x + line.align_em * size;
         for glyph in &line.glyphs {
@@ -1895,7 +2060,7 @@ fn for_each_visible_glyph(
                         || pen_x > clip.max_x()
                 });
                 if !outside {
-                    f(glyph, pen_x, pen_y);
+                    f(glyph, pen_x, pen_y, line.paragraph_byte);
                 }
                 continue;
             }
@@ -1903,7 +2068,7 @@ fn for_each_visible_glyph(
             if clip.is_some_and(|clip| !glyph_intersects(&info, pen_x, pen_y, size, clip)) {
                 continue;
             }
-            f(glyph, pen_x, pen_y);
+            f(glyph, pen_x, pen_y, line.paragraph_byte);
         }
     }
 }
@@ -2069,6 +2234,7 @@ fn clip_runs(items: &[Draw]) -> Vec<Range<usize>> {
 /// suballocated or reused, which is the whole of the ownership fix: no shared
 /// region means nothing to clobber.
 fn batch_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    crate::work::count!(batch_buffers, 1);
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sanscale batch vertices"),
         // A batch that placed nothing still owns a buffer; keep it nominally
@@ -2396,7 +2562,13 @@ mod tests {
     /// chain is ordered (emoji high-priority, Latin primary before it).
     fn emoji_first_chain() -> Option<(TextService, FontChainHandle)> {
         let emoji = font(&["C:/Windows/Fonts/seguiemj.ttf"])?;
-        let latin = font(&["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"])?;
+        let latin = font(&[
+            "C:/Windows/Fonts/segoeui.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ])?;
         let mut text = TextService::new();
         let e = text.map_font(emoji, 0).ok()?;
         let l = text.map_font(latin, 0).ok()?;
@@ -2405,7 +2577,13 @@ mod tests {
     }
 
     fn latin_chain() -> Option<(TextService, FontChainHandle)> {
-        let latin = font(&["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"])?;
+        let latin = font(&[
+            "C:/Windows/Fonts/segoeui.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ])?;
         let mut text = TextService::new();
         let h = text.map_font(latin, 0).ok()?;
         let chain = text.register_chain(&[h]);
@@ -2433,6 +2611,7 @@ mod tests {
             size: 16.0,
             color: Color([1.0, 1.0, 1.0, 1.0]),
             clip,
+            ..Default::default()
         }
     }
 
@@ -2573,7 +2752,7 @@ mod tests {
             Vec2::new(0.0, 0.0),
             16.0,
             clip,
-            |_, _, _| n += 1,
+            |_, _, _, _| n += 1,
         );
         n
     }
@@ -2723,6 +2902,299 @@ mod tests {
                     c as u32
                 );
             }
+        }
+    }
+
+    struct StyledSource<'a> {
+        text: &'a [&'a str],
+        fonts: Vec<Vec<FontSpan>>,
+    }
+    impl ParagraphSource for StyledSource<'_> {
+        fn paragraph_text(&self, i: usize, _: ParagraphKey) -> Option<Cow<'_, str>> {
+            self.text.get(i).map(|s| Cow::Borrowed(*s))
+        }
+        fn paragraph_fonts(&self, i: usize, _: ParagraphKey) -> Cow<'_, [FontSpan]> {
+            Cow::Borrowed(&self.fonts[i])
+        }
+    }
+    fn span_keys(n: usize) -> Vec<ParagraphKey> {
+        (0..n)
+            .map(|i| ParagraphKey {
+                namespace: 71,
+                slot: i as u32,
+                generation: 0,
+            })
+            .collect()
+    }
+    fn required_latin() -> (TextService, FontChainHandle) {
+        latin_chain().expect("font-backed tests require DejaVu Sans, Segoe UI, or Arial")
+    }
+    fn bake(text: &mut TextService, draw: Draw) -> Vec<TextVertex> {
+        let index = text.block_index(draw.block).unwrap();
+        let key = GeomKey {
+            color: draw.color.0.map(f32::to_bits),
+            paint: draw.paint,
+            clip: normalized_clip(&draw).map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
+        };
+        text.rebuild_geometry(index, &draw, key, text.emoji.epoch(), 32);
+        text.geometry[index].as_ref().unwrap().text.clone()
+    }
+    #[test]
+    fn default_draw_is_unallocated_even_when_slot_zero_is_live() {
+        let (mut text, chain) = required_latin();
+        let live = text
+            .shape_transient("live", &style_of(chain, None))
+            .unwrap();
+        let d = Draw::default();
+        assert_ne!(live, d.block);
+        assert_eq!(d.block, ShapedHandle::INVALID);
+        assert!(text.block_index(d.block).is_none());
+        assert_eq!(text.measure(d.block).len_bytes(), 0);
+        assert_eq!(d.size, 1.);
+        assert_eq!(d.color, Color([0., 0., 0., 1.]));
+        assert!(d.paint.is_none() && d.clip.is_none());
+        assert_eq!(
+            std::mem::size_of::<Option<PaintHandle>>(),
+            std::mem::size_of::<PaintHandle>()
+        );
+    }
+    #[test]
+    fn font_ranges_reject_split_graphemes_and_bad_order() {
+        let (mut text, chain) = required_latin();
+        let st = style_of(chain, None);
+        for range in [0..1, 1..3, 0..4, 0..0] {
+            let src = StyledSource {
+                text: &["e\u{301}"],
+                fonts: vec![vec![FontSpan { range, chain }]],
+            };
+            assert!(text.shape(BlockKey(70), &st, &span_keys(1), &src).is_none());
+        }
+        let src = StyledSource {
+            text: &["e\u{301}"],
+            fonts: vec![vec![FontSpan { range: 0..3, chain }]],
+        };
+        assert!(text.shape(BlockKey(70), &st, &span_keys(1), &src).is_some());
+        let bad = vec![
+            FontSpan { range: 2..3, chain },
+            FontSpan { range: 0..1, chain },
+        ];
+        assert!(!valid_font_spans("abc", &bad));
+        assert!(!valid_font_spans("👩‍💻", &[FontSpan { range: 0..4, chain }]));
+    }
+    #[test]
+    fn equivalent_inline_faces_coalesce_and_chain_drop_is_dependency_local() {
+        let (mut text, chain) = required_latin();
+        let st = style_of(chain, Some(4.));
+        let alias_fonts = text.chain_fonts(chain).unwrap().to_vec();
+        let alias = text.register_chain(&alias_fonts);
+        let plain = text
+            .shape(
+                BlockKey(70),
+                &st,
+                &span_keys(1),
+                &Paragraphs(&["office cafe"]),
+            )
+            .unwrap();
+        let src = StyledSource {
+            text: &["office cafe"],
+            fonts: vec![vec![
+                FontSpan { range: 0..3, chain },
+                FontSpan {
+                    range: 3..11,
+                    chain: alias,
+                },
+            ]],
+        };
+        let keys = vec![ParagraphKey {
+            namespace: 72,
+            ..span_keys(1)[0]
+        }];
+        #[cfg(feature = "perf-counters")]
+        crate::profiling::reset_work_counters();
+        let styled = text.shape(BlockKey(71), &st, &keys, &src).unwrap();
+        #[cfg(feature = "perf-counters")]
+        assert_eq!(crate::profiling::work_counters().shape_runs, 1);
+        let signature = |layout: &Layout| {
+            layout
+                .lines
+                .iter()
+                .map(|l| {
+                    (
+                        l.metrics.width_em.to_bits(),
+                        l.glyphs
+                            .iter()
+                            .map(|g| (g.font_id, g.glyph_id, g.cluster, g.x.to_bits()))
+                            .collect::<Vec<_>>(),
+                        l.carets
+                            .iter()
+                            .map(|c| (c.byte_index, c.x_em.to_bits()))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            signature(text.measure(plain)),
+            signature(text.measure(styled))
+        );
+        bake(
+            &mut text,
+            Draw {
+                block: styled,
+                ..Default::default()
+            },
+        );
+        // The block must remember dependencies even after paragraph eviction.
+        text.paragraphs.clear();
+        text.drop_chain(alias);
+        assert!(text.block_index(styled).is_none());
+        assert_eq!(text.measure(styled).len_bytes(), 0);
+        assert!(text.geometry[styled.slot as usize].is_none());
+        assert_eq!(text.measure(plain).len_bytes(), 11);
+    }
+    #[test]
+    fn actual_italic_face_changes_glyphs_not_base_line_metrics() {
+        let (mut text, chain) = required_latin();
+        let data = font(&[
+            "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+            "C:/Windows/Fonts/segoeuii.ttf",
+            "C:/Windows/Fonts/ariali.ttf",
+            "/Library/Fonts/Arial Italic.ttf",
+        ])
+        .expect("font-span tests require an italic/oblique face");
+        let italic = text.map_font(data, 0).unwrap();
+        let ic = text.register_chain(&[italic]);
+        let st = style_of(chain, None);
+        let keys = span_keys(1);
+        let plain = text
+            .shape(BlockKey(70), &st, &keys, &Paragraphs(&["ab cd"]))
+            .unwrap();
+        let height = text.measure(plain).height_em();
+        let src = StyledSource {
+            text: &["ab cd"],
+            fonts: vec![vec![FontSpan {
+                range: 3..5,
+                chain: ic,
+            }]],
+        };
+        let keys = [ParagraphKey {
+            generation: 1,
+            ..keys[0]
+        }];
+        let h = text.shape(BlockKey(70), &st, &keys, &src).unwrap();
+        assert_eq!(text.measure(h).height_em(), height);
+        assert!(
+            text.measure(h).lines[0]
+                .glyphs
+                .iter()
+                .filter(|g| g.cluster >= 3)
+                .all(|g| g.font_id == italic.0)
+        );
+        for byte in 0..=5 {
+            assert_eq!(text.measure(h).caret_at(byte).byte_index, byte);
+        }
+        text.drop_chain(ic);
+        assert!(text.shape(BlockKey(71), &st, &keys, &src).is_none());
+    }
+    #[test]
+    fn paint_uses_block_bytes_and_recolors_without_shape_or_flow() {
+        let (mut text, chain) = required_latin();
+        let st = style_of(chain, None);
+        let h = text
+            .shape(BlockKey(70), &st, &span_keys(2), &Paragraphs(&["ab", "cd"]))
+            .unwrap();
+        let base = Color([0., 0., 0., 1.]);
+        let red = Color([1., 0., 0., 1.]);
+        let green = Color([0., 1., 0., 1.]);
+        #[cfg(feature = "perf-counters")]
+        crate::profiling::reset_work_counters();
+        let p = text
+            .register_paint(&[PaintSpan {
+                range: 3..5,
+                color: red,
+            }])
+            .unwrap();
+        let draw = Draw {
+            block: h,
+            paint: Some(p),
+            color: base,
+            ..Default::default()
+        };
+        let a = bake(&mut text, draw);
+        assert_eq!(a.len(), 24);
+        assert!(a[..12].iter().all(|v| v.col == base.0));
+        assert!(a[12..].iter().all(|v| v.col == red.0));
+        let q = text
+            .register_paint(&[PaintSpan {
+                range: 3..5,
+                color: green,
+            }])
+            .unwrap();
+        let b = bake(
+            &mut text,
+            Draw {
+                paint: Some(q),
+                ..draw
+            },
+        );
+        assert!(b[12..].iter().all(|v| v.col == green.0));
+        assert_eq!(
+            a.iter().map(|v| v.pos).collect::<Vec<_>>(),
+            b.iter().map(|v| v.pos).collect::<Vec<_>>()
+        );
+        #[cfg(feature = "perf-counters")]
+        {
+            let c = crate::profiling::work_counters();
+            assert_eq!(
+                (c.shape_calls, c.flow_calls, c.source_reads, c.glyph_inserts),
+                (0, 0, 0, 0)
+            );
+        }
+        text.drop_paint(p);
+        assert!(text.paints.get(p).is_none());
+        assert!(
+            a[12..].iter().all(|v| v.col == red.0),
+            "baked pixels do not borrow paint"
+        );
+    }
+    #[test]
+    fn paint_colors_cluster_start_without_splitting_ligatures() {
+        let (mut text, chain) = required_latin();
+        let h = text
+            .shape_transient("office", &style_of(chain, None))
+            .unwrap();
+        let clusters = text.measure(h).lines[0]
+            .glyphs
+            .iter()
+            .filter(|g| g.info.is_some())
+            .map(|g| g.cluster)
+            .collect::<Vec<_>>();
+        let red = Color([1., 0., 0., 1.]);
+        let base = Color([0., 0., 0., 1.]);
+        let p = text
+            .register_paint(&[PaintSpan {
+                range: 2..4,
+                color: red,
+            }])
+            .unwrap();
+        let verts = bake(
+            &mut text,
+            Draw {
+                block: h,
+                color: base,
+                paint: Some(p),
+                ..Default::default()
+            },
+        );
+        assert_eq!(verts.len(), clusters.len() * 6);
+        for (quad, cluster) in verts.chunks_exact(6).zip(clusters) {
+            assert!(quad.iter().all(|v| v.col
+                == if (2..4).contains(&cluster) {
+                    red.0
+                } else {
+                    base.0
+                }));
         }
     }
 }

@@ -390,6 +390,7 @@ impl Viewer {
                     size: cell.size,
                     color: sanscale::Color(cell.color),
                     clip: None,
+                    ..Default::default()
                 })
                 .collect();
             self.text

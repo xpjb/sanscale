@@ -16,8 +16,8 @@
 //! Two levels are visible to you, and they do different jobs:
 //!
 //! - A **paragraph** ([`ParagraphKey`]) is the unit of *invalidation*. The key
-//!   carries your own version, so an edit reshapes the paragraph you touched and
-//!   nothing else.
+//!   carries your text/font-span version. An edit reuses the other paragraphs'
+//!   cached shaping, although composing the block still copies their data.
 //! - A **block** ([`BlockKey`] → [`ShapedHandle`]) is the unit of *coordinate
 //!   space*: 1..N paragraphs flowed into one byte range and one line list. It is
 //!   what you measure, hit-test and draw.
@@ -31,6 +31,24 @@
 //! GPU buffer **you** hold, split into [`Segment`]s where the clip changes.
 //! Hold a batch and unchanged content costs zero per-frame upload; ignore the
 //! word "batch" entirely and nothing is taken from you.
+//!
+//! # Inline styles
+//!
+//! [`ParagraphSource::paragraph_fonts`] supplies paragraph-local [`FontSpan`]s
+//! on cache misses. Sorted, nonoverlapping grapheme-safe ranges select real font
+//! chains; gaps inherit [`Style::chain`]. The paragraph generation covers text
+//! **and effective font spans**. Base-style line metrics remain fixed.
+//!
+//! Foreground color is separate: [`TextService::register_paint`] owns immutable
+//! block-local [`PaintSpan`]s behind a [`PaintHandle`]. Set [`Draw::paint`]; gaps
+//! use [`Draw::color`]. Painting never splits shaping: a shaped cluster's start
+//! byte chooses its color, and native-color emoji remain untinted. Plain text
+//! needs no registration. [`Draw::default`] is allocation-free and has an invalid
+//! block, origin (0,0), size 1, opaque black, and no paint or clipping.
+//!
+//! Re-prepare when draw inputs (including paint) change. [`TextService::drop_paint`]
+//! releases a snapshot but not colors already baked into retained batches;
+//! [`TextService::batch_live`] still tracks layout/atlas changes, not caller inputs.
 //!
 //! # What this crate does not own
 //!
@@ -67,6 +85,15 @@
 //! Nothing above touches a GPU. [`TextService::prepare`] (and the `draw*` sugar
 //! over it) is the only path that does.
 //!
+//! # Performance investigations
+//!
+//! The optional `perf-counters` feature exposes the `profiling` module's
+//! thread-local work counters. Probes, including their arguments, compile out
+//! without the feature. These are investigation tools, not production timing:
+//! the pathological benchmark runs latency and work/allocation measurement in
+//! separate builds. See `performance.md` in the repository for the headless
+//! workload matrix and before/after report protocol.
+//!
 //! # Compatibility
 //!
 //! - **wgpu 30** — [`TextService::draw`] borrows `wgpu::Device`, `Queue` and
@@ -83,8 +110,13 @@ mod font;
 mod layout;
 mod outline;
 mod renderer;
+mod spans;
 mod text;
 mod vertex;
+mod work;
+
+#[cfg(feature = "perf-counters")]
+pub mod profiling;
 
 pub use font::{FontMetrics, read_font_file};
 
@@ -94,3 +126,5 @@ pub use text::{
     ParagraphKey, ParagraphSource, Paragraphs, Rect, Segment, SelectionSpan, ShapedHandle, Style,
     TextService, Vec2,
 };
+
+pub use spans::{FontSpan, PaintError, PaintHandle, PaintSpan};

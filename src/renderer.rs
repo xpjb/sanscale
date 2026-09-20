@@ -137,6 +137,7 @@ fn create_atlas_resources(
     band_width: u32,
     band_height: u32,
 ) -> (wgpu::Texture, wgpu::Texture, wgpu::BindGroup) {
+    crate::work::count!(text_atlas_allocations, 1);
     let curve_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("text curve texture"),
         size: wgpu::Extent3d {
@@ -203,6 +204,7 @@ fn write_texture_range<T: Pod>(
         let x = (cursor % width as usize) as u32;
         let y = (cursor / width as usize) as u32;
         let run = (width as usize - x as usize).min(data.len() - cursor);
+        crate::work::count!(text_atlas_upload_bytes, run * texel_size as usize);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture,
@@ -380,6 +382,7 @@ impl TextRenderer {
         let params = Params {
             matrix: matrix.to_cols_array_2d(),
         };
+        crate::work::count!(uniform_upload_bytes, std::mem::size_of::<Params>());
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&params));
     }
 
@@ -402,6 +405,7 @@ impl TextRenderer {
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         pass.set_bind_group(1, &atlas.bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(range.clone()));
+        crate::work::count!(text_draw_calls, 1);
         pass.draw(vertices, 0..1);
     }
 }
@@ -426,6 +430,7 @@ fn create_emoji_resources(
     width: u32,
     height: u32,
 ) -> (wgpu::Texture, wgpu::Sampler, wgpu::BindGroup) {
+    crate::work::count!(emoji_atlas_allocations, 1);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("emoji atlas texture"),
         size: wgpu::Extent3d {
@@ -483,6 +488,7 @@ fn upload_emoji_rows(
     if end <= start {
         return;
     }
+    crate::work::count!(emoji_atlas_upload_bytes, end - start);
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -742,6 +748,7 @@ impl EmojiRenderer {
         let params = Params {
             matrix: matrix.to_cols_array_2d(),
         };
+        crate::work::count!(uniform_upload_bytes, std::mem::size_of::<Params>());
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&params));
     }
 
@@ -761,6 +768,7 @@ impl EmojiRenderer {
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         pass.set_bind_group(1, &atlas.bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(range.clone()));
+        crate::work::count!(emoji_draw_calls, 1);
         pass.draw(vertices, 0..1);
     }
 }

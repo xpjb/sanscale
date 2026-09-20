@@ -89,6 +89,7 @@ impl Font {
     /// True when this face has a glyph for `c` (cmap coverage). Drives fallback
     /// itemization — the first face in a chain that covers a character wins.
     pub fn has_glyph(&self, c: char) -> bool {
+        crate::work::count!(coverage_queries, 1);
         self.face.glyph_index(c).is_some()
     }
 

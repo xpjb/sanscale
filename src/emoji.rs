@@ -178,6 +178,7 @@ impl EmojiCache {
     ) -> Option<EmojiSlot> {
         let key = (face_id, glyph_id, bucket);
         if let Some(&cached) = self.slots.get(&key) {
+            crate::work::count!(emoji_hits, 1);
             if let Some(slot) = cached {
                 if let Some(occ) = self.cells.get_mut(&(slot.x, slot.y)) {
                     occ.last_used = self.frame;
@@ -185,6 +186,7 @@ impl EmojiCache {
             }
             return cached;
         }
+        crate::work::count!(emoji_rasterizations, 1);
         let slot = match rasterize(face, glyph_id as u16, bucket) {
             Some(rgba) => self.place(key, bucket, &rgba),
             None => None,
@@ -242,6 +244,7 @@ impl EmojiCache {
             return Some(pos);
         }
         // Everything in this bucket is needed this frame — a genuine over-budget frame.
+        crate::work::count!(emoji_drops, 1);
         self.dropped = self.dropped.wrapping_add(1);
         if !self.warned {
             self.warned = true;
@@ -267,6 +270,7 @@ impl EmojiCache {
             .filter(|(_, occ)| occ.size == bucket && occ.last_used != frame)
             .min_by_key(|(_, occ)| occ.last_used)
             .map(|(&pos, _)| pos)?;
+        crate::work::count!(emoji_evictions, 1);
         let occ = self.cells.remove(&victim).unwrap();
         self.slots.remove(&occ.key);
         self.epoch = self.epoch.wrapping_add(1);

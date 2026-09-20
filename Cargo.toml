@@ -9,10 +9,18 @@ repository = "https://github.com/xpjb/sanscale"
 readme = "README.md"
 keywords = ["font", "text", "gpu", "wgpu", "slug"]
 categories = ["graphics", "rendering", "text-processing"]
-exclude = ["/report", "/.github", "/gallery", "/scripts"]
+exclude = ["/report", "/perf-results", "/.github", "/gallery", "/scripts"]
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+# Investigation only: compile-out work probes. Benchmark timing uses the default build.
+perf-counters = []
+
+[[bench]]
+name = "pathological"
+harness = false
 
 [dependencies]
 wgpu = "30"
@@ -43,11 +51,15 @@ bytemuck = "1"
 arboard = "3"
 # Canonical Unicode character names for the `unicode` hover.
 unicode_names2 = "3"
-# The `editor` example: rope-backed document + native open/save dialogs.
-ropey = "1"
+# The editor examples: ropes + native open/save dialogs.
+# Physical LF paragraphs; input CRLF/CR is normalized by the examples.
+ropey = { version = "1", default-features = false, features = ["simd"] }
 rfd = "0.15"
 # Surface the library's atlas warnings on stderr during headless smoke tests.
 env_logger = "0.11"
+# Machine-readable regression reports and exact font/corpus fingerprints.
+serde_json = "1"
+sha2 = "0.10"
 
 [lints.clippy]
 too_many_arguments = "allow"

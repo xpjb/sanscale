@@ -38,9 +38,12 @@ pub(crate) fn flow_paragraph(
     glyphs: &[ShapedGlyph],
     max_width_em: f32,
 ) -> Vec<FlowLine> {
+    crate::work::count!(flow_calls, 1);
+    crate::work::count!(flow_glyphs, glyphs.len());
     let mut lines = Vec::new();
     wrap(paragraph, glyphs, max_width_em, &mut lines);
     attach_carets(&mut lines, paragraph);
+    crate::work::count!(flow_lines, lines.len());
     lines
 }
 
@@ -63,6 +66,9 @@ fn wrap(paragraph: &str, glyphs: &[ShapedGlyph], max_width_em: f32, out: &mut Ve
     let mut current_glyphs = Vec::new();
 
     for (token_start, token) in tokenize(paragraph) {
+        crate::work::count!(flow_tokens, 1);
+        // Count the full scan without putting an instrumentation call in its hot loop.
+        crate::work::count!(flow_glyph_tests, glyphs.len());
         let token_end = token_start + token.len();
         let is_ws = token.chars().all(char::is_whitespace);
         let token_glyphs = glyphs

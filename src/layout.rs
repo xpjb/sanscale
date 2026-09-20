@@ -73,6 +73,7 @@ fn is_emoji_sequence(grapheme: &str) -> bool {
 /// than several pieces. Requiring color avoids a monochrome text font hijacking
 /// a non-ligating sequence (which would render a mono base instead of a tofu).
 fn shapes_single_color(font: &Font, text: &str) -> bool {
+    crate::work::count!(fallback_shape_calls, 1);
     let mut buffer = UnicodeBuffer::new();
     buffer.push_str(text);
     buffer.guess_segment_properties();
@@ -89,6 +90,7 @@ fn shapes_single_color(font: &Font, text: &str) -> bool {
 /// [`face_for_grapheme`]'s job, and its emoji-sequence arm requires *color*
 /// (see `shapes_single_color`).
 pub(crate) fn shapes_to_single_glyph(font: &Font, text: &str) -> bool {
+    crate::work::count!(fallback_shape_calls, 1);
     let mut buffer = UnicodeBuffer::new();
     buffer.push_str(text);
     buffer.guess_segment_properties();
@@ -212,20 +214,89 @@ pub(crate) fn shape_text(chain: &[ChainFont<'_>], cache: &mut GlyphCache, text: 
     if chain.is_empty() {
         return ShapedRun::default();
     }
+    shape_runs(
+        cache,
+        text,
+        itemize(chain, text)
+            .into_iter()
+            .map(|(start, run, position)| (start, run, chain[position])),
+        false,
+    )
+}
+
+/// Validated paragraph-local chain overrides. Coalesce by the actual selected
+/// font, not span/chain identity: equivalent adjacent spans must not break a
+/// ligature or create another rustybuzz invocation.
+pub(crate) fn shape_spanned(
+    chains: &[Vec<ChainFont<'_>>],
+    spans: &[(std::ops::Range<usize>, usize)],
+    cache: &mut GlyphCache,
+    text: &str,
+) -> ShapedRun {
+    let mut runs = Vec::new();
+    let mut span_index = 0;
+    let mut start = 0;
+    let mut previous: Option<ChainFont<'_>> = None;
+    for (byte, grapheme) in text.grapheme_indices(true) {
+        while spans.get(span_index).is_some_and(|s| s.0.end <= byte) {
+            span_index += 1;
+        }
+        let chain_index = spans
+            .get(span_index)
+            .filter(|s| s.0.start <= byte)
+            .map(|s| s.1)
+            .unwrap_or(0);
+        let chain = &chains[chain_index];
+        let face = chain[face_for_grapheme(chain, grapheme)];
+        if let Some(old) = previous {
+            if old.id != face.id {
+                runs.push((start, &text[start..byte], old));
+                start = byte;
+            }
+        }
+        previous = Some(face);
+    }
+    if let Some(face) = previous {
+        runs.push((start, &text[start..], face));
+    }
+    shape_runs(cache, text, runs, true)
+}
+
+fn shape_runs<'font, 'text>(
+    cache: &mut GlyphCache,
+    text: &'text str,
+    runs: impl IntoIterator<Item = (usize, &'text str, ChainFont<'font>)>,
+    context: bool,
+) -> ShapedRun {
+    crate::work::count!(shape_calls, 1);
+    crate::work::count!(shape_bytes, text.len());
     let mut glyphs = Vec::new();
     let mut x = 0.0f32;
     let mut y = 0.0f32;
     let mut scratch = BandsScratch::default();
 
-    for (run_start, run_text, position) in itemize(chain, text) {
-        let entry = chain[position];
+    for (run_start, run_text, entry) in runs {
+        crate::work::count!(shape_runs, 1);
         let font = entry.font;
         let upem = font.units_per_em() as f32;
 
         let mut buffer = UnicodeBuffer::new();
         buffer.push_str(run_text);
+        if context {
+            buffer.set_pre_context(&text[..run_start]);
+            buffer.set_post_context(&text[run_start + run_text.len()..]);
+        }
         buffer.guess_segment_properties();
         let glyph_buffer = shape(font.face(), &[], buffer);
+        crate::work::count!(shaped_glyphs, glyph_buffer.len());
+        crate::work::count!(
+            missing_glyphs,
+            glyph_buffer
+                .glyph_infos()
+                .iter()
+                .filter(|g| g.glyph_id == 0)
+                .count()
+        );
 
         for (info, pos) in glyph_buffer
             .glyph_infos()

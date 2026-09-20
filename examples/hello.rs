@@ -179,6 +179,7 @@ impl Scene {
                 size: GREETING_PX,
                 color: Color([0.35, 0.72, 1.0, 1.0]),
                 clip: None,
+                ..Default::default()
             },
             Draw {
                 block: self.scripts,
@@ -186,6 +187,7 @@ impl Scene {
                 size: SCRIPTS_PX,
                 color: Color([1.0, 0.48, 0.22, 1.0]),
                 clip: None,
+                ..Default::default()
             },
             Draw {
                 block: self.fps,
@@ -193,6 +195,7 @@ impl Scene {
                 size: FPS_PX,
                 color: Color([0.38, 1.0, 0.62, 1.0]),
                 clip: None,
+                ..Default::default()
             },
         ]
     }

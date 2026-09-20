@@ -43,11 +43,15 @@ impl GlyphCache {
     }
 
     pub fn get(&self, key: GlyphKey) -> Option<GlyphInfo> {
-        self.glyphs.get(&key).copied()
+        let found = self.glyphs.get(&key).copied();
+        crate::work::count!(glyph_hits, usize::from(found.is_some()));
+        crate::work::count!(glyph_misses, usize::from(found.is_none()));
+        found
     }
 
     /// Insert a glyph's processed band data; returns its assigned `GlyphInfo`.
     pub fn insert(&mut self, key: GlyphKey, band_data: BandData) -> GlyphInfo {
+        crate::work::count!(glyph_inserts, 1);
         let header_count = (band_data.band_max.0 + 1 + band_data.band_max.1 + 1) as usize;
         let curve_start = self.alloc_curves(&band_data.curve_texels);
         let band_start = self.alloc_bands(&band_data.band_texels, header_count, curve_start);
