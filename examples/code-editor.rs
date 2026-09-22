@@ -30,6 +30,7 @@
 //!     Ctrl+O/S open/save · Ctrl+Shift+S save as · Ctrl+A/C/X/V ·
 //!     Ctrl+wheel or Ctrl+Plus/Minus zoom · wheel scroll · F2 palette · F3 italic comments · Esc clears selection
 //! Headless PNG: `cargo run --example code-editor -- --dump [file.c]` → code-editor.png
+//! Resize timing: set `RUST_LOG=sanscale_resize=info` before launching the interactive example.
 //! The built-in ring-buffer sample opens when no file is supplied. This is a
 //! lexical C demo, not a complete preprocessor, language server, or IDE.
 
@@ -762,7 +763,12 @@ fn render_frame(
     caret_visible: bool,
 ) -> Frame {
     editor.doc.resolve_fonts(fonts, editor.italic_comments);
+    let shape_start = Instant::now();
     let handle = text.shape(BlockKey(1), style, &editor.doc.keys(), &editor.doc);
+    let shape_time = shape_start.elapsed();
+    if shape_time >= Duration::from_millis(1) {
+        log::info!(target: "sanscale_resize", "shape {shape_time:?}");
+    }
     let Some(handle) = handle else {
         return Frame { handle: None };
     };
@@ -915,13 +921,20 @@ impl ApplicationHandler for App {
             gfx.blink_phase = phase;
             gfx.window.request_redraw();
         }
-        if gfx.resize_pending {
-            gfx.draw();
+        if gfx.resize_pending
+            && gfx.last_frame.is_none_or(|t| t.elapsed() >= RESIZE_FRAME)
+            && gfx.draw()
+        {
+            gfx.resize_pending = false;
         }
         let next_flip = BLINK_MS - (since % BLINK_MS);
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(next_flip.max(1)),
-        ));
+        let mut wake = Instant::now() + Duration::from_millis(next_flip.max(1));
+        if gfx.resize_pending {
+            if let Some(last) = gfx.last_frame {
+                wake = wake.min(last + RESIZE_FRAME);
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -933,13 +946,16 @@ impl ApplicationHandler for App {
                 gfx.on_key(event);
             }
             WindowEvent::Resized(size) => {
+                log::info!(
+                    target: "sanscale_resize",
+                    "resized {:?} {}x{}",
+                    Instant::now(), size.width, size.height
+                );
                 if size.width == 0 || size.height == 0 {
                     gfx.resize_pending = false;
                 } else {
-                    if !gfx.resize_pending {
-                        gfx.window.request_redraw();
-                    }
                     gfx.resize_pending = true;
+                    gfx.window.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -991,7 +1007,17 @@ impl ApplicationHandler for App {
                     gfx.place_at_cursor(true);
                 }
             }
-            WindowEvent::RedrawRequested => gfx.draw(),
+            WindowEvent::RedrawRequested => {
+                if gfx.resize_pending {
+                    log::info!(target: "sanscale_resize", "paint {:?}", Instant::now());
+                }
+                if (!gfx.resize_pending
+                    || gfx.last_frame.is_none_or(|t| t.elapsed() >= RESIZE_FRAME))
+                    && gfx.draw()
+                {
+                    gfx.resize_pending = false;
+                }
+            },
             _ => {}
         }
     }
@@ -1017,6 +1043,7 @@ struct Gfx {
     /// you type and blinks only at rest.
     last_input: Instant,
     resize_pending: bool,
+    last_frame: Option<Instant>,
     blink_phase: u64,
     /// Previous left-press + running click count, for double/triple-click
     /// detection (winit doesn't count clicks; that is consumer work — only the
@@ -1026,6 +1053,7 @@ struct Gfx {
 
 /// Half a blink cycle: visible for one period, hidden for the next.
 const BLINK_MS: u64 = 530;
+const RESIZE_FRAME: Duration = Duration::from_millis(16);
 
 impl Gfx {
     async fn new(event_loop: &ActiveEventLoop, font: Option<&str>, path: Option<PathBuf>) -> Self {
@@ -1116,6 +1144,7 @@ impl Gfx {
             dragging: false,
             last_input: Instant::now(),
             resize_pending: false,
+            last_frame: None,
             blink_phase: 0,
             last_click: None,
         };
@@ -1382,17 +1411,24 @@ impl Gfx {
         }
     }
 
-    fn draw(&mut self) {
+    fn draw(&mut self) -> bool {
         let size = self.window.inner_size();
+        let trace = log::log_enabled!(target: "sanscale_resize", log::Level::Info)
+            && (self.resize_pending
+                || self.config.width != size.width
+                || self.config.height != size.height);
+        let start = Instant::now();
         if size.width == 0 || size.height == 0 {
-            return;
+            return false;
         }
         if self.config.width != size.width || self.config.height != size.height {
             self.config.width = size.width;
             self.config.height = size.height;
             self.surface.configure(&self.device, &self.config);
         }
+        let configured = Instant::now();
         let mut acquired = self.surface.get_current_texture();
+        let first_acquire = Instant::now();
         if matches!(
             &acquired,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost
@@ -1400,10 +1436,22 @@ impl Gfx {
             self.surface.configure(&self.device, &self.config);
             acquired = self.surface.get_current_texture();
         }
+        let acquired_at = Instant::now();
         let frame = match acquired {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            _ => return,
+            other => {
+                if trace {
+                    log::info!(
+                        target: "sanscale_resize",
+                        "frame {:?} {}x{} no texture: {:?}; configure={:?} acquire={:?} retry={:?}",
+                        start, size.width, size.height, other,
+                        configured - start, first_acquire - configured, acquired_at - first_acquire
+                    );
+                }
+                self.last_frame = Some(Instant::now());
+                return false;
+            }
         };
         let view = frame.texture.create_view(&Default::default());
         let screen = Vec2::new(self.config.width as f32, self.config.height as f32);
@@ -1449,9 +1497,22 @@ impl Gfx {
             );
             self.last_handle = result.handle;
         }
+        let rendered = Instant::now();
         self.queue.submit([encoder.finish()]);
+        let submitted = Instant::now();
         self.queue.present(frame);
-        self.resize_pending = false;
+        let presented = Instant::now();
+        self.last_frame = Some(presented);
+        if trace {
+            log::info!(
+                target: "sanscale_resize",
+                "frame {:?} {}x{} configure={:?} acquire={:?} retry={:?} render={:?} submit={:?} present={:?} total={:?}",
+                start, size.width, size.height,
+                configured - start, first_acquire - configured, acquired_at - first_acquire,
+                rendered - acquired_at, submitted - rendered, presented - submitted, presented - start
+            );
+        }
+        true
     }
 }
 
