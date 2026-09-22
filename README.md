@@ -63,13 +63,21 @@ measurements use em units. You can also supply a world-space transform.
 
 ## Examples
 
-`cargo run --release --example hello` opens the smallest live example. `editor`
-shows caret and selection geometry; `code-editor` and `markdown-editor` show
-styled editing. `unicode` and `emoji` show font coverage and color glyphs. Add
-`-- --dump` to render a PNG without opening a window. The Markdown parser
-belongs to its example, not the library.
+Run an example with `cargo run --release --example <name>`. All six open a
+window; add `-- --dump` to render a preview PNG without opening one.
 
-[API docs](https://docs.rs/sanscale/0.1.0/sanscale/) · [Performance notes](performance.md) · [Example previews](https://github.com/xpjb/sanscale/tree/master/gallery)
+| Preview | Example |
+|---|---|
+| [![Hello](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/hello.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/hello.png) | [`hello`](examples/hello.rs)<br>Moving Unicode text and a live FPS counter |
+| [![Unicode](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/unicode.png) | [`unicode`](examples/unicode.rs)<br>Zoomable map of Unicode planes 0–2 |
+| [![Emoji](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/emoji.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/emoji.png) | [`emoji`](examples/emoji.rs)<br>RGI emoji sequences grouped like a picker |
+| [![Editor](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/editor.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/editor.png) | [`editor`](examples/editor.rs)<br>Plain notepad with caret, selection, and wrapping |
+| [![Code editor](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/code-editor.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/code-editor.png) | [`code-editor`](examples/code-editor.rs)<br>C syntax colors and bold/italic fonts |
+| [![Markdown editor](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/markdown-editor.png)](https://raw.githubusercontent.com/xpjb/sanscale/master/gallery/markdown-editor.png) | [`markdown-editor`](examples/markdown-editor.rs)<br>Split source/preview and streaming tables |
+
+The Markdown parser belongs to its example, not the library.
+
+[API docs](https://docs.rs/sanscale/0.1.0/sanscale/) · [Performance notes](performance.md)
 
 ## License
 
