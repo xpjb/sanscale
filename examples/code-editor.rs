@@ -915,21 +915,13 @@ impl ApplicationHandler for App {
             gfx.blink_phase = phase;
             gfx.window.request_redraw();
         }
-        let now = Instant::now();
-        let mut next = now + Duration::from_millis((BLINK_MS - since % BLINK_MS).max(1));
-        let size = gfx.window.inner_size();
-        if size.width > 0
-            && size.height > 0
-            && (size.width != gfx.config.width || size.height != gfx.config.height)
-        {
-            let due = gfx.last_present.map_or(now, |at| at + RESIZE_FRAME);
-            if now >= due {
-                gfx.draw();
-            } else {
-                next = next.min(due);
-            }
+        if gfx.resize_pending {
+            gfx.draw();
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+        let next_flip = BLINK_MS - (since % BLINK_MS);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(next_flip.max(1)),
+        ));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -941,11 +933,13 @@ impl ApplicationHandler for App {
                 gfx.on_key(event);
             }
             WindowEvent::Resized(size) => {
-                if size.width > 0
-                    && size.height > 0
-                    && gfx.last_present.is_none_or(|at| at.elapsed() >= RESIZE_FRAME)
-                {
-                    gfx.draw();
+                if size.width == 0 || size.height == 0 {
+                    gfx.resize_pending = false;
+                } else {
+                    if !gfx.resize_pending {
+                        gfx.window.request_redraw();
+                    }
+                    gfx.resize_pending = true;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -997,14 +991,7 @@ impl ApplicationHandler for App {
                     gfx.place_at_cursor(true);
                 }
             }
-            WindowEvent::RedrawRequested => {
-                let size = gfx.window.inner_size();
-                if (size.width == gfx.config.width && size.height == gfx.config.height)
-                    || gfx.last_present.is_none_or(|at| at.elapsed() >= RESIZE_FRAME)
-                {
-                    gfx.draw();
-                }
-            }
+            WindowEvent::RedrawRequested => gfx.draw(),
             _ => {}
         }
     }
@@ -1029,7 +1016,7 @@ struct Gfx {
     /// Caret blink anchor: any input resets it, so the caret is solid while
     /// you type and blinks only at rest.
     last_input: Instant,
-    last_present: Option<Instant>,
+    resize_pending: bool,
     blink_phase: u64,
     /// Previous left-press + running click count, for double/triple-click
     /// detection (winit doesn't count clicks; that is consumer work — only the
@@ -1039,7 +1026,6 @@ struct Gfx {
 
 /// Half a blink cycle: visible for one period, hidden for the next.
 const BLINK_MS: u64 = 530;
-const RESIZE_FRAME: Duration = Duration::from_millis(33);
 
 impl Gfx {
     async fn new(event_loop: &ActiveEventLoop, font: Option<&str>, path: Option<PathBuf>) -> Self {
@@ -1129,7 +1115,7 @@ impl Gfx {
             cursor: Vec2::new(0.0, 0.0),
             dragging: false,
             last_input: Instant::now(),
-            last_present: None,
+            resize_pending: false,
             blink_phase: 0,
             last_click: None,
         };
@@ -1465,7 +1451,7 @@ impl Gfx {
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
-        self.last_present = Some(Instant::now());
+        self.resize_pending = false;
     }
 }
 
