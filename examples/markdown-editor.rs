@@ -807,10 +807,7 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 gfx.on_key(event);
             }
-            WindowEvent::Resized(size) => {
-                gfx.resize(size);
-                gfx.window.request_redraw();
-            }
+            WindowEvent::Resized(_) => gfx.window.request_redraw(),
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
@@ -1049,15 +1046,6 @@ impl Gfx {
             self.editor.doc.name(),
             if self.editor.doc.dirty { " •" } else { "" },
         ));
-    }
-
-    fn resize(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        self.config.width = size.width;
-        self.config.height = size.height;
-        self.surface.configure(&self.device, &self.config);
     }
 
     /// Mouse → placed caret, through the same layout the last frame drew.
@@ -1394,13 +1382,26 @@ impl Gfx {
     }
 
     fn draw(&mut self) {
-        let frame = match self.surface.get_current_texture() {
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        if self.config.width != size.width || self.config.height != size.height {
+            self.config.width = size.width;
+            self.config.height = size.height;
+            self.surface.configure(&self.device, &self.config);
+        }
+        let mut acquired = self.surface.get_current_texture();
+        if matches!(
+            &acquired,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost
+        ) {
+            self.surface.configure(&self.device, &self.config);
+            acquired = self.surface.get_current_texture();
+        }
+        let frame = match acquired {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
             _ => return,
         };
         let view = frame.texture.create_view(&Default::default());

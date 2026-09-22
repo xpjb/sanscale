@@ -915,10 +915,20 @@ impl ApplicationHandler for App {
             gfx.blink_phase = phase;
             gfx.window.request_redraw();
         }
+        if gfx.resize_pending
+            && gfx.last_frame.is_none_or(|t| t.elapsed() >= RESIZE_FRAME)
+            && gfx.draw()
+        {
+            gfx.resize_pending = false;
+        }
         let next_flip = BLINK_MS - (since % BLINK_MS);
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(next_flip.max(1)),
-        ));
+        let mut wake = Instant::now() + Duration::from_millis(next_flip.max(1));
+        if gfx.resize_pending {
+            if let Some(last) = gfx.last_frame {
+                wake = wake.min(last + RESIZE_FRAME);
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -930,8 +940,12 @@ impl ApplicationHandler for App {
                 gfx.on_key(event);
             }
             WindowEvent::Resized(size) => {
-                gfx.resize(size);
-                gfx.window.request_redraw();
+                if size.width == 0 || size.height == 0 {
+                    gfx.resize_pending = false;
+                } else {
+                    gfx.resize_pending = true;
+                    gfx.window.request_redraw();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
@@ -982,7 +996,14 @@ impl ApplicationHandler for App {
                     gfx.place_at_cursor(true);
                 }
             }
-            WindowEvent::RedrawRequested => gfx.draw(),
+            WindowEvent::RedrawRequested => {
+                if (!gfx.resize_pending
+                    || gfx.last_frame.is_none_or(|t| t.elapsed() >= RESIZE_FRAME))
+                    && gfx.draw()
+                {
+                    gfx.resize_pending = false;
+                }
+            },
             _ => {}
         }
     }
@@ -1007,6 +1028,8 @@ struct Gfx {
     /// Caret blink anchor: any input resets it, so the caret is solid while
     /// you type and blinks only at rest.
     last_input: Instant,
+    resize_pending: bool,
+    last_frame: Option<Instant>,
     blink_phase: u64,
     /// Previous left-press + running click count, for double/triple-click
     /// detection (winit doesn't count clicks; that is consumer work — only the
@@ -1016,6 +1039,7 @@ struct Gfx {
 
 /// Half a blink cycle: visible for one period, hidden for the next.
 const BLINK_MS: u64 = 530;
+const RESIZE_FRAME: Duration = Duration::from_millis(16);
 
 impl Gfx {
     async fn new(event_loop: &ActiveEventLoop, font: Option<&str>, path: Option<PathBuf>) -> Self {
@@ -1105,6 +1129,8 @@ impl Gfx {
             cursor: Vec2::new(0.0, 0.0),
             dragging: false,
             last_input: Instant::now(),
+            resize_pending: false,
+            last_frame: None,
             blink_phase: 0,
             last_click: None,
         };
@@ -1129,15 +1155,6 @@ impl Gfx {
             self.editor.doc.name(),
             if self.editor.doc.dirty { " •" } else { "" },
         ));
-    }
-
-    fn resize(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        self.config.width = size.width;
-        self.config.height = size.height;
-        self.surface.configure(&self.device, &self.config);
     }
 
     /// Mouse → placed caret, through the same layout the last frame drew.
@@ -1380,15 +1397,31 @@ impl Gfx {
         }
     }
 
-    fn draw(&mut self) {
-        let frame = match self.surface.get_current_texture() {
+    fn draw(&mut self) -> bool {
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return false;
+        }
+        if self.config.width != size.width || self.config.height != size.height {
+            self.config.width = size.width;
+            self.config.height = size.height;
+            self.surface.configure(&self.device, &self.config);
+        }
+        let mut acquired = self.surface.get_current_texture();
+        if matches!(
+            &acquired,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost
+        ) {
+            self.surface.configure(&self.device, &self.config);
+            acquired = self.surface.get_current_texture();
+        }
+        let frame = match acquired {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return;
+            _ => {
+                self.last_frame = Some(Instant::now());
+                return false;
             }
-            _ => return,
         };
         let view = frame.texture.create_view(&Default::default());
         let screen = Vec2::new(self.config.width as f32, self.config.height as f32);
@@ -1436,6 +1469,8 @@ impl Gfx {
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
+        self.last_frame = Some(Instant::now());
+        true
     }
 }
 
