@@ -133,8 +133,8 @@ shrink its corpus silently, or combine these cases into a single average.
 | Paragraph groups | New block with the same cached paragraphs | Cache hits followed by full block assembly/copying |
 | Paragraph groups | Edit first/middle/last versus invalidate-all control | Necessary paragraph work versus gratuitous document-wide invalidation |
 | Structure | Insert/delete at the front, split/merge in the middle, many empty paragraphs | Stable paragraph IDs, byte rebasing, caret/assembly overhead without assuming every change has the same byte length |
-| Width/style | Fresh widths versus an explicitly prewarmed width cycle, for a single paragraph **and whole paragraph groups** | Actual misses versus cached-width hits; no pretending the latter measures reflow. Group sweeps vary widths substantially and give every fresh width a unique value; all three cached variants are prewarmed |
-| Width/style | Fresh line spacing; alignment-only miss | Existing overly broad combined shape/flow cache keys |
+| Width/style | Fresh widths versus an explicitly prewarmed width cycle, for a single paragraph **and whole paragraph groups** | Width misses reflow cached glyphs; cached-width hits do neither. Group sweeps vary widths substantially and give every fresh width a unique value; all three cached variants are prewarmed |
+| Width/style | Fresh line spacing; alignment-only miss | Style-only misses reuse shaped glyphs but still rebuild flowed paragraphs and blocks |
 | Font chains | Cached regular/italic toggle; fresh-layout toggle; distinct chains sharing actual faces | Paragraph-style reuse versus re-shaping with shared outline atlas entries; not a substitute for future inline-span cases |
 | Fallback chain | Same text with a deliberately long fallback chain | Coverage-probe cost independently of atlas misses |
 | Transient labels | Cached content-keyed text | Hash/split overhead versus consumer identity lookup |

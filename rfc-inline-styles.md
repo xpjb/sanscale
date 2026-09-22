@@ -217,11 +217,12 @@ or introduce another cache without measuring the cost and retained memory.
 
 ### Current costs to keep visible (not introduced by this note)
 
-- **Shaping and flow are cached together.** `paragraphs` is keyed by
-  `(ParagraphKey, Style)`. `Style` includes width, alignment, and line spacing;
-  `ensure_paragraph()` shapes before flowing on a miss. An uncached width can
-  therefore cause avoidable shaping. Cycling warmed widths measures cache hits,
-  not this cost.
+- **Shaping and flow were cached together.** `paragraphs` is keyed by
+  `(ParagraphKey, Style)`. The original `ensure_paragraph()` shaped before flowing
+  on every miss. An uncached width caused avoidable shaping; cycling warmed
+  widths measured cache hits, not this cost. **Since fixed:** shaped glyphs are
+  retained separately under `(ParagraphKey, FontChainHandle)`. New widths fetch
+  text and flow again, but do not shape unchanged paragraphs.
 - **One changed paragraph still reassembles the composed block.** `assemble()`
   copies the cached lines/carets/glyphs of all its paragraphs, and `shape()` clears
   the block's geometry. "Only one paragraph reshaped" is not "the edit does work

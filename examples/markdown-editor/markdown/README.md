@@ -128,8 +128,8 @@ sizing is future policy, not silently inferred from a growing suffix.
 - On model changes the adapter walks top-level block metadata to place blocks;
   scene collection also visits block metadata. Only table **rows/cells** have the
   indexed visibility path. Global palette/font changes visit affected text nodes.
-- Initial layout measures all cells to know row heights. New widths can reshape
-  and flow every affected cell: sanscale still has a combined shape/flow cache.
+- Initial layout measures all cells to know row heights. New widths reflow
+  affected cells but reuse their cached shaped glyphs.
 - The source pane is one composed text block. Editing it still reassembles that
   source block. The preview/message component does not require this source pane.
 - The demo retains one text batch per pane/chrome. Changed draw inputs re-prepare
