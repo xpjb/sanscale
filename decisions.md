@@ -23,7 +23,8 @@ first; everything below assumes it.
 5. **Paragraph** — the unit of **invalidation**. The consumer owns its identity and
    version (`ParagraphKey`); it is shaped and reflowed independently and cached at
    `(ParagraphKey, Style)`, which is why an edit costs one paragraph and not the
-   document.
+   document. The current implementation also retains width-independent glyphs at
+   `(ParagraphKey, FontChainHandle)`; a style-only change reuses them for flow.
 6. **Block** — the unit of **coordinate space**. 1..N paragraphs at one `Style`,
    concatenated into one byte range, one line list, one `Layout`. `BlockKey` names
    it; `ShapedHandle` resolves it. The reason it exists is that its paragraphs want
@@ -80,7 +81,7 @@ Pools:
 2. **Chains** (`FontChainHandle`) — an ordered list of fonts (the fallback order). via `register_chain`.
 3. **Text glyph atlas** — Slug band/curve data (rasterized pixels). key: `(face_id, glyph_id)`. *(exists)*
 4. **Emoji atlas** — rasterized color glyphs (pixels). key: `(face_id, glyph_id, bucket)`. *(exists, bounded+evicting as of this week)*
-5. **Run shaping** *(Level 1)* — one itemized run's glyph sequence + advances, em-space. key: `(face, style, run-text)`. *(proposed; today shaping is only cached per-paragraph)*
+5. **Run shaping** *(Level 1)* — one itemized run's glyph sequence + advances, em-space. key: `(face, style, run-text)`. *(proposed; today shaping is only cached per-paragraph, independently of width)*
 6. **Paragraph layout** *(Level 2)* — ordered run-refs + line flow for a paragraph. key: `(ParagraphKey, Style)` — the whole style, since chain and `line_spacing` change the flow as much as `wrap_em` and `align` do. A block's part-refs point at these; a `ShapedHandle` resolves the *block*.
 7. **Geometry** — one block's quads, **host-side**, key `(color, clip)` plus an emoji atlas epoch and raster bucket. *Built* (it was written here as an optional GPU-buffer pool; both halves of that turned out wrong — see the note under *Maybe*).
 
@@ -403,6 +404,13 @@ Things we're certain about, and why.
   document where 99% of visible paragraphs are unchanged, their text is never materialized —
   the closure is the escape hatch that says "give me the chars only if I'm actually
   reshaping." This is the un-boxed form of today's `TextParagraphProvider`.
+
+  **Implementation update:** The old single key was too broad: it reshaped every paragraph on
+  each new width, even if its glyphs did not change. Glyph runs are now cached per
+  `(ParagraphKey, FontChainHandle)`, while flowed paragraphs still use `(ParagraphKey, Style)`.
+  New widths fetch text for line breaking but reuse glyphs and resolved font spans; no text is
+  retained. Font-chain release clears both caches. This is paragraph-level reuse, not the
+  proposed reuse of individual runs across edits.
 
 - **We never own the text — the consumer's data structure stays authoritative.** The service
   stores only *shaping* (derived, disposable), keyed by identity, and borrows a `&str` via

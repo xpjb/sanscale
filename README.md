@@ -48,8 +48,9 @@ measurements use em units. You can also supply a world-space transform.
   system fonts.
 - **Text and layout:** `shape` accepts keyed paragraphs from your own
   `ParagraphSource`. Increment `ParagraphKey::generation` when text or font
-  spans change; unchanged paragraphs can reuse their shaping. `Style` sets
-  wrapping, alignment, and line spacing. `measure` gives you bounds,
+  spans change; changing wrap width reuses unchanged paragraphs' shaped glyphs
+  and reflows their lines. `Style` sets wrapping, alignment, and line spacing.
+  `measure` gives you bounds,
   hit-testing, caret movement, and selection geometry without a GPU.
 - **Inline styles:** supply `FontSpan` ranges through
   `ParagraphSource::paragraph_fonts`. Register `PaintSpan` ranges with

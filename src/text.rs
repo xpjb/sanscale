@@ -21,7 +21,7 @@ use crate::cache::{GlyphCache, GlyphInfo};
 use crate::emoji::{EmojiCache, bucket_for};
 use crate::flow::{FlowLine, flow_paragraph};
 use crate::font::Font;
-use crate::layout::{ChainFont, ShapedGlyph, shape_spanned, shape_text};
+use crate::layout::{ChainFont, ShapedGlyph, ShapedRun, shape_spanned, shape_text};
 use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer};
 use crate::spans::{
     FontSpan, PaintCursor, PaintError, PaintHandle, PaintPool, PaintSpan, valid_font_spans,
@@ -882,6 +882,12 @@ impl ParagraphSource for Paragraphs<'_> {
 // internals
 // ---------------------------------------------------------------------------
 
+struct ParaShape {
+    run: ShapedRun,
+    span_chains: Box<[FontChainHandle]>,
+    last_used: u64,
+}
+
 /// Level-2 result for one paragraph at one style.
 struct ParaLayout {
     span_chains: Box<[FontChainHandle]>,
@@ -1082,6 +1088,7 @@ pub struct TextService {
     /// live handles stay valid.
     free_blocks: Vec<u32>,
     block_lookup: HashMap<BlockKey, ShapedHandle>,
+    shaped: HashMap<(ParagraphKey, FontChainHandle), ParaShape>,
     paragraphs: HashMap<(ParagraphKey, Style), ParaLayout>,
 
     paints: PaintPool,
@@ -1159,6 +1166,8 @@ impl TextService {
         *slot = None;
         self.paragraphs
             .retain(|(_, style), para| style.chain != chain && !para.span_chains.contains(&chain));
+        self.shaped
+            .retain(|(_, base), para| *base != chain && !para.span_chains.contains(&chain));
         for (index, slot) in self.blocks.iter_mut().enumerate() {
             let stale = slot.block.as_ref().is_some_and(|block| {
                 block.style.chain == chain || block.span_chains.contains(&chain)
@@ -1202,6 +1211,7 @@ impl TextService {
         self.geometry.clear();
         self.free_blocks.clear();
         self.block_lookup.clear();
+        self.shaped.clear();
         self.paragraphs.clear();
         self.paints.clear();
         self.glyphs = GlyphCache::new();
@@ -1220,10 +1230,10 @@ impl TextService {
     /// while the block remains cached. A camera transform does not require this
     /// call at all.
     ///
-    /// The paragraph cache currently includes the entire [`Style`]: a new width,
-    /// alignment, or line spacing reshapes as well as reflows on a cache miss.
-    /// Changing one paragraph at the same style reuses the others' cached results,
-    /// but block assembly still copies all paragraphs' glyphs and carets.
+    /// A new width, alignment, or line spacing reflows paragraphs but reuses
+    /// their shaped glyphs. Changing one paragraph at the same style reuses
+    /// the others' cached results; block assembly still copies all paragraphs'
+    /// glyphs and carets.
     pub fn shape(
         &mut self,
         block: BlockKey,
@@ -1805,58 +1815,63 @@ impl TextService {
         let clock = self.clock;
         if let Some(entry) = self.paragraphs.get_mut(&(key, *style)) {
             crate::work::count!(paragraph_hits, 1);
-            entry.last_used = self.clock;
+            entry.last_used = clock;
+            if let Some(shaped) = self.shaped.get_mut(&(key, style.chain)) {
+                shaped.last_used = clock;
+            }
             return Some(());
         }
         // The only place text is ever pulled from the consumer.
         crate::work::count!(source_reads, 1);
         let text = source.paragraph_text(index, key)?;
         crate::work::count!(source_bytes, text.len());
-        let spans = source.paragraph_fonts(index, key);
-        if !valid_font_spans(&text, &spans) {
-            return None;
-        }
-        crate::work::count!(font_spans, spans.len());
-        // Split the borrow: the chain view reads `fonts`, shaping writes
-        // `glyphs`. They are disjoint fields, but a `&self` helper would tie them
-        // together.
-        let Self {
-            fonts,
-            chains,
-            glyphs,
-            paragraphs,
-            ..
-        } = self;
-        let chain = chain_view(fonts, chains, style.chain);
-        if chain.is_empty() {
-            return None;
-        }
-        let mut dependencies = Vec::new();
-        let run = if spans.is_empty() {
-            shape_text(&chain, glyphs, text.as_ref())
-        } else {
-            let mut views = vec![chain];
-            let mut indices = HashMap::from([(style.chain, 0usize)]);
-            let mut resolved = Vec::with_capacity(spans.len());
-            for span in spans.iter() {
-                let next = views.len();
-                let position = *indices.entry(span.chain).or_insert_with(|| {
-                    views.push(chain_view(fonts, chains, span.chain));
-                    dependencies.push(span.chain);
-                    next
-                });
-                if views[position].is_empty() {
-                    return None;
-                }
-                resolved.push((span.range.clone(), position));
+        if !self.shaped.contains_key(&(key, style.chain)) {
+            let spans = source.paragraph_fonts(index, key);
+            if !valid_font_spans(&text, &spans) {
+                return None;
             }
-            shape_spanned(&views, &resolved, glyphs, text.as_ref())
-        };
-        let lines = flow_paragraph(text.as_ref(), &run.glyphs, style.max_width_em());
-        paragraphs.insert(
+            crate::work::count!(font_spans, spans.len());
+            let chain = chain_view(&self.fonts, &self.chains, style.chain);
+            if chain.is_empty() {
+                return None;
+            }
+            let mut dependencies = Vec::new();
+            let run = if spans.is_empty() {
+                shape_text(&chain, &mut self.glyphs, text.as_ref())
+            } else {
+                let mut views = vec![chain];
+                let mut indices = HashMap::from([(style.chain, 0usize)]);
+                let mut resolved = Vec::with_capacity(spans.len());
+                for span in spans.iter() {
+                    let next = views.len();
+                    let position = *indices.entry(span.chain).or_insert_with(|| {
+                        views.push(chain_view(&self.fonts, &self.chains, span.chain));
+                        dependencies.push(span.chain);
+                        next
+                    });
+                    if views[position].is_empty() {
+                        return None;
+                    }
+                    resolved.push((span.range.clone(), position));
+                }
+                shape_spanned(&views, &resolved, &mut self.glyphs, text.as_ref())
+            };
+            self.shaped.insert(
+                (key, style.chain),
+                ParaShape {
+                    run,
+                    span_chains: dependencies.into_boxed_slice(),
+                    last_used: clock,
+                },
+            );
+        }
+        let shaped = self.shaped.get_mut(&(key, style.chain))?;
+        shaped.last_used = clock;
+        let lines = flow_paragraph(text.as_ref(), &shaped.run.glyphs, style.max_width_em());
+        self.paragraphs.insert(
             (key, *style),
             ParaLayout {
-                span_chains: dependencies.into_boxed_slice(),
+                span_chains: shaped.span_chains.clone(),
                 lines,
                 len_bytes: text.len(),
                 last_used: clock,
@@ -1955,6 +1970,13 @@ impl TextService {
     /// the consumer keeps drawing is kept alive by being re-shaped (a comparison
     /// when nothing moved), so this only ever reaches genuinely cold entries.
     fn evict(&mut self) {
+        if self.shaped.len() > MAX_PARAGRAPHS {
+            let mut ages: Vec<u64> = self.shaped.values().map(|p| p.last_used).collect();
+            let cut = self.shaped.len() - MAX_PARAGRAPHS * 3 / 4;
+            ages.select_nth_unstable(cut);
+            let threshold = ages[cut];
+            self.shaped.retain(|_, entry| entry.last_used > threshold);
+        }
         if self.paragraphs.len() > MAX_PARAGRAPHS {
             let mut ages: Vec<u64> = self.paragraphs.values().map(|p| p.last_used).collect();
             let cut = self.paragraphs.len() - MAX_PARAGRAPHS * 3 / 4;
@@ -2754,6 +2776,48 @@ mod tests {
         assert_eq!(src.calls.get(), 2, "a new generation must fetch");
     }
 
+    #[test]
+    fn width_change_reflows_without_reshaping() {
+        let Some((mut text, chain)) = latin_chain() else {
+            return;
+        };
+        let key = ParagraphKey {
+            namespace: 8,
+            slot: 1,
+            generation: 0,
+        };
+        let src = CountingSource {
+            text: "alpha beta gamma delta",
+            calls: std::cell::Cell::new(0),
+        };
+        let narrow = style_of(chain, Some(5.));
+        let wide = style_of(chain, Some(100.));
+        let narrow_handle = text.shape(BlockKey(1), &narrow, &[key], &src).unwrap();
+        let narrow_lines = text.measure(narrow_handle).lines.len();
+        let glyphs = text.shaped[&(key, chain)].run.glyphs.as_ptr();
+        assert!(narrow_lines > 1);
+
+        #[cfg(feature = "perf-counters")]
+        crate::profiling::reset_work_counters();
+        let wide_handle = text.shape(BlockKey(1), &wide, &[key], &src).unwrap();
+        assert_eq!(text.measure(wide_handle).lines.len(), 1);
+        assert_eq!(text.shaped[&(key, chain)].run.glyphs.as_ptr(), glyphs);
+        assert_eq!(src.calls.get(), 2, "new width still needs the source for flow");
+        #[cfg(feature = "perf-counters")]
+        {
+            let work = crate::profiling::work_counters();
+            assert_eq!(work.shape_calls, 0);
+            assert_eq!(work.flow_calls, 1);
+        }
+
+        let edited = ParagraphKey {
+            generation: 1,
+            ..key
+        };
+        text.shape(BlockKey(1), &wide, &[edited], &src).unwrap();
+        assert_eq!(text.shaped.len(), 2, "a new generation needs new glyphs");
+    }
+
     /// Restored from `engine.rs`. `is_single_glyph` is what a grid consumer uses
     /// to decide between drawing a sequence and drawing tofu.
     #[test]
@@ -3071,6 +3135,7 @@ mod tests {
         // The block must remember dependencies even after paragraph eviction.
         text.paragraphs.clear();
         text.drop_chain(alias);
+        assert!(!text.shaped.contains_key(&(keys[0], chain)));
         assert!(text.block_index(styled).is_none());
         assert_eq!(text.measure(styled).len_bytes(), 0);
         assert!(text.geometry[styled.slot as usize].is_none());

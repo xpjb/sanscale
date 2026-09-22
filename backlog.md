@@ -78,30 +78,20 @@ is accepted deliberately.
 
 ---
 
-## No measurement of reflow itself
+## Isolated line-breaking benchmark remains open
 
-`flow_paragraph` — greedy first-fit line breaking — has no benchmark. compendium's
-`layout.slug.width_cycle_cache_hit` looks like one and is not: `wrap_em` is part of
-the shaping key, so each width gets its own cache entry and after warmup the
-scenario measures hits. It was renamed to say so.
+`flow_paragraph` — greedy first-fit line breaking — has no isolated benchmark.
+The pathological suite's `cpu.cache.width_fresh` uses genuinely new widths;
+`width_cycle_cached` measures hits on prewarmed styles, not line breaking.
+Once a paragraph is shaped, a new width reuses its glyphs but still fetches its
+text, flows the lines, and assembles the block. A width-fresh timing is therefore
+not just `flow_paragraph` time. The suite's flow-call/token/glyph-test counters
+separate the work counts, not the timings.
 
-This is fine today. Reflow runs only when a node or pane is genuinely resized —
-zoom does not trigger it, because `wrap_em` derives from world units and the zoom
-cancels — so the live path is dragging a resize handle, and nothing suggests it is
-slow.
-
-It stops being fine the moment line breaking is touched. The Knuth-Plass item in
-`decisions.md` swaps the Level-2 step wholesale for an optimal-breaking pass that is
-categorically more expensive, and there is no number it could regress against.
-Whoever picks that up should add a reflow scenario that defeats the cache *first*,
-and take a baseline before changing anything.
-
-**Pipeline baseline added:** [the pathological suite](performance.md) now has
-`cpu.cache.width_fresh` (genuine misses) separately from `width_cycle_cached`, plus
-flow-call/token/glyph-test counters. This measures the current shape+flow pipeline,
-not isolated `flow_paragraph` time: the combined cache still reshapes on a width
-miss. A pure-flow timing probe remains separate work if the breaking algorithm
-itself is changed. Do not relabel a warmed width cycle as that measurement.
+If line breaking changes, add an isolated reflow probe and take a baseline first.
+The proposed Knuth-Plass pass is more expensive than greedy flow, and the current
+line breaker also scans all glyphs for each token. Resizing is a live path; do not
+assume this work is free.
 
 ---
 
@@ -111,12 +101,12 @@ The [inline-style design note](rfc-inline-styles.md) records the proposed C-edit
 milestone and the subsequent incremental Markdown renderer, including tables.
 Neither is implemented by that note.
 
-Separate shaping/flow caches and context-safe run reuse remain candidates, not
-prerequisites for spans. The current combined cache can reshape on a width-only
-miss, a changed paragraph reassembles its whole block, geometry has one cached
-variant per block, and preparing again uploads the requested batch. Those are
-specific costs, not grounds for claiming the whole pipeline is incremental just
-because unchanged paragraphs hit their cache.
+Paragraph-level shaping and flow now have separate caches; context-safe run
+reuse across edits remains open. A width-only miss reflows without reshaping,
+but a changed paragraph still reassembles its whole block, geometry has one
+cached variant per block, and preparing again uploads the requested batch.
+Those are specific costs, not grounds for claiming the whole pipeline is
+incremental just because unchanged paragraphs hit their cache.
 
 **Trigger:** implement rich spans with explicit work counters/baselines, then
 revisit the costs that measure in style-only changes, long paragraphs, pane
