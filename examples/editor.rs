@@ -23,7 +23,7 @@
 //!
 //! Interactive:  `cargo run --example editor [-- <file>] [--font <family>]`
 //!     Ctrl+O/S open/save · Ctrl+Shift+S save as · Ctrl+A/C/X/V ·
-//!     Ctrl+wheel zoom · wheel scroll · Esc clears selection
+//!     Ctrl+wheel or Ctrl+Plus/Minus zoom · wheel scroll · Esc clears selection
 //! Headless PNG: `cargo run --example editor -- --dump`   → editor.png
 
 mod common;
@@ -253,7 +253,7 @@ impl Editor {
             anchor: None,
             goal: None,
             scroll_y: 0.0,
-            font_px: 17.0,
+            font_px: 20.0,
             caret_block: false,
         }
     }
@@ -990,6 +990,18 @@ impl Gfx {
         self.blink_phase = 0;
         let ctrl = self.mods.control_key();
         let shift = self.mods.shift_key();
+        if ctrl {
+            let factor = match &event.logical_key {
+                Key::Character(c) if matches!(c.as_str(), "+" | "=") => Some(1.1),
+                Key::Character(c) if matches!(c.as_str(), "-" | "_") => Some(1.0 / 1.1),
+                _ => None,
+            };
+            if let Some(factor) = factor {
+                self.editor.font_px = (self.editor.font_px * factor).clamp(5.0, 160.0);
+                self.window.request_redraw();
+                return;
+            }
+        }
         let Some(handle) = self.last_handle else {
             return;
         };
