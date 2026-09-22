@@ -1880,7 +1880,8 @@ impl TextService {
         };
         let metrics = primary.font.metrics();
         let line_height_em = metrics.line_height() * style.line_spacing;
-        let ascent_em = metrics.ascent;
+        let baseline_offset_em = metrics.ascent
+            + (line_height_em - (metrics.ascent - metrics.descent)) * 0.5;
 
         let mut lines: Vec<LayoutLine> = Vec::new();
         let mut byte_offset = 0usize;
@@ -1902,7 +1903,7 @@ impl TextService {
                     byte_range: flow.source.start + byte_offset..flow.source.end + byte_offset,
                     metrics: LineMetrics {
                         top_em,
-                        baseline_em: top_em + ascent_em,
+                        baseline_em: top_em + baseline_offset_em,
                         height_em: line_height_em,
                         width_em: flow.advance,
                     },
@@ -2357,6 +2358,29 @@ mod tests {
             byte_range: bytes,
         };
         Layout::from_lines(vec![line(0..2, 0.0), line(3..3, 1.0), line(4..6, 2.0)])
+    }
+
+    #[test]
+    fn line_spacing_is_centered_around_the_font_box() {
+        let (mut text, chain) = required_latin();
+        let metrics = text.chain_view(chain)[0].font.metrics();
+        let style = Style {
+            line_spacing: 1.15,
+            ..style_of(chain, None)
+        };
+        let handle = text
+            .shape(BlockKey(1), &style, &span_keys(1), &Paragraphs(&["Ag"]))
+            .unwrap();
+        let layout = text.measure(handle);
+        let line = layout.line(0).unwrap();
+        let above = line.baseline_em - line.top_em - metrics.ascent;
+        let below = line.top_em + line.height_em - (line.baseline_em - metrics.descent);
+        assert!(above > 0.0);
+        assert!((above - below).abs() < 1e-6);
+        let caret = layout.caret_rect(0);
+        let selected = &layout.selection(0..1)[0];
+        assert_eq!((caret.y_em, caret.height_em), (line.top_em, line.height_em));
+        assert_eq!((selected.y_em, selected.height_em), (line.top_em, line.height_em));
     }
 
     /// A selected hard newline shows as a stub past the last glyph, and a blank
