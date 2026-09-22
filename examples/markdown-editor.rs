@@ -4,7 +4,7 @@
 //! Run `cargo run --release --example markdown-editor -- [file.md]`.
 //! F2 palette, F3 italic faces, F4 reveal source block in preview, F5 append/pause
 //! a simulated agent message, F6 follow tail. Wheel scrolls the pane under the pointer; Shift+wheel pans wide
-//! tables; Ctrl+wheel zooms. Click preview text to place the source caret.
+//! tables; Ctrl+wheel or Ctrl+Plus/Minus zooms. Click preview text to place the source caret.
 //! `--dump` writes markdown-editor.png; `--dump --stream` exercises chunked
 //! appends before writing markdown-editor-stream.png. No GUI in headless mode.
 mod common;
@@ -225,7 +225,7 @@ impl Editor {
             scroll_y: 0.0,
             preview_scroll: Vec2::new(0., 0.),
             follow_tail: false,
-            font_px: 17.0,
+            font_px: 20.0,
             caret_block: false,
         }
     }
@@ -1206,6 +1206,18 @@ impl Gfx {
         }
         let ctrl = self.mods.control_key();
         let shift = self.mods.shift_key();
+        if ctrl {
+            let factor = match &event.logical_key {
+                Key::Character(c) if matches!(c.as_str(), "+" | "=") => Some(1.1),
+                Key::Character(c) if matches!(c.as_str(), "-" | "_") => Some(1.0 / 1.1),
+                _ => None,
+            };
+            if let Some(factor) = factor {
+                self.editor.font_px = (self.editor.font_px * factor).clamp(8.0, 48.0);
+                self.window.request_redraw();
+                return;
+            }
+        }
         let Some(handle) = self.last_handle else {
             return;
         };
