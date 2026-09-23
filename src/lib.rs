@@ -145,10 +145,10 @@ pub mod profiling;
 pub use font::read_font_file;
 
 pub use text::{
-    Align, Batch, BlockKey, Boundaries, Caret, CaretRect, CaretStop, Color, Diagnostics, Draw,
+    Align, Batch, BlockKey, Caret, CaretRect, CaretStop, Color, Diagnostics, Draw,
     FontChainHandle, FontData, FontError, FontHandle, Layout, LayoutLineSpec, LineMetrics, Motion,
     ParagraphKey, ParagraphSource, Paragraphs, Rect, Segment, SelectionSpan, ShapedHandle, Style,
-    TextService, Vec2,
+    TextService, Vec2, WordBoundaries,
 };
 
 pub use spans::{FontSpan, PaintError, PaintHandle, PaintSpan};

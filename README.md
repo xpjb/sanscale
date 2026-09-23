@@ -111,7 +111,7 @@ let rect = layout.caret_rect(caret);
 ```
 
 - Up/Down → `Motion::Up` / `Down`; retaining `goal_x` prevents drifting across short lines.
-- Ctrl+Left/Right → `WordLeft` / `WordRight`, with a `Boundaries` implementation over
+- Ctrl+Left/Right → `WordLeft` / `WordRight`, with a `WordBoundaries` implementation over
   your text. **Passing `()` falls back to cluster steps, not word navigation.**
 - Home/End, PageUp/PageDown (visual-line stride), and DocStart/DocEnd are also motions.
 - Shift extends from your selection anchor; movement alone does not own a selection.
@@ -139,6 +139,11 @@ clusters. Finer ligature/post-edit positioning is a [deferred follow-up](backlog
   word-boundary arguments also accept trait objects.
 - A stale/incomplete prepare stays non-live. Refresh evicted shape handles before
   preparing; emoji bucket changes now invalidate retained native-color batches.
+
+Pre-publication naming cleanup (also applies when migrating from `8cc5afe`):
+`Boundaries` → `WordBoundaries`, `Layout::caret_on_line` →
+`Layout::caret_byte_on_line`, and `SelectionSpan::line` → `line_index`.
+These are renames only; byte-index return values and behavior are unchanged.
 
 ## Examples
 

@@ -1073,3 +1073,26 @@ incomplete liveness) were each rejected by the corresponding tests.
 
 Reopen only with a demonstrated correctness or measured cost problem under these
 same ownership/order contracts, not to reintroduce guessed frame boundaries.
+
+
+## Pre-publication naming cleanup (locked)
+
+A compiler-resolved inventory review before publishing 0.1 identified three small
+ambiguities. Rename `Boundaries` to `WordBoundaries` because the trait supplies
+only word boundaries; rename `Layout::caret_on_line` to `caret_byte_on_line`
+because it returns a byte index, not a placed `Caret`; and rename
+`SelectionSpan::line` to `line_index` to match `Caret`.
+
+No behavior or ownership changes, compatibility aliases, or extra public types.
+Keep the existing `TextService`, shape/measure/draw vocabulary, and distinct
+consumer keys versus service handles. Earlier entries retain the historical
+names. The current declarations, examples, tests and migration guide use the new
+names; consumers pinned to older Git revisions can migrate when updating their
+pin. This is unrelated to the deferred intra-ligature/IME work.
+
+Validation: all 96 library/example/integration tests passed, including the ignored
+GPU cases. Library/integration-test Clippy and rustdoc (warnings denied) passed;
+the compiler-resolved public inventory was regenerated. All-target Clippy still
+hits the unchanged redraw-guard style lint in `examples/code-editor.rs:999–1005`
+(`clippy::collapsible_match`), recorded separately as flag
+`d31293b4-fbdc-4f6e-8b6e-be3505f999f3`; no unrelated event-loop rewrite was included.

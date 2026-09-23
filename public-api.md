@@ -25,7 +25,7 @@ python3 scripts/export-public-api.py target/doc/sanscale.json public-api.md
 ```
 
 Rustdoc JSON format: `61`. Declaration fingerprint (SHA-256):
-`420c862555f035cbe4a99501629ac75f039e29a8c71ada76de1e18a71ae034aa`. Do not edit generated declarations by hand.
+`ad59c1bac935543bbd03f1b16ff941f6556075adac08af8348f4ee8b8c9fd7e3`. Do not edit generated declarations by hand.
 
 ## `sanscale::Align`
 
@@ -67,22 +67,6 @@ The consumer's identity for a composed block: the unit of *coordinate space*.
 
 ```rust
 pub struct BlockKey(pub u64);
-```
-
-## `sanscale::Boundaries`
-
-[src/text.rs:295](src/text.rs#L295)
-
-Word classification over the caller's text, for `Motion::WordLeft` /
-`Motion::WordRight`. Words are semantics, not shaping, so the crate asks
-rather than guesses — the same seam as `ParagraphSource`. Return `None`
-to decline; the motion degrades to a cluster step. `()` always declines.
-
-```rust
-pub trait Boundaries {
-    fn prev_word(&self, byte_index: usize) -> Option<usize>;
-    fn next_word(&self, byte_index: usize) -> Option<usize>;
-}
 ```
 
 ## `sanscale::Caret`
@@ -261,7 +245,7 @@ impl Layout {
     pub fn line_range(&self, index: usize) -> Option<Range<usize>>;
     pub fn len_bytes(&self) -> usize;
     pub fn hit_test(&self, at_em: Vec2) -> Option<Caret>;
-    pub fn caret_on_line(&self, line_index: usize, x_em: f32) -> Option<usize>;
+    pub fn caret_byte_on_line(&self, line_index: usize, x_em: f32) -> Option<usize>;
     pub fn caret_rect(&self, caret: Caret) -> CaretRect;
     pub fn next_caret_stop(&self, byte_index: usize) -> Option<usize>;
     pub fn prev_caret_stop(&self, byte_index: usize) -> Option<usize>;
@@ -273,9 +257,13 @@ impl Layout {
         caret: Caret,
         motion: Motion,
         goal: &mut Option<f32>,
-        text: &impl Boundaries + ?Sized,
+        text: &impl WordBoundaries + ?Sized,
     ) -> Caret;
-    pub fn select_word_at(&self, byte_index: usize, text: &impl Boundaries + ?Sized) -> Range<usize>;
+    pub fn select_word_at(
+        &self,
+        byte_index: usize,
+        text: &impl WordBoundaries + ?Sized,
+    ) -> Range<usize>;
     pub fn select_paragraph_at(&self, byte_index: usize) -> Range<usize>;
     pub fn selection(&self, range: Range<usize>) -> Vec<SelectionSpan>;
 }
@@ -446,7 +434,7 @@ pub struct Segment {
 
 ```rust
 pub struct SelectionSpan {
-    pub line: usize,
+    pub line_index: usize,
     pub x_em: f32,
     pub y_em: f32,
     pub width_em: f32,
@@ -556,6 +544,22 @@ impl Vec2 {
 }
 ```
 
+## `sanscale::WordBoundaries`
+
+[src/text.rs:295](src/text.rs#L295)
+
+Word classification over the caller's text, for `Motion::WordLeft` /
+`Motion::WordRight`. Words are semantics, not shaping, so the crate asks
+rather than guesses — the same seam as `ParagraphSource`. Return `None`
+to decline; the motion degrades to a cluster step. `()` always declines.
+
+```rust
+pub trait WordBoundaries {
+    fn prev_word(&self, byte_index: usize) -> Option<usize>;
+    fn next_word(&self, byte_index: usize) -> Option<usize>;
+}
+```
+
 ## `sanscale::profiling::WorkCounters` — feature `perf-counters`
 
 [src/profiling.rs:30](src/profiling.rs#L30)
@@ -661,11 +665,6 @@ pub fn read_font_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Font
 ## Trait implementations (including derives)
 
 ```rust
-impl Boundaries for () {
-    fn prev_word(&self, _: usize) -> Option<usize>;
-    fn next_word(&self, _: usize) -> Option<usize>;
-}
-
 impl Clone for Align {
     fn clone(&self) -> Align;
     // Inherited defaults: clone_from
@@ -1231,6 +1230,11 @@ impl StructuralPartialEq for ShapedHandle {}
 impl StructuralPartialEq for Vec2 {}
 
 impl StructuralPartialEq for profiling::WorkCounters {}
+
+impl WordBoundaries for () {
+    fn prev_word(&self, _: usize) -> Option<usize>;
+    fn next_word(&self, _: usize) -> Option<usize>;
+}
 ```
 
 ## Inferred auto traits
