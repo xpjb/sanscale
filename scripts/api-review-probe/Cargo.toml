@@ -1,0 +1,11 @@
+[package]
+name = "sanscale-api-review-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# A forensic reproduction of this exact revision, not a regression suite for HEAD.
+[dependencies]
+sanscale = { git = "https://github.com/xpjb/sanscale", rev = "e5c9b03ca07add3418acb4e19bc6168f3c04475a", features = ["perf-counters"] }
+wgpu = "30"
+pollster = "0.3"
