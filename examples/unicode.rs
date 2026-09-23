@@ -335,8 +335,8 @@ impl Viewer {
         scale: f32,
         hud: Option<&str>,
     ) {
-        // No epoch check: the service owns its geometry, so an atlas eviction can
-        // no longer invalidate anything cached out here.
+        // The service caches logical geometry; prepared batches own emoji pages.
+        // Cache eviction cannot overwrite vertices or pixels retained out here.
         let inv = 1.0 / scale;
         let r0 = ((((0.0 - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, MAX_ROW);
         let r1 = ((((h - offset.y) * inv) / CELL_H).floor() as i64).clamp(0, MAX_ROW);
@@ -354,7 +354,7 @@ impl Viewer {
         // screen-space text uses, just a different matrix. Quads are emitted in
         // local em, so nothing here is baked at a zoom level.
         let cam = ortho(w, h) * model(offset, scale);
-        self.text.set_transform(&self.queue, cam.to_cols_array());
+        self.text.set_transform(cam.to_cols_array());
 
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
@@ -406,7 +406,7 @@ impl Viewer {
             return;
         };
         self.text
-            .set_transform(&self.queue, TextService::pixel_ortho(w as u32, h as u32));
+            .set_transform(TextService::pixel_ortho(w as u32, h as u32));
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -425,16 +425,7 @@ impl Viewer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.text.draw(
-                &self.device,
-                &self.queue,
-                &mut pass,
-                overlay,
-                sanscale::Vec2::new(16.0, h - 40.0),
-                24.0,
-                sanscale::Color([1.0, 0.0, 0.0, 1.0]),
-                None,
-            );
+            self.text.draw(&self.device, &self.queue, &mut pass, sanscale::Draw { block: overlay, at: sanscale::Vec2::new(16.0, h - 40.0), size: 24.0, color: sanscale::Color([1.0, 0.0, 0.0, 1.0]), clip: None, ..Default::default() });
         }
         self.queue.submit([enc.finish()]);
     }

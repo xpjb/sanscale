@@ -66,7 +66,7 @@ pub fn load(text: &mut TextService, families: &[&str], requested: Option<&str>) 
     let mut register = |face| {
         let mut chain = vec![face];
         chain.extend(fallback.iter().copied());
-        text.register_chain(&chain)
+        text.register_chain(&chain).expect("font chain capacity")
     };
     let regular = register(normal);
     CodeFonts {

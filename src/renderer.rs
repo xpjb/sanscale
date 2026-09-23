@@ -1,18 +1,58 @@
 //! wgpu pipeline + atlas upload + draw.
 
 use bytemuck::Pod;
-use glam::Mat4;
 use std::ops::Range;
 use wgpu::util::DeviceExt;
 
 use crate::cache::GlyphCache;
-use crate::emoji::EmojiCache;
 use crate::vertex::{EmojiVertex, TextVertex};
 
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Params {
-    matrix: [[f32; 4]; 4],
+/// Each changed matrix gets immutable storage. Recorded passes retain the old
+/// bind group through wgpu, even when several transforms precede one submit.
+pub(crate) struct Uniforms {
+    pub layout: wgpu::BindGroupLayout,
+    pub binding: wgpu::BindGroup,
+    bits: [u32; 16],
+}
+
+impl Uniforms {
+    pub fn new(device: &wgpu::Device, matrix: [f32; 16]) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("text transform layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let binding = Self::binding(device, &layout, &matrix);
+        Self { layout, binding, bits: matrix.map(f32::to_bits) }
+    }
+
+    pub fn set(&mut self, device: &wgpu::Device, matrix: [f32; 16]) {
+        if self.bits != matrix.map(f32::to_bits) {
+            self.binding = Self::binding(device, &self.layout, &matrix);
+            self.bits = matrix.map(f32::to_bits);
+        }
+    }
+
+    fn binding(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, matrix: &[f32; 16]) -> wgpu::BindGroup {
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("immutable text transform"),
+            contents: bytemuck::cast_slice(matrix),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        crate::work::count!(uniform_upload_bytes, std::mem::size_of_val(matrix));
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("text transform"), layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+        })
+    }
 }
 
 /// One uploaded glyph atlas (curve + band textures) bound as group 1.
@@ -238,29 +278,11 @@ fn write_texture_range<T: Pod>(
 /// Renders prepared vertex buffers against an atlas.
 pub struct TextRenderer {
     pipeline: wgpu::RenderPipeline,
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
-    pub atlas_layout: wgpu::BindGroupLayout,
 }
 
 impl TextRenderer {
-    /// A pipeline for one target format. The service builds one per format it is
-    /// asked to draw into; there is no surface and no configuration here.
-    pub(crate) fn for_format(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-            label: Some("text uniform layout"),
-        });
-        let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+    pub(crate) fn atlas_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -284,24 +306,13 @@ impl TextRenderer {
                 },
             ],
             label: Some("text atlas layout"),
-        });
+        })
+    }
 
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("text uniform buffer"),
-            contents: bytemuck::bytes_of(&Params {
-                matrix: Mat4::IDENTITY.to_cols_array_2d(),
-            }),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-            label: Some("text uniform bind group"),
-        });
-
+    pub(crate) fn for_format(
+        device: &wgpu::Device, format: wgpu::TextureFormat,
+        uniform_layout: &wgpu::BindGroupLayout, atlas_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
         let vert = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("text vertex shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/vertex.wgsl").into()),
@@ -313,7 +324,7 @@ impl TextRenderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("text pipeline layout"),
-            bind_group_layouts: &[Some(&uniform_layout), Some(&atlas_layout)],
+            bind_group_layouts: &[Some(uniform_layout), Some(atlas_layout)],
             immediate_size: 0,
         });
 
@@ -377,20 +388,7 @@ impl TextRenderer {
             cache: None,
         });
 
-        Self {
-            pipeline,
-            uniform_buffer,
-            uniform_bind_group,
-            atlas_layout,
-        }
-    }
-
-    pub(crate) fn write_matrix(&self, queue: &wgpu::Queue, matrix: Mat4) {
-        let params = Params {
-            matrix: matrix.to_cols_array_2d(),
-        };
-        crate::work::count!(uniform_upload_bytes, std::mem::size_of::<Params>());
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&params));
+        Self { pipeline }
     }
 
     /// Record a text draw. Nothing here needs to outlive the call: wgpu
@@ -400,6 +398,7 @@ impl TextRenderer {
     pub(crate) fn draw_vertices(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
+        uniforms: &wgpu::BindGroup,
         atlas: &TextAtlas,
         vertex_buffer: &wgpu::Buffer,
         range: Range<u64>,
@@ -409,7 +408,7 @@ impl TextRenderer {
             return;
         }
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(0, uniforms, &[]);
         pass.set_bind_group(1, &atlas.bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(range.clone()));
         crate::work::count!(text_draw_calls, 1);
@@ -417,194 +416,58 @@ impl TextRenderer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Emoji atlas + textured-quad pipeline (color glyphs). Same discipline as
-// TextAtlas/TextRenderer: one RGBA texture, grow-on-demand (power-of-two height),
-// incremental upload of newly-packed rows when the cache revision advances.
-// ---------------------------------------------------------------------------
-
-fn data_height(cache: &EmojiCache, width: u32) -> u32 {
-    if width == 0 {
-        0
-    } else {
-        (cache.pixels().len() / (width as usize * 4)) as u32
-    }
-}
-
-fn create_emoji_resources(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    width: u32,
-    height: u32,
-) -> (wgpu::Texture, wgpu::Sampler, wgpu::BindGroup) {
-    crate::work::count!(emoji_atlas_allocations, 1);
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("emoji atlas texture"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("emoji atlas sampler"),
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-        ..Default::default()
-    });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(
-                    &texture.create_view(&Default::default()),
-                ),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-        label: Some("emoji atlas bind group"),
-    });
-    (texture, sampler, bind_group)
-}
-
-fn upload_emoji_rows(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    width: u32,
-    from_row: u32,
-    to_row: u32,
-    pixels: &[u8],
-) {
-    if to_row <= from_row {
-        return;
-    }
-    let row_bytes = (width * 4) as usize;
-    let start = from_row as usize * row_bytes;
-    let end = (to_row as usize * row_bytes).min(pixels.len());
-    if end <= start {
-        return;
-    }
-    crate::work::count!(emoji_atlas_upload_bytes, end - start);
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: 0,
-                y: from_row,
-                z: 0,
-            },
-            aspect: wgpu::TextureAspect::All,
-        },
-        &pixels[start..end],
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(to_row - from_row),
-        },
-        wgpu::Extent3d {
-            width,
-            height: to_row - from_row,
-            depth_or_array_layers: 1,
-        },
-    );
-}
-
-/// GPU emoji atlas (premultiplied RGBA).
-pub struct EmojiAtlas {
+/// Append-only, 16-cell emoji page. Allocator metadata lives in EmojiCache;
+/// batches hold these GPU resources independently of cache residency. No cell
+/// is ever overwritten, so no submission/frame knowledge is needed.
+pub(crate) struct EmojiPage {
     texture: wgpu::Texture,
-    #[allow(dead_code)]
-    sampler: wgpu::Sampler,
     bind_group: wgpu::BindGroup,
-    width: u32,
-    capacity_height: u32,
-    synced_revision: Option<u64>,
+    pub side: u32,
 }
 
-impl EmojiAtlas {
-    /// An emoji atlas at the cache's fixed width with no rows uploaded yet; the
-    /// first `sync` fills it.
-    pub(crate) fn empty(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        cache: &EmojiCache,
-    ) -> Self {
-        let width = cache.size().0.max(1);
-        let (texture, sampler, bind_group) = create_emoji_resources(device, layout, width, 1);
-        Self {
-            texture,
-            sampler,
-            bind_group,
-            width,
-            capacity_height: 1,
-            synced_revision: None,
-        }
+impl EmojiPage {
+    pub fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, side: u32) -> Self {
+        crate::work::count!(emoji_atlas_allocations, 1);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("emoji page"),
+            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("emoji sampler"),
+            mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("emoji page"), layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture.create_view(&Default::default())) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        Self { texture, bind_group, side }
     }
 
-    pub(crate) fn invalidate_contents(&mut self) {
-        self.synced_revision = None;
-    }
-
-    pub(crate) fn sync(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        layout: &wgpu::BindGroupLayout,
-        cache: &EmojiCache,
-    ) {
-        if self.synced_revision == Some(cache.revision()) {
-            return;
-        }
-        let width = cache.size().0;
-        let real_height = data_height(cache, width);
-        let recreate = width != self.width || real_height > self.capacity_height;
-        if recreate {
-            // Growth phase: reallocate the texture and re-upload everything. Height is
-            // capped by the cache, so `capacity_height` cannot exceed the device limit.
-            self.width = width;
-            self.capacity_height = grow_texture_height(real_height.max(1));
-            warn_if_over_device_limit(device, self.capacity_height, "emoji");
-            let (texture, sampler, bind_group) =
-                create_emoji_resources(device, layout, self.width, self.capacity_height);
-            self.texture = texture;
-            self.sampler = sampler;
-            self.bind_group = bind_group;
-        }
-        if recreate || self.synced_revision.is_none() {
-            // On reset the old allocation is usable, but none of its contents
-            // are. Full-upload the new populated rows, not the whole capacity.
-            upload_emoji_rows(queue, &self.texture, width, 0, real_height, cache.pixels());
-            cache.take_dirty();
-        } else if let Some((from_row, to_row)) = cache.take_dirty() {
-            // Steady state: re-upload only the rows that changed — this covers cells
-            // recycled by eviction, which an append-only upload would miss.
-            upload_emoji_rows(
-                queue,
-                &self.texture,
-                width,
-                from_row,
-                to_row,
-                cache.pixels(),
-            );
-        }
-        self.synced_revision = Some(cache.revision());
+    pub fn upload(&self, queue: &wgpu::Queue, x: u32, y: u32, size: u32, rgba: &[u8]) {
+        crate::work::count!(emoji_atlas_upload_bytes, rgba.len());
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture, mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All,
+            }, rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
     }
 }
 
 /// Warn once if an atlas texture would exceed the device's max 2D texture size, past
-/// which wgpu silently drops the overflow. The emoji atlas is capped below this, but
-/// the (still-unbounded) text band/curve atlas can reach it in long sessions.
+/// which texture creation cannot succeed. Emoji pages are individually bounded;
+/// the still-unbounded text band/curve atlas can reach this in long sessions.
 fn warn_if_over_device_limit(device: &wgpu::Device, height: u32, which: &str) {
     if height > device.limits().max_texture_dimension_2d {
         static WARNED: std::sync::Once = std::sync::Once::new();
@@ -618,32 +481,14 @@ fn warn_if_over_device_limit(device: &wgpu::Device, height: u32, which: &str) {
     }
 }
 
-/// Textured-quad pipeline for the emoji atlas; drawn over the Slug text pass.
+/// Textured-quad pipeline for emoji pages, interleaved in caller order.
 pub struct EmojiRenderer {
     pipeline: wgpu::RenderPipeline,
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
-    pub atlas_layout: wgpu::BindGroupLayout,
 }
 
 impl EmojiRenderer {
-    /// A pipeline for one target format. The service builds one per format it is
-    /// asked to draw into; there is no surface and no configuration here.
-    pub(crate) fn for_format(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-            label: Some("emoji uniform layout"),
-        });
-        let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+    pub(crate) fn atlas_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -663,24 +508,13 @@ impl EmojiRenderer {
                 },
             ],
             label: Some("emoji atlas layout"),
-        });
+        })
+    }
 
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("emoji uniform buffer"),
-            contents: bytemuck::bytes_of(&Params {
-                matrix: Mat4::IDENTITY.to_cols_array_2d(),
-            }),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-            label: Some("emoji uniform bind group"),
-        });
-
+    pub(crate) fn for_format(
+        device: &wgpu::Device, format: wgpu::TextureFormat,
+        uniform_layout: &wgpu::BindGroupLayout, atlas_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
         let vert = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("emoji vertex shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/emoji_vertex.wgsl").into()),
@@ -692,7 +526,7 @@ impl EmojiRenderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("emoji pipeline layout"),
-            bind_group_layouts: &[Some(&uniform_layout), Some(&atlas_layout)],
+            bind_group_layouts: &[Some(uniform_layout), Some(atlas_layout)],
             immediate_size: 0,
         });
 
@@ -752,27 +586,15 @@ impl EmojiRenderer {
             cache: None,
         });
 
-        Self {
-            pipeline,
-            uniform_buffer,
-            uniform_bind_group,
-            atlas_layout,
-        }
+        Self { pipeline }
     }
 
-    pub(crate) fn write_matrix(&self, queue: &wgpu::Queue, matrix: Mat4) {
-        let params = Params {
-            matrix: matrix.to_cols_array_2d(),
-        };
-        crate::work::count!(uniform_upload_bytes, std::mem::size_of::<Params>());
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&params));
-    }
-
-    /// Draw emoji quads into an existing render pass (call after the text pass).
+    /// Record one ordered run of emoji quads from one immutable page.
     pub(crate) fn draw(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
-        atlas: &EmojiAtlas,
+        uniforms: &wgpu::BindGroup,
+        atlas: &EmojiPage,
         vertex_buffer: &wgpu::Buffer,
         range: Range<u64>,
         vertices: Range<u32>,
@@ -781,7 +603,7 @@ impl EmojiRenderer {
             return;
         }
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(0, uniforms, &[]);
         pass.set_bind_group(1, &atlas.bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(range.clone()));
         crate::work::count!(emoji_draw_calls, 1);

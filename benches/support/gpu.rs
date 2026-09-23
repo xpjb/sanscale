@@ -110,7 +110,7 @@ impl Gpu {
     }
     pub fn attach(&self, text: &mut TextService) {
         text.set_target(&self.device, self.format);
-        text.set_transform(&self.queue, TextService::pixel_ortho(WIDTH, HEIGHT));
+        text.set_transform(TextService::pixel_ortho(WIDTH, HEIGHT));
         self.drain();
     }
     pub fn drain(&self) {

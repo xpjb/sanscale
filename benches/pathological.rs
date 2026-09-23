@@ -583,12 +583,12 @@ fn gpu_cases(suite: &mut Suite<'_>, fonts: &Fonts, unicode: &str, gpu: &Gpu) {
                         "camera_transform" => {
                             let matrix=glam::Mat4::from_cols_array(&TextService::pixel_ortho(WIDTH,HEIGHT))
                                 * glam::Mat4::from_translation(glam::Vec3::new(step,0.,0.));
-                            text.set_transform(&gpu.queue,matrix.to_cols_array());
+                            text.set_transform(matrix.to_cols_array());
                             assert!(text.batch_live(&retained));
                             gpu.draw_batch(&text,&retained)
                         },
                         "draw_transient_batch"=>gpu.render(|pass|text.draw_batch(&gpu.device,&gpu.queue,pass,&draws)),
-                        "draw_individual"=>gpu.render(|pass| { for d in &draws {text.draw(&gpu.device,&gpu.queue,pass,d.block,d.at,d.size,d.color,d.clip);} }),
+                        "draw_individual"=>gpu.render(|pass| { for d in &draws {text.draw(&gpu.device, &gpu.queue, pass, *d);} }),
                         "prepare_warm"=>{
                             let start=Instant::now();
                             let batch=text.prepare(&gpu.device,&gpu.queue,&draws);

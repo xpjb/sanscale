@@ -175,8 +175,8 @@ comparison; grouping does not magically remove glyphs or substitute Latin text.
 - Very long horizontal line: small visible fraction while scrolling, versus the
   retained-frame control. One line can still require visiting every glyph.
 - Emoji: cold raster, same raster bucket, and crossing between buckets. Warmup can
-  populate both crossed buckets: distinguish raster-cache reuse from geometry
-  rebuilt because the selected bucket changed.
+  populate both crossed buckets: CPU geometry now stores logical emoji requests,
+  so changing a bucket resolves pages/emits quads without rebuilding that geometry.
 
 ### Counter layers
 
@@ -241,11 +241,11 @@ regression. If the harness itself must change, retain/report that change.
 
 - No synthetic monospace shaper, extra shaping cache, or tiny-capacity alternate
   engine is introduced to make a benchmark look good.
-- Public-service emoji **steady-state eviction/churn is not claimed as covered**.
-  `EmojiCache::begin_frame` currently has no production service call site; private
-  eviction tests advance it explicitly. This integration gap was flagged while
-  building the suite. Resolve the frame/lifetime contract and add a public-path
-  saturation/churn case rather than silently calling private hooks in a benchmark.
+- Public-service emoji pressure is covered for **correctness**, not steady-state
+  latency, in `tests/api_contracts.rs`: a batch exceeds the 64 MiB cache budget,
+  every glyph is pixel-compared with separate draws, buckets churn, and retained
+  and pre-encoded/dropped batches survive eviction. No private frame hooks are
+  needed. Add a dedicated pressure timing case before claiming churn latency.
 - GPU timestamps and allocator instrumentation do not expose hardware memory
   residency or driver-internal allocation. Add external GPU/RSS tools when those
   are the hypothesis, and record their overhead separately.
@@ -274,3 +274,34 @@ Retained paint draws, including after snapshot release, do zero prepare/uploads.
 On this 64-bit build `Draw` grows from 56 to 64 bytes and `TextService` from 1,200
 to 1,248; per-line origins and paragraph/block dependency lists also add metadata.
 These are real storage costs even where the work counters remain unchanged.
+
+
+### API lifetime follow-up costs
+
+Emoji cache ownership is limited to 64 MiB of small append-only GPU pages;
+`Diagnostics::emoji_cache_usage` excludes pages retained only by batches/commands.
+There is no full CPU pixel sheet or full-atlas upload on eviction. A new glyph
+uploads only its cell. A retained batch does no page lookup or upload; preparing
+native geometry resolves glyph requests again and emits quads, including when a
+raster bucket changes. Cache hits need no rasterization or texture upload.
+
+Each changed matrix creates one immutable 64-byte uniform binding shared by both
+pipelines, instead of overwriting two shared uniforms. Consecutive equal matrices
+are free. Ordered text/emoji/page transitions can increase draw calls; adjacent
+plain text still coalesces. These are ownership/order costs, not changes to the
+plain text shaping/flow algorithm. The pressure correctness test deliberately
+keeps more pages alive than the cache budget, which is not a total-process GPU
+memory ceiling. Callers control retained-batch lifetimes.
+
+
+A local before/after capture against `712ab2f` ran all 112 quick cases with 21
+samples and 3 warmups, separate timing/work builds, identical locks/fonts/device,
+and only necessary harness API migration. No p50 exceeded the report's combined
+>10% and >=1 µs regression threshold. This is one local check, not a general
+speedup claim or pressure-latency measurement. Camera-transform completed-frame
+p50 was 251.93 → 254.54 µs for 2,048 blocks; immutable bindings add real allocation
+work while uniform bytes fall from 128 to 64. Cold three-glyph emoji uploads fall
+from 278,528 to 12,288 bytes. Prewarmed cross-bucket prepares do zero geometry
+rebuilds (formerly one), with zero rerasterization/uploads in both versions.
+All six example dump paths also completed; the 3,944-emoji board sweep reported
+66,908,160 cache-owned bytes and zero raster failures.

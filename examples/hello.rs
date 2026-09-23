@@ -352,10 +352,7 @@ impl ApplicationHandler for App {
                     gfx.frame_seconds_ema,
                 );
                 gfx.scene.text.set_target(&gfx.device, gfx.config.format);
-                gfx.scene.text.set_transform(
-                    &gfx.queue,
-                    TextService::pixel_ortho(gfx.config.width, gfx.config.height),
-                );
+                gfx.scene.text.set_transform(TextService::pixel_ortho(gfx.config.width, gfx.config.height));
 
                 let view = frame.texture.create_view(&Default::default());
                 let mut encoder = gfx.device.create_command_encoder(&Default::default());

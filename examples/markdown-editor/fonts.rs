@@ -83,7 +83,7 @@ pub fn load(text: &mut TextService, requested: Option<&str>) -> Faces {
             let face = map(&mut db, text, id);
             let mut handles = vec![face];
             handles.extend(fallback.iter().copied().filter(|&h| h != face));
-            text.register_chain(&handles)
+            text.register_chain(&handles).expect("font chain capacity")
         })
     };
 

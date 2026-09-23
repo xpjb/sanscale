@@ -348,7 +348,7 @@ impl Editor {
     /// Keep the caret inside the viewport after motion or edits.
     fn scroll_caret_into_view(&mut self, layout: &Layout, view_h: f32) {
         let caret = layout.clamp_caret(self.caret);
-        let rect = layout.caret_rect_on_line(Some(caret.line_index), caret.byte_index);
+        let rect = layout.caret_rect(caret);
         let top = MARGIN + rect.y_em * self.font_px - self.scroll_y;
         let height = (rect.height_em.max(1.0)) * self.font_px;
         if top < MARGIN {
@@ -570,16 +570,7 @@ fn render_frame(
     );
     rects.flush(device, pass);
 
-    text.draw(
-        device,
-        queue,
-        pass,
-        handle,
-        origin,
-        font_px,
-        Color(FG),
-        Some(view),
-    );
+    text.draw(device, queue, pass, sanscale::Draw { block: handle, at: origin, size: font_px, color: Color(FG), clip: Some(view), ..Default::default() });
 
     // Status line: name, dirty marker, caret position. Content-keyed transient
     // shaping — no identity to invent for chrome text.
@@ -607,16 +598,7 @@ fn render_frame(
         )
     };
     if let Some(chrome) = text.shape_transient(&status, style) {
-        text.draw(
-            device,
-            queue,
-            pass,
-            chrome,
-            Vec2::new(MARGIN, screen.y - STATUS_H + 5.0),
-            13.0,
-            Color(STATUS_FG),
-            None,
-        );
+        text.draw(device, queue, pass, sanscale::Draw { block: chrome, at: Vec2::new(MARGIN, screen.y - STATUS_H + 5.0), size: 13.0, color: Color(STATUS_FG), clip: None, ..Default::default() });
     }
 
     // Caret, over the glyphs. The block form covers the next cluster (its
@@ -625,7 +607,7 @@ fn render_frame(
         let layout = text.measure(handle);
         let placed = layout.clamp_caret(editor.caret);
         let line = Some(placed.line_index);
-        let caret = layout.caret_rect_on_line(line, placed.byte_index);
+        let caret = layout.caret_rect(placed);
         let height = if caret.height_em > 0.0 {
             caret.height_em
         } else {
@@ -636,7 +618,7 @@ fn render_frame(
                 .and_then(|l| layout.line_range(l))
                 .zip(layout.next_caret_stop(placed.byte_index))
                 .filter(|(range, next)| *next <= range.end)
-                .map(|(_, next)| (layout.caret_rect_on_line(line, next).x_em - caret.x_em).abs())
+                .map(|(_, next)| (layout.caret_rect(Caret { byte_index: next, ..placed }).x_em - caret.x_em).abs())
                 .filter(|w| *w > 0.05)
                 .unwrap_or(0.55);
             let mut color = CARET;
@@ -1155,10 +1137,7 @@ impl Gfx {
         let screen = Vec2::new(self.config.width as f32, self.config.height as f32);
 
         self.text.set_target(&self.device, self.config.format);
-        self.text.set_transform(
-            &self.queue,
-            TextService::pixel_ortho(self.config.width, self.config.height),
-        );
+        self.text.set_transform(TextService::pixel_ortho(self.config.width, self.config.height));
 
         let style = self.style();
         let mut encoder = self.device.create_command_encoder(&Default::default());

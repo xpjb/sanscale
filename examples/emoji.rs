@@ -303,7 +303,7 @@ impl Viewer {
         // The pan/zoom camera is just the transform — same call screen-space text
         // uses, different matrix.
         let cam = ortho(w, h) * model(offset, scale);
-        self.text.set_transform(&self.queue, cam.to_cols_array());
+        self.text.set_transform(cam.to_cols_array());
 
         let batch: Vec<Draw> = cells
             .iter()
@@ -351,7 +351,7 @@ impl Viewer {
             return;
         };
         self.text
-            .set_transform(&self.queue, TextService::pixel_ortho(w as u32, h as u32));
+            .set_transform(TextService::pixel_ortho(w as u32, h as u32));
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -370,23 +370,14 @@ impl Viewer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.text.draw(
-                &self.device,
-                &self.queue,
-                &mut pass,
-                overlay,
-                sanscale::Vec2::new(16.0, h - 40.0),
-                24.0,
-                sanscale::Color([1.0, 0.0, 0.0, 1.0]),
-                None,
-            );
+            self.text.draw(&self.device, &self.queue, &mut pass, sanscale::Draw { block: overlay, at: sanscale::Vec2::new(16.0, h - 40.0), size: 24.0, color: sanscale::Color([1.0, 0.0, 0.0, 1.0]), clip: None, ..Default::default() });
         }
         self.queue.submit([enc.finish()]);
     }
 }
 
-/// Request the adapter's full 2D texture size (default limits cap it at 8192,
-/// which the emoji atlas can exceed) so more color glyphs fit before overflow.
+/// Give the still-growing monochrome curve/band atlases the adapter's full
+/// 2D limit. Emoji uses bounded small pages, independently of this ceiling.
 fn device_descriptor(max_texture_dimension_2d: u32) -> wgpu::DeviceDescriptor<'static> {
     wgpu::DeviceDescriptor {
         label: Some("emoji"),
@@ -648,13 +639,12 @@ impl Gfx {
                 hud = format!("{hud}   ·   copied {s}");
             }
         }
-        // Atlas pressure, so overflow is never invisible: current height and, if the
-        // working set ever exceeds the budget, the count of glyphs it had to drop.
-        let (_, _, (_, atlas_h)) = self.viewer.text.diagnostics().atlas_sizes();
-        hud = format!("{hud}   ·   atlas {atlas_h}px");
+        // Cache-owned residency, excluding pages retained only by batches/commands.
+        let (pages, bytes) = self.viewer.text.diagnostics().emoji_cache_usage();
+        hud = format!("{hud}   ·   {pages} pages / {:.1} MiB", bytes as f64 / 1_048_576.);
         let dropped = self.viewer.text.diagnostics().dropped_glyphs();
         if dropped > 0 {
-            hud = format!("{hud}   ·   DROPPED {dropped}");
+            hud = format!("{hud}   ·   RASTER FAILURES {dropped}");
         }
 
         let t0 = Instant::now();
@@ -763,15 +753,15 @@ fn dump() {
         "emoji_flags.png",
     );
 
-    let (_, _, (aw, ah)) = viewer.text.diagnostics().atlas_sizes();
+    let (pages, bytes) = viewer.text.diagnostics().emoji_cache_usage();
     println!(
         "wrote emoji_board.png, emoji_board_zoom.png, emoji_flags.png \
-         (emoji atlas {aw}x{ah} after full sweep, dropped {})",
+         ({pages} cached pages / {bytes} bytes after full sweep, raster failures {})",
         viewer.text.diagnostics().dropped_glyphs()
     );
 }
 
-/// Render every viewport slice of the board once, off-screen, so the bounded atlas
+/// Render every viewport slice of the board once, off-screen, so the page cache
 /// fills and starts evicting — the churn a real pan produces. No read-back.
 fn sweep_board(viewer: &mut Viewer, vh: u32, scale: f32) {
     let target = viewer.device.create_texture(&wgpu::TextureDescriptor {

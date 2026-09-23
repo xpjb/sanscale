@@ -22,7 +22,7 @@ fn latin_font() -> FontData {
 fn install(text: &mut TextService, font: &FontData) -> Style {
     let font = text.map_font(font.clone(), 0).unwrap();
     Style {
-        chain: text.register_chain(&[font]),
+        chain: text.register_chain(&[font]).expect("font chain capacity"),
         wrap_em: None,
         align: Align::Left,
         line_spacing: 1.,
@@ -43,7 +43,7 @@ fn snapshot(layout: &Layout) -> Vec<u64> {
     }
     // Also observe alignment/hit-test coordinate space, not just line widths.
     for byte in 0..=layout.len_bytes() {
-        let caret = layout.caret_rect(byte);
+        let caret = layout.caret_rect(layout.caret_at(byte));
         out.extend([caret.x_em, caret.y_em, caret.height_em].map(|v| u64::from(v.to_bits())));
     }
     out
@@ -252,9 +252,9 @@ fn device() -> (wgpu::Device, wgpu::Queue) {
     })
 }
 
-fn attach(text: &mut TextService, device: &wgpu::Device, queue: &wgpu::Queue) {
+fn attach(text: &mut TextService, device: &wgpu::Device, _queue: &wgpu::Queue) {
     text.set_target(device, FORMAT);
-    text.set_transform(queue, TextService::pixel_ortho(WIDTH, HEIGHT));
+    text.set_transform(TextService::pixel_ortho(WIDTH, HEIGHT));
 }
 
 fn render(
@@ -363,7 +363,7 @@ fn check_gpu_reset(font: FontData, cases: &[(&str, &str)], emoji: bool) {
             let work = sanscale::profiling::work_counters();
             assert_eq!(
                 (work.text_atlas_allocations, work.emoji_atlas_allocations),
-                (0, 0)
+                (0, u64::from(emoji))
             );
             assert!(
                 if emoji {
@@ -422,7 +422,7 @@ fn gpu_clear_reload_matches_fresh_text_without_reallocating() {
 
 #[test]
 #[ignore = "requires a headless wgpu adapter and Noto/Segoe/Apple color emoji"]
-fn gpu_clear_reload_matches_fresh_emoji_without_reallocating() {
+fn gpu_clear_reload_matches_fresh_emoji_with_owned_pages() {
     let font = [
         "/usr/share/fonts/noto/NotoColorEmoji.ttf",
         "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",

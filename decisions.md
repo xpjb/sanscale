@@ -1005,3 +1005,71 @@ Run GPU coverage explicitly with
 `cargo nextest run --test service_lifecycle --all-features --run-ignored all`;
 it requires a headless wgpu adapter and the font fixtures listed in that test.
 The ignored GPU cases are opt-in, not silently passed when a device/font is absent.
+
+
+## API review follow-up — owned GPU snapshots and explicit carets (Locked)
+
+The [review](api-review.md) reproduced failures at composition/lifetime boundaries,
+not a need for another facade. Preserve one service, caller-owned source/pass/state,
+and `Batch` ownership. The following supersedes conflicting implementation details
+in earlier locks, particularly reset allocation reuse for native-color textures.
+
+- Changed transforms get immutable uniform buffers/bindings shared by both
+  pipelines. Recorded passes keep their own matrix even before a single submit.
+  Identical consecutive matrices allocate/upload nothing. `set_transform(matrix)`
+  needs no queue and remembers pre-initialization values.
+- Target formats select cached pipelines with common layouts; they do not replace
+  atlas resources or the transform. A service belongs to one device. Targets are
+  single-sample/no-depth; no new render-context or frame protocol is introduced.
+- Draw order is input order, including text/emoji transitions inside one block.
+  Segments delimit scissors; ordered shader/page runs inside them coalesce only
+  when adjacent and compatible. This can require more than two draws, intentionally.
+- Native-color glyphs use append-only pages of at most 16 cells with transparent
+  padding. An access-driven page LRU bounds **cache-owned** textures to 64 MiB,
+  across all size buckets. Eviction removes lookups/ownership, never texels.
+  Batches hold page references and wgpu retains recorded bindings after batch
+  drop. A batch larger than the budget still draws completely. No frame hook,
+  hidden slot leases, pressure-failure caching, or full-atlas copies are needed.
+- Cached CPU geometry holds logical emoji requests, not texture addresses. Prepare
+  resolves these requests and records native bucket requirements. Cache eviction
+  cannot invalidate owned pixels; changing pixel scale across buckets does make
+  a native batch non-live. Monochrome-only batches remain zoom-invariant.
+- **Reset amendment:** pipelines, matrix and monochrome texture allocations stay,
+  with monochrome upload prefixes invalidated. Emoji cache ownership is dropped;
+  subsequent glyphs allocate new pages while batches/commands may retain old ones.
+  Reusing those native allocations would violate the stronger queued-draw contract.
+  Stale batches after clear are not monochrome content snapshots.
+- `batch_live` rejects incomplete prepares. Recovery from shape eviction requires
+  reissuing shape from the caller's source/style and replacing handles, not simply
+  rebuilding an empty buffer. After resource release/reset, refresh those inputs
+  too. Baked paint survives snapshot release; a new prepare requires live paint.
+- Chain registration is fallible (65,535 slots); handles include a generation.
+  Drop/clear reuse free slots without ABA, with exhausted generations retired.
+  A stale release cannot free a new chain or invalidate its dependents.
+- `caret_rect(Caret)` is the one geometry projection. Remove `caret_position` and
+  `caret_rect_on_line`; keep `line_for_byte` private. Placement, post-edit placement
+  and reflow clamping remain distinct. Invalidated line affinity uses canonical
+  hard-break placement. Page strides saturate and zero strides are no-ops.
+- `draw` accepts `Draw`, so its convenience path also supports paint. Remove the
+  orphan public `FontMetrics`; accept filesystem paths and unsized `Boundaries`.
+  Keep `from_lines` and diagnostics. `emoji_cache_usage` reports cache pages/bytes;
+  the third `atlas_sizes` pair now describes the largest resident emoji page,
+  and `dropped_glyphs` counts unsupported rasterization, not cache pressure.
+
+Costs are explicit: changed matrices allocate bindings/buffers; preserving mixed
+z-order/page order adds draw calls; retained batches can keep pages beyond the cache
+budget (at most 16-cell retention amplification per page). Conversely no full CPU
+emoji sheet is stored/uploaded, and bucket changes reuse logical geometry. See
+[performance notes](performance.md). This does not introduce text ownership, a
+content-keyed batch cache, or a consumer-visible lifetime/lease framework.
+
+`tests/api_contracts.rs` exercises actual font choices, chain capacity/reuse,
+hard-break reflow, dynamic word classifiers, page strides, queued matrices,
+format changes, inter/intra-block z-order, scissors, stale-handle recovery,
+bucket changes, pressure beyond cache capacity, and retained/encoded pixel
+ownership. Controls render separately and must contain ink. Six deliberate
+regressions (caret, chain release, format reset, ordering, bucket invalidation,
+incomplete liveness) were each rejected by the corresponding tests.
+
+Reopen only with a demonstrated correctness or measured cost problem under these
+same ownership/order contracts, not to reintroduce guessed frame boundaries.

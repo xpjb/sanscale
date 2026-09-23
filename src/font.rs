@@ -10,7 +10,7 @@ use crate::text::{FontData, FontError};
 
 /// Vertical font metrics, in em-space.
 #[derive(Clone, Copy, Debug)]
-pub struct FontMetrics {
+pub(crate) struct FontMetrics {
     pub ascent: f32,
     pub descent: f32,
     pub line_gap: f32,
@@ -133,6 +133,6 @@ impl Font {
 
 /// Read a font file into shared bytes. Convenience for examples and tests; a real
 /// consumer discovers fonts itself and hands over an `Arc` it already has.
-pub fn read_font_file(path: &str) -> std::io::Result<FontData> {
+pub fn read_font_file(path: impl AsRef<std::path::Path>) -> std::io::Result<FontData> {
     Ok(Arc::new(std::fs::read(path)?))
 }

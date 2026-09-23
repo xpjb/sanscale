@@ -22,7 +22,7 @@ use crate::emoji::{EmojiCache, bucket_for};
 use crate::flow::{FlowLine, flow_paragraph};
 use crate::font::Font;
 use crate::layout::{ChainFont, ShapedGlyph, ShapedRun, shape_spanned, shape_text};
-use crate::renderer::{EmojiAtlas, EmojiRenderer, TextAtlas, TextRenderer};
+use crate::renderer::{EmojiPage, EmojiRenderer, TextAtlas, TextRenderer, Uniforms};
 use crate::spans::{
     FontSpan, PaintCursor, PaintError, PaintHandle, PaintPool, PaintSpan, valid_font_spans,
 };
@@ -126,7 +126,7 @@ pub enum Align {
 pub enum FontError {
     /// The bytes are not a font this build can parse.
     Parse,
-    /// The font pool is full (65 535 faces).
+    /// The font or chain pool has exhausted its 65,535 slots.
     PoolFull,
 }
 
@@ -134,7 +134,7 @@ impl std::fmt::Display for FontError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parse => write!(f, "failed to parse font"),
-            Self::PoolFull => write!(f, "font pool is full"),
+            Self::PoolFull => write!(f, "font or chain pool is full"),
         }
     }
 }
@@ -145,13 +145,23 @@ impl std::error::Error for FontError {}
 // handles and keys
 // ---------------------------------------------------------------------------
 
-/// One mapped concrete font. Deduped by data identity.
+/// One mapped concrete font, local to its service. Deduped by data identity.
+/// Invalid after `clear`; remap rather than reusing an old font handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FontHandle(u16);
 
-/// An ordered fallback chain of fonts.
+/// An ordered fallback chain of fonts, local to its service.
+/// Released handles cannot select or release a later occupant of the slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FontChainHandle(u16);
+pub struct FontChainHandle {
+    slot: u16,
+    generation: u32,
+}
+
+struct ChainSlot {
+    generation: u32,
+    fonts: Option<Vec<FontHandle>>,
+}
 
 /// A shaped *block* — 1..N paragraphs flowed into one coordinate space.
 ///
@@ -192,8 +202,10 @@ pub struct ParagraphKey {
 
 /// The consumer's identity for a composed block: the unit of *coordinate space*.
 ///
-/// Carries no version — change detection is comparing the parts, whose keys carry
-/// their own.
+/// Carries no version — change detection compares the parts and style. Reusing
+/// this key reshapes the same mutable layout instance; simultaneous different
+/// layouts of the same content require different keys. Paragraph namespaces do
+/// not namespace block keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockKey(pub u64);
 
@@ -366,7 +378,10 @@ impl Layout {
     ///
     /// Caret motion, selection and hit-testing are pure geometry, so a consumer
     /// should be able to unit-test its editor against a synthetic layout without
-    /// loading a font or touching a GPU.
+    /// loading a font or touching a GPU. Lines must be in visual/logical LTR
+    /// order, with coherent byte ranges, metrics and caret stops (including line
+    /// endpoints). Hard paragraph seams have a separator byte; soft seams share
+    /// an endpoint. This low-level fixture constructor does not validate inputs.
     pub fn from_lines(lines: Vec<LayoutLineSpec>) -> Self {
         let width_em = lines
             .iter()
@@ -393,7 +408,7 @@ impl Layout {
         }
     }
 
-    /// Widest line, em.
+    /// Widest natural line advance, em, not the wrap box or aligned ink bounds.
     pub fn width_em(&self) -> f32 {
         self.width_em
     }
@@ -453,7 +468,7 @@ impl Layout {
 
     /// The line a byte offset falls on. A byte at a soft break belongs to the
     /// line that *starts* with it, which is what word-wrap caret affinity needs.
-    pub fn line_for_byte(&self, byte_index: usize) -> Option<usize> {
+    fn line_for_byte(&self, byte_index: usize) -> Option<usize> {
         if self.lines.is_empty() {
             return None;
         }
@@ -479,32 +494,16 @@ impl Layout {
             .map(|caret| caret.byte_index)
     }
 
-    /// Top-left of the caret for `byte_index`, em.
-    pub fn caret_position(&self, byte_index: usize) -> Vec2 {
-        let rect = self.caret_rect(byte_index);
-        Vec2::new(rect.x_em, rect.y_em)
-    }
-
-    pub fn caret_rect(&self, byte_index: usize) -> CaretRect {
-        self.caret_rect_on_line(self.line_for_byte(byte_index), byte_index)
-    }
-
-    /// Caret rect resolved on a specific line — the affinity hint an editor
-    /// carries so a caret at a soft break stays where the user put it.
-    pub fn caret_rect_on_line(&self, line_index: Option<usize>, byte_index: usize) -> CaretRect {
-        let empty = CaretRect {
-            x_em: 0.0,
-            y_em: 0.0,
-            height_em: 0.0,
-        };
-        let Some(index) = line_index.or_else(|| self.line_for_byte(byte_index)) else {
-            return empty;
-        };
-        let Some(line) = self.lines.get(index) else {
-            return empty;
+    /// Rectangle of a placed caret, in em. Re-anchor with [`Self::clamp_caret`]
+    /// after reshaping; this query preserves the supplied visual-line affinity.
+    /// An invalid line returns an empty rectangle. A byte outside that line
+    /// projects to its start/end, useful for block-caret advance measurements.
+    pub fn caret_rect(&self, caret: Caret) -> CaretRect {
+        let Some(line) = self.lines.get(caret.line_index) else {
+            return CaretRect { x_em: 0.0, y_em: 0.0, height_em: 0.0 };
         };
         CaretRect {
-            x_em: caret_x_on(line, byte_index) + line.align_em,
+            x_em: caret_x_on(line, caret.byte_index) + line.align_em,
             y_em: line.metrics.top_em,
             height_em: line.metrics.height_em,
         }
@@ -546,8 +545,7 @@ impl Layout {
             .line_range(caret.line_index)
             .filter(|range| byte_index >= range.start && byte_index <= range.end)
             .map(|_| caret.line_index)
-            .or_else(|| self.line_for_byte(byte_index))
-            .unwrap_or(0);
+            .unwrap_or_else(|| self.caret_at(byte_index).line_index);
         Caret {
             byte_index,
             line_index,
@@ -556,11 +554,9 @@ impl Layout {
 
     /// The caret for a byte, with the layout's default (start-affine) line.
     ///
-    /// One correction over raw [`Layout::line_for_byte`]: a hard break's end
-    /// byte belongs to no line, and `line_for_byte` answers with the following
-    /// line — whose start is *past* the byte. That byte pins to the line whose
-    /// end it is, which is also what puts a blank line's caret on the blank
-    /// line rather than the one below it.
+    /// Hard-break separator bytes stay on the line they terminate, including
+    /// empty paragraphs. At soft wraps, use [`Self::caret_after_edit`] for
+    /// end-affine placement or retain the line returned by hit-testing/motion.
     pub fn caret_at(&self, byte_index: usize) -> Caret {
         let byte_index = byte_index.min(self.len_bytes());
         let natural = self.line_for_byte(byte_index).unwrap_or(0);
@@ -619,7 +615,7 @@ impl Layout {
         caret: Caret,
         motion: Motion,
         goal: &mut Option<f32>,
-        text: &impl Boundaries,
+        text: &(impl Boundaries + ?Sized),
     ) -> Caret {
         if self.lines.is_empty() {
             *goal = None;
@@ -645,14 +641,18 @@ impl Layout {
             self.caret_at(byte_index)
         };
 
-        let vertical = |goal: &mut Option<f32>, delta: isize| -> Caret {
+        let vertical = |goal: &mut Option<f32>, up: bool, lines: usize| -> Caret {
+            if lines == 0 { return caret; }
             let current = caret.line_index;
-            let target =
-                (current as isize + delta).clamp(0, self.lines.len() as isize - 1) as usize;
+            let target = if up {
+                current.saturating_sub(lines)
+            } else {
+                current.saturating_add(lines).min(self.lines.len() - 1)
+            };
             if target == current {
                 // Boundary line: Up snaps to its start, Down to its end.
                 let range = self.line_range(current);
-                let byte_index = if delta < 0 {
+                let byte_index = if up {
                     range.map(|r| r.start).unwrap_or(0)
                 } else {
                     range.map(|r| r.end).unwrap_or_else(|| self.len_bytes())
@@ -663,8 +663,7 @@ impl Layout {
                 };
             }
             let x = *goal.get_or_insert_with(|| {
-                self.caret_rect_on_line(Some(current), caret.byte_index)
-                    .x_em
+                self.caret_rect(caret).x_em
             });
             let byte_index = self.caret_on_line(target, x).unwrap_or(caret.byte_index);
             Caret {
@@ -722,10 +721,10 @@ impl Layout {
                     line_index: caret.line_index,
                 }
             }
-            Motion::Up => vertical(goal, -1),
-            Motion::Down => vertical(goal, 1),
-            Motion::PageUp(lines) => vertical(goal, -(lines as isize)),
-            Motion::PageDown(lines) => vertical(goal, lines as isize),
+            Motion::Up => vertical(goal, true, 1),
+            Motion::Down => vertical(goal, false, 1),
+            Motion::PageUp(lines) => vertical(goal, true, lines),
+            Motion::PageDown(lines) => vertical(goal, false, lines),
             Motion::DocStart => {
                 *goal = None;
                 Caret {
@@ -746,7 +745,7 @@ impl Layout {
     /// The word around `byte_index` — the double-click selection. Classified
     /// by the caller's [`Boundaries`] (words are semantics, not shaping); a
     /// declining classifier degrades to the cluster around the byte.
-    pub fn select_word_at(&self, byte_index: usize, text: &impl Boundaries) -> Range<usize> {
+    pub fn select_word_at(&self, byte_index: usize, text: &(impl Boundaries + ?Sized)) -> Range<usize> {
         let byte_index = byte_index.min(self.len_bytes());
         let start = text
             .prev_word(byte_index)
@@ -936,7 +935,7 @@ struct Block {
 /// What the cached vertices were built for. Color is baked per-vertex — the
 /// price of letting differently-colored blocks share one draw call — so it is
 /// part of the key. `at` and `size` are deliberately absent: quads bake at the
-/// origin and unit size, and `place` applies both on the way out.
+/// origin and unit size, and `prepare` applies both on the way out.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GeomKey {
     color: [u32; 4],
@@ -962,18 +961,17 @@ struct GeomKey {
 /// discarding the last.
 struct Geometry {
     key: GeomKey,
-    /// Emoji atlas eviction epoch the UVs were baked against. A change means a
-    /// cell was recycled and the cached quads may now point at another glyph —
-    /// the invalidation the old public `emoji_epoch` made the *consumer* do.
-    epoch: u64,
-    /// Raster bucket the color glyphs were baked against. Held here rather than
-    /// in [`GeomKey`] for the same reason as `epoch`: it is the one thing a size
-    /// change still decides, and it decides nothing for a block with no color
-    /// glyphs. Keying on it would rebuild every text block in the frame each time
-    /// a zoom crossed a bucket boundary, for nothing.
-    bucket: u32,
     text: Vec<TextVertex>,
-    emoji: Vec<EmojiVertex>,
+    emoji: Vec<EmojiRequest>,
+}
+
+/// A color glyph's place in the geometry, not a cache-dependent atlas address.
+/// The text prefix records interleaving without another allocation for plain text.
+struct EmojiRequest {
+    font: u16,
+    glyph: u32,
+    pen: Vec2,
+    text_before: usize,
 }
 
 /// One block to draw, for [`TextService::draw_batch`].
@@ -1020,23 +1018,20 @@ pub struct Segment {
     /// The clip these items were prepared with, echoed back in the space it was
     /// passed in. `None` = unclipped: no scissor needed beyond the pass's own.
     pub clip: Option<Rect>,
-    /// Byte and vertex bounds into the batch buffer, per pipeline. Private:
-    /// the buffer layout and the text/emoji stride split are not surface.
-    text_bytes: (u64, u64),
-    text_vertices: (u32, u32),
-    emoji_bytes: (u64, u64),
-    emoji_vertices: (u32, u32),
+    runs: (usize, usize),
 }
 
 /// Blocks the consumer chose to group, concatenated into one GPU buffer **the
 /// consumer holds** — the unit of vertex ownership (see the "`Batch` owns its
 /// vertices" lock in `decisions.md`).
 ///
-/// Nothing here is shared, so nothing can be clobbered: the buffer lives
-/// exactly as long as the `Batch`, and dropping it immediately after recording
-/// is fine — wgpu ref-counts what a pass binds. Rebuilding is the consumer's
-/// call (content changed, [`TextService::batch_live`] went false, a recolor —
-/// color is baked per-vertex); an unchanged batch costs zero per-frame upload.
+/// The vertex buffer is owned; emoji pages are shared but append-only. Evicting
+/// a page from the service's cache never overwrites it. Dropping a batch after
+/// recording is safe: wgpu retains bound resources through submission. Retained
+/// pages may outlive the cache's 64 MiB residency budget; dropping batches is how
+/// the consumer releases that ownership. An unchanged live batch costs no upload.
+/// After `clear`, stale batches are memory-safe but not preserved snapshots of
+/// monochrome atlas contents. Check [`TextService::batch_live`] before reuse.
 ///
 /// Order within a batch is the order of the `&[Draw]` it was prepared from —
 /// that is z-order, and it is the consumer's: `prepare` never reorders, and
@@ -1044,9 +1039,14 @@ pub struct Segment {
 pub struct Batch {
     buffer: wgpu::Buffer,
     segments: Vec<Segment>,
-    /// Emoji-atlas eviction epoch the UVs were baked against; `None` for a
-    /// batch with no emoji.
-    emoji_epoch: Option<u64>,
+    runs: Vec<DrawRun>,
+    split: u64,
+    total: u64,
+    /// Only color glyphs depend on a requested raster bucket, never plain text.
+    emoji_sizes: Vec<(f32, u32)>,
+    /// A prepare that skipped stale inputs must not become a permanently live
+    /// empty replacement. The caller needs to re-shape/re-register those inputs.
+    complete: bool,
     /// The blocks these vertices were baked from, as `(slot, generation,
     /// revision)`. An edit reshapes a block in place — same key, slot and
     /// handle — so nothing in the consumer's draw list changes; the revision
@@ -1056,18 +1056,49 @@ pub struct Batch {
 
 impl Batch {
     /// Where the clip changes: one entry per scissor-uniform run, in draw
-    /// order. A uniform-clip batch has exactly one.
+    /// order. A nonempty uniform-clip request has exactly one.
     pub fn segments(&self) -> &[Segment] {
         &self.segments
     }
 }
 
+struct DrawRun {
+    /// None selects Slug. Some owns the append-only emoji page being sampled.
+    page: Option<Arc<EmojiPage>>,
+    vertices: Range<u32>,
+}
+
 struct Gpu {
+    device: wgpu::Device,
     format: wgpu::TextureFormat,
-    text: TextRenderer,
-    emoji: EmojiRenderer,
+    pipelines: HashMap<wgpu::TextureFormat, (TextRenderer, EmojiRenderer)>,
+    uniforms: Uniforms,
+    text_layout: wgpu::BindGroupLayout,
+    emoji_layout: wgpu::BindGroupLayout,
     text_atlas: TextAtlas,
-    emoji_atlas: EmojiAtlas,
+}
+
+impl Gpu {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, matrix: [f32; 16]) -> Self {
+        let uniforms = Uniforms::new(device, matrix);
+        let text_layout = TextRenderer::atlas_layout(device);
+        let emoji_layout = EmojiRenderer::atlas_layout(device);
+        let text_atlas = TextAtlas::empty(device, &text_layout);
+        let mut gpu = Self {
+            device: device.clone(), format, pipelines: HashMap::new(),
+            uniforms, text_layout, emoji_layout, text_atlas,
+        };
+        gpu.set_target(format);
+        gpu
+    }
+
+    fn set_target(&mut self, format: wgpu::TextureFormat) {
+        self.pipelines.entry(format).or_insert_with(|| (
+            TextRenderer::for_format(&self.device, format, &self.uniforms.layout, &self.text_layout),
+            EmojiRenderer::for_format(&self.device, format, &self.uniforms.layout, &self.emoji_layout),
+        ));
+        self.format = format;
+    }
 }
 
 /// Cache bounds. Eviction is capacity-based rather than time-based on purpose:
@@ -1083,14 +1114,14 @@ const MAX_PARAGRAPHS: usize = 1 << 17;
 /// One text service: every pool, every cache, and the GPU resources.
 ///
 /// Lives *beside* the consumer's renderer, never inside it: nothing here needs a
-/// device except [`TextService::draw`], which takes one as a parameter. That is what
-/// lets model code hold a `&TextService` for measurement and hit-testing without
-/// reaching for the GPU, and what makes shaping work headless.
+/// device until [`Self::set_target`]. Shaping, measurement and hit-testing remain
+/// GPU-free. GPU resources belong to one device; use a new service for a new
+/// device. All font/chain/paint/shaped handles and batches are service-local.
 #[derive(Default)]
 pub struct TextService {
     fonts: Vec<Font>,
-    /// `None` for a dropped slot, so live handles stay valid across a reload.
-    chains: Vec<Option<Vec<FontHandle>>>,
+    chains: Vec<ChainSlot>,
+    free_chains: Vec<u16>,
 
     blocks: Vec<BlockSlot>,
     /// Slot generations, held apart from `blocks` so validating a handle touches
@@ -1114,7 +1145,7 @@ pub struct TextService {
     glyphs: GlyphCache,
     emoji: EmojiCache,
     gpu: Option<Gpu>,
-    pending_format: Option<wgpu::TextureFormat>,
+    transform: Option<[f32; 16]>,
     /// On-screen pixels per source-space unit; `None` = 1 (exact under
     /// `pixel_ortho`). Consulted only when picking an emoji raster bucket —
     /// see [`TextService::set_pixel_scale`].
@@ -1159,30 +1190,47 @@ impl TextService {
     }
 
     /// Register an ordered fallback chain. Stored as-is: `fonts[0]` is primary and
-    /// defines the line metrics for anything shaped with it.
-    pub fn register_chain(&mut self, fonts: &[FontHandle]) -> FontChainHandle {
-        let slot = self
-            .chains
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.chains.push(None);
-                self.chains.len() - 1
-            });
-        self.chains[slot] = Some(fonts.to_vec());
-        FontChainHandle(slot as u16)
+    /// defines the line metrics for anything shaped with it. At most 65,535 slots;
+    /// exhaustion returns [`FontError::PoolFull`]. Dropped slots are reused with a
+    /// new generation; exhausted generations are retired instead of wrapping.
+    pub fn register_chain(&mut self, fonts: &[FontHandle]) -> Result<FontChainHandle, FontError> {
+        let slot = if let Some(slot) = self.free_chains.pop() {
+            slot
+        } else {
+            if self.chains.len() >= u16::MAX as usize {
+                return Err(FontError::PoolFull);
+            }
+            self.chains.push(ChainSlot { generation: 1, fonts: None });
+            (self.chains.len() - 1) as u16
+        };
+        let entry = &mut self.chains[slot as usize];
+        entry.fonts = Some(fonts.to_vec());
+        Ok(FontChainHandle { slot, generation: entry.generation })
+    }
+
+    fn release_chain(&mut self, chain: FontChainHandle) -> bool {
+        let Some(entry) = self.chains.get_mut(chain.slot as usize) else { return false; };
+        if entry.generation != chain.generation || entry.fonts.take().is_none() {
+            return false;
+        }
+        // Retire exhausted slots instead of reviving an ancient handle.
+        if let Some(next) = entry.generation.checked_add(1) {
+            entry.generation = next;
+            self.free_chains.push(chain.slot);
+        }
+        true
     }
 
     /// Drop a chain and every block and paragraph shaped with it.
     ///
     /// Fonts stay in the pool — another chain may share them — but nothing keeps
     /// the old chain's layouts alive. This is what a settings font change needs,
-    /// and what the old `Box::leak`ed font bytes made impossible.
+    /// and what the old `Box::leak`ed font bytes made impossible. Releasing a stale
+    /// or already-released handle is a no-op, even after slot reuse or clear.
     pub fn drop_chain(&mut self, chain: FontChainHandle) {
-        let Some(slot) = self.chains.get_mut(chain.0 as usize) else {
+        if !self.release_chain(chain) {
             return;
-        };
-        *slot = None;
+        }
         self.paragraphs
             .retain(|(_, style), para| style.chain != chain && !para.span_chains.contains(&chain));
         self.shaped
@@ -1216,12 +1264,18 @@ impl TextService {
     /// Drop every font, chain, paint snapshot and cached layout. Old shaped
     /// handles and batches remain stale after new layouts are allocated.
     ///
-    /// GPU allocations and the transform are retained, not their content-validity
-    /// records: the next [`TextService::prepare`] uploads the new atlas contents.
-    /// Slot generation history is retained just as it is for ordinary eviction.
+    /// Pipelines, transform, and monochrome atlas allocations are retained; the
+    /// next prepare uploads replacement contents. Emoji cache ownership is
+    /// released, not overwritten: batches/recorded draws keep their old pages
+    /// alive and new color glyphs allocate fresh pages. Slot generation history
+    /// survives. Recreate fonts/chains/paint and re-shape before preparing again.
     pub fn clear(&mut self) {
         self.fonts.clear();
-        self.chains.clear();
+        for slot in 0..self.chains.len() {
+            self.release_chain(FontChainHandle {
+                slot: slot as u16, generation: self.chains[slot].generation,
+            });
+        }
         for index in 0..self.blocks.len() {
             self.remove_block(index);
         }
@@ -1232,7 +1286,6 @@ impl TextService {
         self.emoji.clear();
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.text_atlas.invalidate_contents();
-            gpu.emoji_atlas.invalidate_contents();
         }
     }
 
@@ -1394,21 +1447,28 @@ impl TextService {
 
     // -- drawing -------------------------------------------------------------
 
-    /// Select the target format for the draws that follow; a pipeline is built
-    /// and cached per format. Call once per pass.
+    /// Select a single-sample color target. Pipelines are cached per format;
+    /// changing format preserves atlases, transforms, and retained batches.
+    /// Call before preparing/drawing. A service's GPU resources belong to this
+    /// device; create a new service to replace the device. No depth testing.
     pub fn set_target(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
-        self.pending_format = Some(format);
-        self.ensure_gpu(device);
+        if let Some(gpu) = &mut self.gpu {
+            assert_eq!(&gpu.device, device, "TextService belongs to a different device");
+            gpu.set_target(format);
+        } else {
+            self.gpu = Some(Gpu::new(device, format,
+                self.transform.unwrap_or(glam::Mat4::IDENTITY.to_cols_array())));
+        }
     }
 
-    /// Set the transform applied to the local-em quads this service emits. Call
-    /// once per pass. Screen-space is [`TextService::pixel_ortho`]; world or 3D text is
-    /// an MVP — same call, no mode flag.
-    pub fn set_transform(&mut self, queue: &wgpu::Queue, transform: [f32; 16]) {
-        if let Some(gpu) = &self.gpu {
-            let matrix = glam::Mat4::from_cols_array(&transform);
-            gpu.text.write_matrix(queue, matrix);
-            gpu.emoji.write_matrix(queue, matrix);
+    /// Set the column-major transform for subsequent draws. Works before GPU
+    /// initialization. Each changed matrix has immutable GPU storage: earlier
+    /// recorded passes keep their matrix even before a shared submission.
+    /// Screen space uses [`Self::pixel_ortho`]; world/3D text uses an MVP.
+    pub fn set_transform(&mut self, transform: [f32; 16]) {
+        self.transform = Some(transform);
+        if let Some(gpu) = &mut self.gpu {
+            gpu.uniforms.set(&gpu.device, transform);
         }
     }
 
@@ -1420,7 +1480,9 @@ impl TextService {
     /// cannot know what one unit maps to on screen — state it (a camera zoom,
     /// typically), updating alongside [`TextService::set_transform`] when it
     /// changes, or emoji rasterize at world-unit resolution and blur under
-    /// magnification. Zero and negatives are ignored.
+    /// magnification. `batch_live` becomes false when a batch's requested emoji
+    /// bucket changes; monochrome-only batches stay live. Zero and negatives are
+    /// ignored.
     pub fn set_pixel_scale(&mut self, px_per_unit: f32) {
         if px_per_unit > 0.0 {
             self.pixel_scale = Some(px_per_unit);
@@ -1441,48 +1503,25 @@ impl TextService {
         .to_cols_array()
     }
 
-    /// Record glyph quads for `h` into `pass`.
-    ///
-    /// `at` and `size` are in the transform's source space — screen pixels under
-    /// [`TextService::pixel_ortho`], world units under an MVP. `at` is the **top-left**
-    /// of the block box; the baseline is internal, so hit-testing and rendering
-    /// cannot disagree about it. `clip` culls lines and glyphs on the CPU before
-    /// anything is emitted, which is what keeps a scrolled long document cheap.
-    #[allow(clippy::too_many_arguments)]
+    /// Record one [`Draw`], including optional paint, through the batch path.
+    /// Coordinates are in the transform's source space; `at` is the block's
+    /// top-left. `clip` culls whole glyphs; set a pass scissor for hard clipping.
     pub fn draw(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'_>,
-        h: ShapedHandle,
-        at: Vec2,
-        size: f32,
-        color: Color,
-        clip: Option<Rect>,
+        &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'_>, item: Draw,
     ) {
-        self.draw_batch(
-            device,
-            queue,
-            pass,
-            &[Draw {
-                block: h,
-                at,
-                size,
-                color,
-                clip,
-                ..Default::default()
-            }],
-        );
+        self.draw_batch(device, queue, pass, &[item]);
     }
 
     /// Build a [`Batch`] the consumer owns: every block's quads (cached, and
     /// reused across frames while its draw parameters hold) concatenated into
     /// one buffer, split into [`Segment`]s where the clip changes.
     ///
-    /// **All mutation happens here** — geometry rebuilds, emoji rasterization,
-    /// atlas sync, one buffer upload. `draw_segment`/`draw_prepared` purely
-    /// record, so "never recreate a texture between a bind and its draw" holds
-    /// by construction rather than by call-order discipline.
+    /// Geometry rebuilds, emoji rasterization/page uploads, monochrome atlas
+    /// sync and vertex upload happen here. `draw_segment`/`draw_prepared` purely
+    /// record. The batch keeps its emoji pages even if later preparation evicts
+    /// them; cached CPU geometry stores glyph requests, never stale texture UVs.
+    /// Panics if no target was selected or `device` differs from its owner.
     ///
     /// Input order is preserved (it is z-order, and it is yours); adjacent
     /// items with an equal clip coalesce into one segment. Retention is only
@@ -1492,106 +1531,75 @@ impl TextService {
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, items: &[Draw]) -> Batch {
         crate::work::count!(prepares, 1);
         crate::work::count!(prepared_items, items.len());
-        self.ensure_gpu(device);
-        if self.gpu.is_none() {
-            // No target format was ever set, so there is no pipeline to bind
-            // and nothing to bind it to. A `Batch` owns a buffer by
-            // definition; this one is never bound, having no segments.
-            return Batch {
-                buffer: batch_buffer(device, 0),
-                segments: Vec::new(),
-                emoji_epoch: None,
-                blocks: Vec::new(),
-            };
-        }
-
-        // Read *before* the walk: rasterizing a new emoji can evict, and the
-        // quads placed up to that point were baked against this value. It is
-        // also what `rebuild_geometry` stamps, so the batch and the geometry
-        // pool agree about what they were built against.
-        let epoch = self.emoji.epoch();
+        let gpu = self.gpu.as_ref().expect("call set_target before prepare");
+        assert_eq!(&gpu.device, device, "TextService belongs to a different device");
         let pixel_scale = self.pixel_scale.unwrap_or(1.0);
         let mut text_verts = std::mem::take(&mut self.batch_text);
         let mut emoji_verts = std::mem::take(&mut self.batch_emoji);
         text_verts.clear();
         emoji_verts.clear();
-        // One growth up front. A dense frame concatenates tens of thousands of
-        // small runs, and letting the Vec double its way there is most of the
-        // batch cost.
         text_verts.reserve(items.len() * 6);
-
-        let mut segments: Vec<Segment> = Vec::new();
-        let mut blocks: Vec<(u32, u32, u64)> = Vec::new();
-        for run in clip_runs(items) {
-            let text_start = text_verts.len() as u32;
-            let emoji_start = emoji_verts.len() as u32;
-            for item in &items[run.clone()] {
+        let mut segments = Vec::new();
+        let mut runs = Vec::new();
+        let mut blocks = Vec::new();
+        let mut emoji_sizes = Vec::new();
+        let mut complete = true;
+        for clip_run in clip_runs(items) {
+            let run_start = runs.len();
+            for item in &items[clip_run.clone()] {
                 let Some(index) = self.block_index(item.block) else {
+                    complete = false;
                     continue;
                 };
                 if item.paint.is_some_and(|h| self.paints.get(h).is_none()) {
+                    complete = false;
                     continue;
                 }
-                let baked = (
-                    item.block.slot,
-                    item.block.generation,
-                    self.blocks[index].revision,
-                );
-                if blocks.last() != Some(&baked) {
-                    blocks.push(baked);
-                }
-                // The bucket wants an *on-screen* size: under an MVP `size` is
-                // world units, and the consumer-stated scale bridges the gap.
-                let bucket = bucket_for(item.size * pixel_scale);
+                let baked = (item.block.slot, item.block.generation, self.blocks[index].revision);
+                if blocks.last() != Some(&baked) { blocks.push(baked); }
                 let key = GeomKey {
-                    color: item.color.0.map(f32::to_bits),
-                    paint: item.paint,
-                    clip: normalized_clip(item)
-                        .map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
+                    color: item.color.0.map(f32::to_bits), paint: item.paint,
+                    clip: normalized_clip(item).map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
                 };
-                // Fast path: one dense-array probe, then straight into the batch.
-                if let Some(geom) = self.geometry[index].as_ref() {
-                    // The epoch only matters if this block actually baked emoji
-                    // UVs; an atlas eviction cannot disturb a text-only block,
-                    // and invalidating those too rebuilds the frame for nothing.
-                    let emoji_still_valid =
-                        geom.emoji.is_empty() || (geom.epoch == epoch && geom.bucket == bucket);
-                    if geom.key == key && emoji_still_valid {
-                        crate::work::count!(geometry_hits, 1);
-                        place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
-                        continue;
+                if self.geometry[index].as_ref().is_some_and(|g| g.key == key) {
+                    crate::work::count!(geometry_hits, 1);
+                } else {
+                    self.rebuild_geometry(index, item, key);
+                }
+                let geom = self.geometry[index].as_ref().expect("geometry built");
+                let bucket = bucket_for(item.size * pixel_scale);
+                if !geom.emoji.is_empty() && emoji_sizes.last() != Some(&(item.size, bucket)) {
+                    emoji_sizes.push((item.size, bucket));
+                }
+                let gpu = self.gpu.as_ref().expect("target set");
+                let mut cursor = 0;
+                for request in &geom.emoji {
+                    let start = text_verts.len() as u32;
+                    place_text(&mut text_verts, &geom.text[cursor..request.text_before], item.at, item.size);
+                    push_run(&mut runs, run_start, None, start..text_verts.len() as u32);
+                    cursor = request.text_before;
+                    let font = &self.fonts[request.font as usize];
+                    if let Some(slot) = self.emoji.get_or_insert(
+                        font.face(), request.font, request.glyph, bucket, device, queue, &gpu.emoji_layout,
+                    ) {
+                        let start = emoji_verts.len() as u32;
+                        crate::work::count!(emoji_quads, 1);
+                        push_emoji_quad(&mut emoji_verts,
+                            request.pen.x * item.size + item.at.x,
+                            request.pen.y * item.size + item.at.y, item.size,
+                            [slot.x as f32, slot.y as f32],
+                            [(slot.x + slot.size) as f32, (slot.y + slot.size) as f32]);
+                        push_run(&mut runs, run_start, Some(slot.page), start..emoji_verts.len() as u32);
                     }
                 }
-                self.rebuild_geometry(index, item, key, epoch, bucket);
-                if let Some(geom) = self.geometry[index].as_ref() {
-                    place(&mut text_verts, &mut emoji_verts, geom, item.at, item.size);
-                }
+                let start = text_verts.len() as u32;
+                place_text(&mut text_verts, &geom.text[cursor..], item.at, item.size);
+                push_run(&mut runs, run_start, None, start..text_verts.len() as u32);
             }
-            segments.push(Segment {
-                clip: items[run.start].clip,
-                // Byte spans are batch-global under this layout and are only
-                // known once both halves are sized; filled in below.
-                text_bytes: (0, 0),
-                text_vertices: (text_start, text_verts.len() as u32),
-                emoji_bytes: (0, 0),
-                emoji_vertices: (emoji_start, emoji_verts.len() as u32),
-            });
+            segments.push(Segment { clip: items[clip_run.start].clip, runs: (run_start, runs.len()) });
         }
-
-        // Atlas uploads are `queue` writes, which land before this batch is
-        // ever drawn, so *adding* glyphs here is safe. The invariants that keep
-        // it safe — never recreate a texture already bound by an earlier draw in
-        // the pass, never evict a slot that draw sampled — live with the atlases.
-        let gpu = self.gpu.as_mut().expect("checked above");
-        gpu.text_atlas
-            .sync(device, queue, &gpu.text.atlas_layout, &self.glyphs);
-        gpu.emoji_atlas
-            .sync(device, queue, &gpu.emoji.atlas_layout, &self.emoji);
-
-        // One buffer per batch, text quads then emoji quads: two writes and two
-        // `set_vertex_buffer` offsets whatever the segment count. Both strides
-        // (56 and 16) are multiples of four, so the emoji half starts at a legal
-        // offset however much text precedes it.
+        let gpu = self.gpu.as_mut().expect("target set");
+        gpu.text_atlas.sync(device, queue, &gpu.text_layout, &self.glyphs);
         let text_data: &[u8] = bytemuck::cast_slice(&text_verts);
         let emoji_data: &[u8] = bytemuck::cast_slice(&emoji_verts);
         let split = text_data.len() as u64;
@@ -1599,54 +1607,30 @@ impl TextService {
         crate::work::count!(vertex_upload_bytes, total);
         crate::work::count!(prepared_segments, segments.len());
         let buffer = batch_buffer(device, total);
-        if !text_data.is_empty() {
-            queue.write_buffer(&buffer, 0, text_data);
-        }
-        if !emoji_data.is_empty() {
-            queue.write_buffer(&buffer, split, emoji_data);
-        }
-        for segment in &mut segments {
-            segment.text_bytes = (0, split);
-            segment.emoji_bytes = (split, total);
-        }
-
-        let emoji_epoch = (!emoji_verts.is_empty()).then_some(epoch);
+        if !text_data.is_empty() { queue.write_buffer(&buffer, 0, text_data); }
+        if !emoji_data.is_empty() { queue.write_buffer(&buffer, split, emoji_data); }
         self.batch_text = text_verts;
         self.batch_emoji = emoji_verts;
-        Batch {
-            buffer,
-            segments,
-            emoji_epoch,
-            blocks,
-        }
+        Batch { buffer, segments, runs, split, total, emoji_sizes, complete, blocks }
     }
 
-    /// Record one segment of a prepared batch. Sets **no scissor** — set yours
-    /// first from [`Segment::clip`]. Within a segment, text draws below emoji.
-    ///
-    /// Recording only: `&self`, no device, nothing is uploaded or rebuilt. A
-    /// no-op if `index` is out of range or no target was ever set.
+    /// Record one clip-uniform segment in input order, interleaving Slug and
+    /// emoji page runs. Sets no scissor: set yours first from [`Segment::clip`].
+    /// Recording only: no allocation, upload, or cache mutation. An out-of-range
+    /// index or an unset target is a no-op.
     pub fn draw_segment(&self, pass: &mut wgpu::RenderPass<'_>, batch: &Batch, index: usize) {
-        let Some(gpu) = self.gpu.as_ref() else {
-            return;
-        };
-        let Some(seg) = batch.segments.get(index) else {
-            return;
-        };
-        gpu.text.draw_vertices(
-            pass,
-            &gpu.text_atlas,
-            &batch.buffer,
-            seg.text_bytes.0..seg.text_bytes.1,
-            seg.text_vertices.0..seg.text_vertices.1,
-        );
-        gpu.emoji.draw(
-            pass,
-            &gpu.emoji_atlas,
-            &batch.buffer,
-            seg.emoji_bytes.0..seg.emoji_bytes.1,
-            seg.emoji_vertices.0..seg.emoji_vertices.1,
-        );
+        let Some(gpu) = &self.gpu else { return; };
+        let Some(segment) = batch.segments.get(index) else { return; };
+        let (text, emoji) = &gpu.pipelines[&gpu.format];
+        for run in &batch.runs[segment.runs.0..segment.runs.1] {
+            if let Some(page) = &run.page {
+                emoji.draw(pass, &gpu.uniforms.binding, page, &batch.buffer,
+                    batch.split..batch.total, run.vertices.clone());
+            } else {
+                text.draw_vertices(pass, &gpu.uniforms.binding, &gpu.text_atlas, &batch.buffer,
+                    0..batch.split, run.vertices.clone());
+            }
+        }
     }
 
     /// Record every segment of a prepared batch, in order, with no scissor
@@ -1659,31 +1643,30 @@ impl TextService {
         }
     }
 
-    /// Whether a retained batch still draws what it was baked from. Integer
-    /// compares only — check per frame, re-`prepare` on `false`. Goes stale
-    /// when the emoji atlas evicted under its UVs, **or when any block it
-    /// baked has since reshaped or been evicted**. The second clause is the
-    /// one a consumer cannot answer for itself: an edit reshapes a block *in
-    /// place* — same key, same slot, same handle — so the consumer's draw
-    /// list compares identical while the vertices it retained are of the old
-    /// text. The service did the reshape; the service answers for it.
-    /// Drawing a stale batch is memory-safe, but may sample repurposed atlas
-    /// contents after clear/eviction. Re-prepare on `false`; old pixels are not
-    /// a preserved snapshot.
+    /// Whether a batch's layouts and requested emoji resolution are current.
+    /// Caller-owned draw inputs (position, color, clip, paint) must also match.
+    /// Emoji cache eviction cannot change its pixels: the batch owns its pages.
+    ///
+    /// On `false`, re-issue `shape`/`shape_transient` from your source/style and
+    /// replace the draw handles before preparing. Re-preparing alone cannot
+    /// recover an evicted handle. A prepare that skipped invalid block/paint
+    /// handles remains non-live; it cannot cache missing text as a live result.
+    /// Already-baked paint colors survive `drop_paint`, but a new prepare needs
+    /// a live paint handle. After `clear`, recreate fonts/chains/paint as well.
     pub fn batch_live(&self, batch: &Batch) -> bool {
-        epoch_live(batch.emoji_epoch, self.emoji.epoch())
+        batch.complete
+            && batch.emoji_sizes.iter().all(|&(size, bucket)|
+                bucket_for(size * self.pixel_scale.unwrap_or(1.0)) == bucket)
             && batch.blocks.iter().all(|&(slot, generation, revision)| {
                 self.generations.get(slot as usize) == Some(&generation)
-                    && self
-                        .blocks
-                        .get(slot as usize)
-                        .is_some_and(|b| b.revision == revision)
+                    && self.blocks.get(slot as usize).is_some_and(|b| b.revision == revision)
             })
     }
 
-    /// Record many blocks in **one** pair of draw calls: `prepare` +
-    /// `draw_prepared` + drop. The easy path *is* the hard path plus a drop —
-    /// there is no second route to the GPU.
+    /// `prepare` + `draw_prepared` + drop: the easy path is the same rendering
+    /// route. Adjacent compatible runs coalesce; each scissor, shader-kind or
+    /// emoji-page transition can require another GPU draw. Input order wins
+    /// over regrouping by pipeline. Plain uniform-clip text remains one draw.
     ///
     /// This is what a dense canvas needs: drawing tens of thousands of
     /// glyph-sized blocks one call each costs hundreds of milliseconds in
@@ -1706,14 +1689,13 @@ impl TextService {
     }
 
     /// Build one block's quads into its geometry cache. CPU only — no device and
-    /// no upload; `prepare` does that once for the whole batch.
+    /// no upload. Emoji requests retain their position in the text stream;
+    /// `prepare` resolves them into owned page bindings and ordered GPU runs.
     fn rebuild_geometry(
         &mut self,
         index: usize,
         item: &Draw,
         key: GeomKey,
-        epoch: u64,
-        bucket: u32,
     ) {
         crate::work::count!(geometry_builds, 1);
         let color = item.color;
@@ -1723,16 +1705,12 @@ impl TextService {
             .map(|spans| PaintCursor::new(spans, color));
         // Bake at the origin *and* at unit size, with the clip normalised to
         // match, so the build depends on everything about this draw except where
-        // it lands and how big it is. `place` applies both on the way out.
+        // it lands and how big it is. `prepare` applies both on the way out.
         let at = Vec2::new(0.0, 0.0);
         let size = 1.0f32;
         let clip = normalized_clip(item);
         let mut text_verts = Vec::new();
-        let mut emoji_verts = Vec::new();
-
-        // Emoji rasterization mutates the emoji cache, so it cannot happen while
-        // the block is borrowed; collect the requests, then service them.
-        let mut emoji_requests: Vec<(u16, u32, f32, f32)> = Vec::new();
+        let mut emoji_requests = Vec::new();
         {
             let block = self.blocks[index]
                 .block
@@ -1745,7 +1723,10 @@ impl TextService {
                 clip,
                 |glyph, pen_x, pen_y, paragraph_byte| {
                     if glyph.is_color {
-                        emoji_requests.push((glyph.font_id, glyph.glyph_id, pen_x, pen_y));
+                        emoji_requests.push(EmojiRequest {
+                            font: glyph.font_id, glyph: glyph.glyph_id,
+                            pen: Vec2::new(pen_x, pen_y), text_before: text_verts.len(),
+                        });
                     } else if let Some(info) = glyph.info {
                         crate::work::count!(text_quads, 1);
                         let foreground = paint
@@ -1765,62 +1746,13 @@ impl TextService {
             );
         }
 
-        for (font_id, glyph_id, pen_x, pen_y) in emoji_requests {
-            let Some(font) = self.fonts.get(font_id as usize) else {
-                continue;
-            };
-            if let Some(slot) = self
-                .emoji
-                .get_or_insert(font.face(), font_id, glyph_id, bucket)
-            {
-                crate::work::count!(emoji_quads, 1);
-                let uv_min = [slot.x as f32, slot.y as f32];
-                let uv_max = [(slot.x + slot.size) as f32, (slot.y + slot.size) as f32];
-                push_emoji_quad(&mut emoji_verts, pen_x, pen_y, size, uv_min, uv_max);
-            }
-        }
-
-        self.geometry[index] = Some(Geometry {
-            key,
-            epoch,
-            bucket,
-            text: text_verts,
-            emoji: emoji_verts,
-        });
+        self.geometry[index] = Some(Geometry { key, text: text_verts, emoji: emoji_requests });
     }
 
     // -- internals -----------------------------------------------------------
 
-    fn ensure_gpu(&mut self, device: &wgpu::Device) {
-        let Some(format) = self.pending_format else {
-            return;
-        };
-        if self.gpu.as_ref().is_some_and(|gpu| gpu.format == format) {
-            return;
-        }
-        let text = TextRenderer::for_format(device, format);
-        let emoji = EmojiRenderer::for_format(device, format);
-        // Bound the emoji atlas to what this device can hold, so it never grows
-        // into a silent failure.
-        self.emoji
-            .set_max_height(device.limits().max_texture_dimension_2d);
-        let text_atlas = TextAtlas::empty(device, &text.atlas_layout);
-        let emoji_atlas = EmojiAtlas::empty(device, &emoji.atlas_layout, &self.emoji);
-        self.gpu = Some(Gpu {
-            format,
-            text,
-            emoji,
-            text_atlas,
-            emoji_atlas,
-        });
-    }
-
     fn chain_fonts(&self, chain: FontChainHandle) -> Option<&[FontHandle]> {
-        self.chains
-            .get(chain.0 as usize)
-            .and_then(Option::as_ref)
-            .map(Vec::as_slice)
-            .filter(|fonts| !fonts.is_empty())
+        chain_fonts(&self.chains, chain)
     }
 
     fn chain_view(&self, chain: FontChainHandle) -> Vec<ChainFont<'_>> {
@@ -2061,16 +1993,20 @@ impl TextService {
     }
 }
 
+fn chain_fonts(chains: &[ChainSlot], chain: FontChainHandle) -> Option<&[FontHandle]> {
+    let entry = chains.get(chain.slot as usize)?;
+    (entry.generation == chain.generation).then_some(())?;
+    entry.fonts.as_deref().filter(|fonts| !fonts.is_empty())
+}
+
 /// The chain as borrows into the font pool. A free function so callers can split
 /// the service's fields around it.
 fn chain_view<'a>(
     fonts: &'a [Font],
-    chains: &[Option<Vec<FontHandle>>],
+    chains: &[ChainSlot],
     chain: FontChainHandle,
 ) -> Vec<ChainFont<'a>> {
-    chains
-        .get(chain.0 as usize)
-        .and_then(Option::as_ref)
+    chain_fonts(chains, chain)
         .map(|handles| {
             handles
                 .iter()
@@ -2169,8 +2105,8 @@ impl Diagnostics<'_> {
             .collect()
     }
 
-    /// Characters in `text` that no face in `chain` covers — i.e. what will
-    /// render as tofu.
+    /// Non-control/non-whitespace scalars absent from every face's cmap.
+    /// Coverage is not a guarantee about whole-cluster shaping or raster support.
     pub fn uncovered_chars(&self, chain: FontChainHandle, text: &str) -> Vec<char> {
         let view = self.text.chain_view(chain);
         let mut missing: Vec<char> = text
@@ -2186,7 +2122,7 @@ impl Diagnostics<'_> {
         missing
     }
 
-    /// Whether any face in `chain` covers `c`. `false` means tofu.
+    /// Whether any face maps `c` in its cmap, not a whole-cluster rendering test.
     pub fn covers(&self, chain: FontChainHandle, c: char) -> bool {
         self.text
             .chain_view(chain)
@@ -2246,7 +2182,7 @@ impl Diagnostics<'_> {
         crate::layout::resolves_to_single_glyph(&view, text)
     }
 
-    /// Curve, band and emoji atlas sizes, in texels.
+    /// Curve/band atlas dimensions and the largest resident emoji page, in texels.
     pub fn atlas_sizes(&self) -> ((u32, u32), (u32, u32), (u32, u32)) {
         (
             self.text.glyphs.curve_size(),
@@ -2255,9 +2191,17 @@ impl Diagnostics<'_> {
         )
     }
 
-    /// Color glyphs dropped because the emoji atlas was full.
+    /// Failed color-glyph rasterizations, counted once per cached failure key.
+    /// Cache pressure evicts pages instead of dropping glyphs.
     pub fn dropped_glyphs(&self) -> u64 {
         self.text.emoji.dropped_glyphs()
+    }
+
+    /// `(resident emoji pages, texture bytes)` owned by the cache. Excludes pages
+    /// kept alive only by retained batches or recorded GPU commands. Cache-owned
+    /// pages have a 64 MiB budget; batch ownership is controlled by the consumer.
+    pub fn emoji_cache_usage(&self) -> (usize, usize) {
+        self.text.emoji.usage()
     }
 
     /// `(cached paragraph layouts, live blocks)`.
@@ -2308,35 +2252,30 @@ fn batch_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
     })
 }
 
-/// The staleness rule behind [`TextService::batch_live`], without a device:
-/// a batch that baked no emoji UVs has nothing an eviction can repoint.
-fn epoch_live(baked: Option<u64>, current: u64) -> bool {
-    baked.is_none_or(|epoch| epoch == current)
+fn push_run(runs: &mut Vec<DrawRun>, segment_start: usize, page: Option<Arc<EmojiPage>>, vertices: Range<u32>) {
+    if vertices.is_empty() { return; }
+    if runs.len() > segment_start {
+        let last = runs.last_mut().expect("run");
+        let same = match (&last.page, &page) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if same && last.vertices.end == vertices.start {
+            last.vertices.end = vertices.end;
+            return;
+        }
+    }
+    runs.push(DrawRun { page, vertices });
 }
 
-/// Concatenate one block's origin-baked quads into the batch, translated to
-/// `at`. The copy is a memcpy plus a linear add — orders of magnitude cheaper
-/// than the rebuild that baking `at` into the cache key would have forced.
-fn place(
-    text: &mut Vec<TextVertex>,
-    emoji: &mut Vec<EmojiVertex>,
-    geom: &Geometry,
-    at: Vec2,
-    size: f32,
-) {
-    let base = text.len();
-    text.extend_from_slice(&geom.text);
-    for v in &mut text[base..] {
+/// Copy cached em-space vertices, applying the caller's source-space placement.
+fn place_text(out: &mut Vec<TextVertex>, vertices: &[TextVertex], at: Vec2, size: f32) {
+    let base = out.len();
+    out.extend_from_slice(vertices);
+    for v in &mut out[base..] {
         v.pos[0] = v.pos[0] * size + at.x;
         v.pos[1] = v.pos[1] * size + at.y;
-    }
-    if !geom.emoji.is_empty() {
-        let base = emoji.len();
-        emoji.extend_from_slice(&geom.emoji);
-        for v in &mut emoji[base..] {
-            v.pos[0] = v.pos[0] * size + at.x;
-            v.pos[1] = v.pos[1] * size + at.y;
-        }
     }
 }
 
@@ -2387,7 +2326,7 @@ mod tests {
     #[test]
     fn style_float_equality_is_bitwise() {
         let style = |wrap_em, line_spacing| Style {
-            chain: FontChainHandle(0),
+            chain: FontChainHandle { slot: 0, generation: 0 },
             wrap_em,
             align: Align::Left,
             line_spacing,
@@ -2439,7 +2378,7 @@ mod tests {
         let below = line.top_em + line.height_em - (line.baseline_em - metrics.descent);
         assert!(above > 0.0);
         assert!((above - below).abs() < 1e-6);
-        let caret = layout.caret_rect(0);
+        let caret = layout.caret_rect(layout.caret_at(0));
         let selected = &layout.selection(0..1)[0];
         assert_eq!((caret.y_em, caret.height_em), (line.top_em, line.height_em));
         assert_eq!(
@@ -2661,7 +2600,7 @@ mod tests {
         let mut text = TextService::new();
         let e = text.map_font(emoji, 0).ok()?;
         let l = text.map_font(latin, 0).ok()?;
-        let chain = text.register_chain(&[e, l]);
+        let chain = text.register_chain(&[e, l]).expect("font chain capacity");
         Some((text, chain))
     }
 
@@ -2675,7 +2614,7 @@ mod tests {
         ])?;
         let mut text = TextService::new();
         let h = text.map_font(latin, 0).ok()?;
-        let chain = text.register_chain(&[h]);
+        let chain = text.register_chain(&[h]).expect("font chain capacity");
         Some((text, chain))
     }
 
@@ -2742,20 +2681,6 @@ mod tests {
         // Every item lands in exactly one run, and the runs read in input order.
         let covered: Vec<usize> = runs.iter().flat_map(Clone::clone).collect();
         assert_eq!(covered, (0..items.len()).collect::<Vec<_>>());
-    }
-
-    /// Emoji eviction alone cannot invalidate a text-only batch. Block edits,
-    /// eviction and clear are checked separately through generations/revisions
-    /// in batch_live; they can invalidate either kind of batch.
-    #[test]
-    fn emoji_eviction_does_not_invalidate_text_only_batches() {
-        assert!(epoch_live(None, 0));
-        assert!(epoch_live(None, u64::MAX));
-        assert!(epoch_live(Some(4), 4));
-        assert!(
-            !epoch_live(Some(4), 5),
-            "an eviction since the bake is staleness"
-        );
     }
 
     /// Counts how often the service asks for a paragraph's bytes.
@@ -3079,7 +3004,7 @@ mod tests {
             paint: draw.paint,
             clip: normalized_clip(&draw).map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
         };
-        text.rebuild_geometry(index, &draw, key, text.emoji.epoch(), 32);
+        text.rebuild_geometry(index, &draw, key);
         text.geometry[index].as_ref().unwrap().text.clone()
     }
     #[test]
@@ -3129,7 +3054,7 @@ mod tests {
         let (mut text, chain) = required_latin();
         let st = style_of(chain, Some(4.));
         let alias_fonts = text.chain_fonts(chain).unwrap().to_vec();
-        let alias = text.register_chain(&alias_fonts);
+        let alias = text.register_chain(&alias_fonts).expect("font chain capacity");
         let plain = text
             .shape(
                 BlockKey(70),
@@ -3212,7 +3137,7 @@ mod tests {
         ])
         .expect("font-span tests require an italic/oblique face");
         let italic = text.map_font(data, 0).unwrap();
-        let ic = text.register_chain(&[italic]);
+        let ic = text.register_chain(&[italic]).expect("font chain capacity");
         let st = style_of(chain, None);
         let keys = span_keys(1);
         let plain = text

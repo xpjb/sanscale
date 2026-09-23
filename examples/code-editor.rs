@@ -514,7 +514,7 @@ impl Editor {
     /// Keep the caret inside the viewport after motion or edits.
     fn scroll_caret_into_view(&mut self, layout: &Layout, view_h: f32) {
         let caret = layout.clamp_caret(self.caret);
-        let rect = layout.caret_rect_on_line(Some(caret.line_index), caret.byte_index);
+        let rect = layout.caret_rect(caret);
         let top = MARGIN + rect.y_em * self.font_px - self.scroll_y;
         let height = (rect.height_em.max(1.0)) * self.font_px;
         if top < MARGIN {
@@ -838,7 +838,7 @@ fn render_frame(
         rects.flush(device, pass);
         cache.body.draw(text, pass);
         if caret_visible {
-            let rect = layout.caret_rect_on_line(Some(placed.line_index), placed.byte_index);
+            let rect = layout.caret_rect(placed);
             let height = rect.height_em.max(1.);
             let width = if editor.caret_block {
                 layout
@@ -847,7 +847,7 @@ fn render_frame(
                     .filter(|(range, next)| *next <= range.end)
                     .map(|(_, next)| {
                         (layout
-                            .caret_rect_on_line(Some(placed.line_index), next)
+                            .caret_rect(Caret { byte_index: next, ..placed })
                             .x_em
                             - rect.x_em)
                             .abs()
@@ -1427,10 +1427,7 @@ impl Gfx {
         let screen = Vec2::new(self.config.width as f32, self.config.height as f32);
 
         self.text.set_target(&self.device, self.config.format);
-        self.text.set_transform(
-            &self.queue,
-            TextService::pixel_ortho(self.config.width, self.config.height),
-        );
+        self.text.set_transform(TextService::pixel_ortho(self.config.width, self.config.height));
 
         let style = self.style();
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -1701,7 +1698,7 @@ mod tests {
         assert_eq!(layout.len_bytes(), doc.rope.len_bytes());
         for line in 0..layout.line_count() {
             let range = layout.line_range(line).unwrap();
-            let caret = layout.caret_rect_on_line(Some(line), range.start);
+            let caret = layout.caret_rect(Caret { line_index: line, byte_index: range.start });
             let hit = layout
                 .hit_test(Vec2::new(caret.x_em, caret.y_em + caret.height_em * 0.5))
                 .unwrap();

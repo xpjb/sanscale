@@ -3,7 +3,7 @@
 Generated from compiler-resolved rustdoc JSON, not a regex. Version **0.1.0**;
 **all features** enabled. `profiling` is available only with `perf-counters`.
 
-**34 public types/traits/aliases · 3 free functions · 58 inherent methods ·
+**33 public types/traits/aliases · 3 free functions · 55 inherent methods ·
 4 trait method declarations · 1 associated constant.**
 Explicit and derived trait implementations appear in the final section.
 
@@ -25,7 +25,7 @@ python3 scripts/export-public-api.py target/doc/sanscale.json public-api.md
 ```
 
 Rustdoc JSON format: `61`. Declaration fingerprint (SHA-256):
-`5445081cb777f3f34255537a16ff7d6a6cc7d0ee40287208a4fed68f99269385`. Do not edit generated declarations by hand.
+`420c862555f035cbe4a99501629ac75f039e29a8c71ada76de1e18a71ae034aa`. Do not edit generated declarations by hand.
 
 ## `sanscale::Align`
 
@@ -43,7 +43,7 @@ pub enum Align {
 
 ## `sanscale::Batch`
 
-[src/text.rs:1044](src/text.rs#L1044)
+[src/text.rs:1039](src/text.rs#L1039)
 
 Blocks the consumer chose to group, concatenated into one GPU buffer **the
 consumer holds** — the unit of vertex ownership (see the "`Batch` owns its
@@ -61,7 +61,7 @@ impl Batch {
 
 ## `sanscale::BlockKey`
 
-[src/text.rs:198](src/text.rs#L198)
+[src/text.rs:210](src/text.rs#L210)
 
 The consumer's identity for a composed block: the unit of *coordinate space*.
 
@@ -71,7 +71,7 @@ pub struct BlockKey(pub u64);
 
 ## `sanscale::Boundaries`
 
-[src/text.rs:283](src/text.rs#L283)
+[src/text.rs:295](src/text.rs#L295)
 
 Word classification over the caller's text, for `Motion::WordLeft` /
 `Motion::WordRight`. Words are semantics, not shaping, so the crate asks
@@ -87,7 +87,7 @@ pub trait Boundaries {
 
 ## `sanscale::Caret`
 
-[src/text.rs:252](src/text.rs#L252)
+[src/text.rs:264](src/text.rs#L264)
 
 A placed caret: a byte offset **and** the visual line it is shown on.
 
@@ -100,7 +100,7 @@ pub struct Caret {
 
 ## `sanscale::CaretRect`
 
-[src/text.rs:298](src/text.rs#L298)
+[src/text.rs:310](src/text.rs#L310)
 
 ```rust
 pub struct CaretRect {
@@ -112,7 +112,7 @@ pub struct CaretRect {
 
 ## `sanscale::CaretStop`
 
-[src/text.rs:323](src/text.rs#L323)
+[src/text.rs:335](src/text.rs#L335)
 
 One caret position on a line: a byte offset and where it sits, in em.
 
@@ -139,7 +139,7 @@ pub struct Color(pub [f32; 4]);
 
 ## `sanscale::Diagnostics`
 
-[src/text.rs:2153](src/text.rs#L2153)
+[src/text.rs:2089](src/text.rs#L2089)
 
 Read-only introspection: font coverage and cache occupancy.
 
@@ -157,13 +157,14 @@ impl Diagnostics<'_> {
     pub fn is_single_glyph(&self, chain: FontChainHandle, text: &str) -> bool;
     pub fn atlas_sizes(&self) -> ((u32, u32), (u32, u32), (u32, u32));
     pub fn dropped_glyphs(&self) -> u64;
+    pub fn emoji_cache_usage(&self) -> (usize, usize);
     pub fn cache_occupancy(&self) -> (usize, usize);
 }
 ```
 
 ## `sanscale::Draw`
 
-[src/text.rs:983](src/text.rs#L983)
+[src/text.rs:981](src/text.rs#L981)
 
 One block to draw, for `TextService::draw_batch`.
 
@@ -180,12 +181,15 @@ pub struct Draw {
 
 ## `sanscale::FontChainHandle`
 
-[src/text.rs:154](src/text.rs#L154)
+[src/text.rs:156](src/text.rs#L156)
 
-An ordered fallback chain of fonts.
+An ordered fallback chain of fonts, local to its service.
+Released handles cannot select or release a later occupant of the slot.
 
 ```rust
-pub struct FontChainHandle(/* private field */);
+pub struct FontChainHandle {
+    /* private fields */
+}
 ```
 
 ## `sanscale::FontData`
@@ -213,30 +217,13 @@ pub enum FontError {
 
 ## `sanscale::FontHandle`
 
-[src/text.rs:150](src/text.rs#L150)
+[src/text.rs:151](src/text.rs#L151)
 
-One mapped concrete font. Deduped by data identity.
+One mapped concrete font, local to its service. Deduped by data identity.
+Invalid after `clear`; remap rather than reusing an old font handle.
 
 ```rust
 pub struct FontHandle(/* private field */);
-```
-
-## `sanscale::FontMetrics`
-
-[src/font.rs:13](src/font.rs#L13)
-
-Vertical font metrics, in em-space.
-
-```rust
-pub struct FontMetrics {
-    pub ascent: f32,
-    pub descent: f32,
-    pub line_gap: f32,
-}
-
-impl FontMetrics {
-    pub fn line_height(&self) -> f32;
-}
 ```
 
 ## `sanscale::FontSpan`
@@ -254,7 +241,7 @@ pub struct FontSpan {
 
 ## `sanscale::Layout`
 
-[src/text.rs:358](src/text.rs#L358)
+[src/text.rs:370](src/text.rs#L370)
 
 Laid-out geometry for one block, in em space, with block-global byte offsets
 across all of its paragraphs.
@@ -274,11 +261,8 @@ impl Layout {
     pub fn line_range(&self, index: usize) -> Option<Range<usize>>;
     pub fn len_bytes(&self) -> usize;
     pub fn hit_test(&self, at_em: Vec2) -> Option<Caret>;
-    pub fn line_for_byte(&self, byte_index: usize) -> Option<usize>;
     pub fn caret_on_line(&self, line_index: usize, x_em: f32) -> Option<usize>;
-    pub fn caret_position(&self, byte_index: usize) -> Vec2;
-    pub fn caret_rect(&self, byte_index: usize) -> CaretRect;
-    pub fn caret_rect_on_line(&self, line_index: Option<usize>, byte_index: usize) -> CaretRect;
+    pub fn caret_rect(&self, caret: Caret) -> CaretRect;
     pub fn next_caret_stop(&self, byte_index: usize) -> Option<usize>;
     pub fn prev_caret_stop(&self, byte_index: usize) -> Option<usize>;
     pub fn clamp_caret(&self, caret: Caret) -> Caret;
@@ -289,9 +273,9 @@ impl Layout {
         caret: Caret,
         motion: Motion,
         goal: &mut Option<f32>,
-        text: &impl Boundaries,
+        text: &impl Boundaries + ?Sized,
     ) -> Caret;
-    pub fn select_word_at(&self, byte_index: usize, text: &impl Boundaries) -> Range<usize>;
+    pub fn select_word_at(&self, byte_index: usize, text: &impl Boundaries + ?Sized) -> Range<usize>;
     pub fn select_paragraph_at(&self, byte_index: usize) -> Range<usize>;
     pub fn selection(&self, range: Range<usize>) -> Vec<SelectionSpan>;
 }
@@ -299,7 +283,7 @@ impl Layout {
 
 ## `sanscale::LayoutLineSpec`
 
-[src/text.rs:330](src/text.rs#L330)
+[src/text.rs:342](src/text.rs#L342)
 
 One line's worth of synthetic layout, for `Layout::from_lines`.
 
@@ -313,7 +297,7 @@ pub struct LayoutLineSpec {
 
 ## `sanscale::LineMetrics`
 
-[src/text.rs:314](src/text.rs#L314)
+[src/text.rs:326](src/text.rs#L326)
 
 ```rust
 pub struct LineMetrics {
@@ -326,7 +310,7 @@ pub struct LineMetrics {
 
 ## `sanscale::Motion`
 
-[src/text.rs:264](src/text.rs#L264)
+[src/text.rs:276](src/text.rs#L276)
 
 One caret motion, resolved by `Layout::caret_move`.
 
@@ -387,7 +371,7 @@ pub struct PaintSpan {
 
 ## `sanscale::ParagraphKey`
 
-[src/text.rs:187](src/text.rs#L187)
+[src/text.rs:197](src/text.rs#L197)
 
 The consumer's identity for one paragraph: the unit of *invalidation*.
 Its generation covers text **and effective font spans**, never paint.
@@ -402,7 +386,7 @@ pub struct ParagraphKey {
 
 ## `sanscale::ParagraphSource`
 
-[src/text.rs:863](src/text.rs#L863)
+[src/text.rs:862](src/text.rs#L862)
 
 Supplies a paragraph's text, by identity, on a shaping cache miss.
 
@@ -415,7 +399,7 @@ pub trait ParagraphSource {
 
 ## `sanscale::Paragraphs`
 
-[src/text.rs:877](src/text.rs#L877)
+[src/text.rs:876](src/text.rs#L876)
 
 A source over already-materialized paragraphs, for consumers holding strings.
 
@@ -444,7 +428,7 @@ impl Rect {
 
 ## `sanscale::Segment`
 
-[src/text.rs:1019](src/text.rs#L1019)
+[src/text.rs:1017](src/text.rs#L1017)
 
 One clip-uniform run inside a `Batch`: the vertices between two scissor
 changes. Read-only, minted by `TextService::prepare`, dies with its batch.
@@ -458,7 +442,7 @@ pub struct Segment {
 
 ## `sanscale::SelectionSpan`
 
-[src/text.rs:305](src/text.rs#L305)
+[src/text.rs:317](src/text.rs#L317)
 
 ```rust
 pub struct SelectionSpan {
@@ -472,7 +456,7 @@ pub struct SelectionSpan {
 
 ## `sanscale::ShapedHandle`
 
-[src/text.rs:163](src/text.rs#L163)
+[src/text.rs:173](src/text.rs#L173)
 
 A shaped *block* — 1..N paragraphs flowed into one coordinate space.
 
@@ -488,7 +472,7 @@ impl ShapedHandle {
 
 ## `sanscale::Style`
 
-[src/text.rs:204](src/text.rs#L204)
+[src/text.rs:216](src/text.rs#L216)
 
 Base font and paragraph layout policy. Inline font spans are separate source
 inputs covered by the paragraph generation. No pixels or color: moving the
@@ -505,7 +489,7 @@ pub struct Style {
 
 ## `sanscale::TextService`
 
-[src/text.rs:1090](src/text.rs#L1090)
+[src/text.rs:1121](src/text.rs#L1121)
 
 One text service: every pool, every cache, and the GPU resources.
 
@@ -517,7 +501,7 @@ pub struct TextService {
 impl TextService {
     pub fn new() -> Self;
     pub fn map_font(&mut self, data: FontData, face_index: u32) -> Result<FontHandle, FontError>;
-    pub fn register_chain(&mut self, fonts: &[FontHandle]) -> FontChainHandle;
+    pub fn register_chain(&mut self, fonts: &[FontHandle]) -> Result<FontChainHandle, FontError>;
     pub fn drop_chain(&mut self, chain: FontChainHandle);
     pub fn register_paint(&mut self, spans: &[PaintSpan]) -> Result<PaintHandle, PaintError>;
     pub fn drop_paint(&mut self, paint: PaintHandle);
@@ -533,7 +517,7 @@ impl TextService {
     pub fn measure(&self, h: ShapedHandle) -> &Layout;
     pub fn diagnostics(&self) -> Diagnostics<'_>;
     pub fn set_target(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat);
-    pub fn set_transform(&mut self, queue: &wgpu::Queue, transform: [f32; 16]);
+    pub fn set_transform(&mut self, transform: [f32; 16]);
     pub fn set_pixel_scale(&mut self, px_per_unit: f32);
     pub fn pixel_ortho(width: u32, height: u32) -> [f32; 16];
     pub fn draw(
@@ -541,11 +525,7 @@ impl TextService {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         pass: &mut wgpu::RenderPass<'_>,
-        h: ShapedHandle,
-        at: Vec2,
-        size: f32,
-        color: Color,
-        clip: Option<Rect>,
+        item: Draw,
     );
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, items: &[Draw]) -> Batch;
     pub fn draw_segment(&self, pass: &mut wgpu::RenderPass<'_>, batch: &Batch, index: usize);
@@ -675,7 +655,7 @@ Read a font file into shared bytes. Convenience for examples and tests; a real
 consumer discovers fonts itself and hands over an `Arc` it already has.
 
 ```rust
-pub fn read_font_file(path: &str) -> std::io::Result<FontData>;
+pub fn read_font_file(path: impl AsRef<std::path::Path>) -> std::io::Result<FontData>;
 ```
 
 ## Trait implementations (including derives)
@@ -733,11 +713,6 @@ impl Clone for FontError {
 
 impl Clone for FontHandle {
     fn clone(&self) -> FontHandle;
-    // Inherited defaults: clone_from
-}
-
-impl Clone for FontMetrics {
-    fn clone(&self) -> FontMetrics;
     // Inherited defaults: clone_from
 }
 
@@ -841,8 +816,6 @@ impl Copy for FontError {}
 
 impl Copy for FontHandle {}
 
-impl Copy for FontMetrics {}
-
 impl Copy for LineMetrics {}
 
 impl Copy for Motion {}
@@ -904,10 +877,6 @@ impl Debug for FontError {
 }
 
 impl Debug for FontHandle {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result;
-}
-
-impl Debug for FontMetrics {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result;
 }
 
@@ -1277,12 +1246,11 @@ Compiler/target-specific; `!` means a negative implementation.
 | `sanscale::CaretRect` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::CaretStop` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::Color` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
-| `sanscale::Diagnostics` | `!RefUnwindSafe`, `!Send`, `!Sync`, `!UnwindSafe`, `Freeze`, `Unpin`, `UnsafeUnpin` |
+| `sanscale::Diagnostics` | `!RefUnwindSafe`, `!UnwindSafe`, `Freeze`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin` |
 | `sanscale::Draw` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::FontChainHandle` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::FontError` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::FontHandle` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
-| `sanscale::FontMetrics` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::FontSpan` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::Layout` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::LayoutLineSpec` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
@@ -1298,6 +1266,6 @@ Compiler/target-specific; `!` means a negative implementation.
 | `sanscale::SelectionSpan` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::ShapedHandle` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::Style` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
-| `sanscale::TextService` | `!Freeze`, `!RefUnwindSafe`, `!Sync`, `!UnwindSafe`, `Send`, `Unpin`, `UnsafeUnpin` |
+| `sanscale::TextService` | `!RefUnwindSafe`, `!UnwindSafe`, `Freeze`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin` |
 | `sanscale::Vec2` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |
 | `sanscale::profiling::WorkCounters` | `Freeze`, `RefUnwindSafe`, `Send`, `Sync`, `Unpin`, `UnsafeUnpin`, `UnwindSafe` |

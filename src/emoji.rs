@@ -1,18 +1,14 @@
-//! Color-emoji support: `COLR` v0/v1 and PNG-backed CBDT/sbix strikes.
+//! Color-emoji rasterization (COLR v0/v1 and PNG CBDT/sbix), cached on the GPU.
 //!
-//! Color glyphs can't go through the monochrome Slug path, so they're rasterized
-//! once (per size bucket) into an RGBA atlas and drawn as textured quads. COLR
-//! paint trees render through tiny-skia; embedded bitmap strikes are decoded and
-//! scaled into the same cache.
-//!
-//! Caching mirrors [`GlyphCache`](crate::cache): the CPU side is **append-only**
-//! with a `revision` counter; the GPU side ([`EmojiAtlas`](crate::renderer)) uploads
-//! incrementally when the revision moves. Bounded by a small fixed set of size
-//! buckets, so zoom re-rasters an emoji at most a few times.
+//! Pages are append-only. LRU eviction removes cache entries, not texels: a
+//! prepared batch owns references to its pages, and recorded draws retain their
+//! bindings through wgpu. This supports multiple unsubmitted passes without a
+//! frame hook, slot leases, or copying an entire atlas on eviction.
 
-use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::renderer::EmojiPage;
 use rustybuzz::Face as RustyFace;
 use tiny_skia::{
     BlendMode, Color, FillRule, GradientStop, LinearGradient, Paint as SkPaint, Path, PathBuilder,
@@ -21,287 +17,177 @@ use tiny_skia::{
 use ttf_parser::colr::{ClipBox, CompositeMode, GradientExtend, Paint, Painter};
 use ttf_parser::{GlyphId, OutlineBuilder, RasterImageFormat, RgbaColor, Transform};
 
-/// Atlas is a fixed width; height grows in power-of-two steps up to a cap, after
-/// which cells are recycled by eviction (see [`EmojiCache`]) so the texture never
-/// exceeds the GPU's `max_texture_dimension_2d`.
-pub const EMOJI_ATLAS_WIDTH: u32 = 2048;
-
-/// Raster resolutions. On-screen pixel size snaps up to the nearest bucket, so an
-/// emoji is rasterized at most `SIZE_BUCKETS.len()` times across all zooms.
 const SIZE_BUCKETS: [u32; 4] = [32, 64, 128, 256];
 const ATLAS_PAD: u32 = 2;
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
+// A bounded number of known-unrenderable glyphs; these have no resident page.
+const MAX_FAILURES: usize = 1 << 16;
+type GlyphKey = (u16, u32, u32);
 
-/// Default cap on atlas height, in force until a device is known. Kept ≤ the wgpu
-/// default `max_texture_dimension_2d` (8192) so the atlas can never silently
-/// overflow even on a default-limits device; once `TextService` builds its GPU resources
-/// it replaces this with the device's real `max_texture_dimension_2d` via
-/// [`EmojiCache::set_max_height`].
-pub(crate) const DEFAULT_EMOJI_ATLAS_MAX_HEIGHT: u32 = 4096;
-
-/// Bucket (raster resolution) for an on-screen pixel size.
 pub(crate) fn bucket_for(px: f32) -> u32 {
     let px = px.ceil().max(1.0) as u32;
-    SIZE_BUCKETS
-        .into_iter()
-        .find(|&b| px <= b)
-        .unwrap_or(SIZE_BUCKETS[SIZE_BUCKETS.len() - 1])
+    SIZE_BUCKETS.into_iter().find(|&b| px <= b).unwrap_or(256)
 }
 
-/// Index of a bucket size in [`SIZE_BUCKETS`] (bucket sizes are the only valid keys).
 fn bucket_index(bucket: u32) -> usize {
-    SIZE_BUCKETS.iter().position(|&b| b == bucket).unwrap_or(0)
+    SIZE_BUCKETS.iter().position(|&b| b == bucket).expect("raster bucket")
 }
 
-/// A rasterized emoji's texel rect in the atlas (square, `size`×`size`).
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct EmojiSlot {
+    pub page: Arc<EmojiPage>,
     pub x: u32,
     pub y: u32,
     pub size: u32,
 }
 
-/// Which key currently owns a cell, and when it was last drawn. `size` (== bucket)
-/// lets eviction scan only cells of the target bucket.
-struct Occupant {
-    key: (u16, u32, u32),
-    size: u32,
+#[derive(Clone, Copy)]
+struct Cell {
+    page: usize,
+    index: u32,
+}
+
+struct Page {
+    gpu: Arc<EmojiPage>,
+    bucket: u32,
+    columns: u32,
+    keys: Vec<GlyphKey>,
     last_used: u64,
 }
 
-/// CPU-side emoji atlas: premultiplied-RGBA pixels + a **per-bucket slab allocator**
-/// with an LRU free list, keyed `(face_id, glyph_id, bucket)`.
-///
-/// Because the four bucket sizes are fixed, each shelf holds uniform cells for one
-/// bucket, so an evicted cell is reused in place with no repacking. Height is capped
-/// at [`max_height`](Self::set_max_height); once every shelf is spoken for, the
-/// least-recently-used cell of the requested bucket (that wasn't drawn this frame) is
-/// evicted and recycled. A cached `None` records a glyph that isn't renderable, so we
-/// don't retry it every frame.
-///
-/// **Eviction invalidates baked UVs.** [`epoch`](Self::epoch) bumps whenever a cell is
-/// recycled; holders of cached vertices (e.g. the examples' per-row cache) must drop
-/// them when it changes. The engine's per-frame re-emit path re-fetches slots each
-/// frame, so it is unaffected.
-pub(crate) struct EmojiCache {
-    pixels: Vec<u8>,
-    height: u32,
-    max_height: u32,
-    /// Next free row for a brand-new shelf (shelves are handed out top-to-bottom).
-    next_y: u32,
-    /// Unused cell origins per bucket, replenished a shelf at a time.
-    free: [Vec<(u32, u32)>; SIZE_BUCKETS.len()],
-    slots: HashMap<(u16, u32, u32), Option<EmojiSlot>>,
-    /// Reverse map: occupied cell origin → occupant, for LRU eviction.
-    cells: HashMap<(u32, u32), Occupant>,
-    frame: u64,
-    epoch: u64,
-    revision: u64,
-    /// Row range whose pixels changed since the last GPU sync (min..max, exclusive).
-    dirty: Cell<Option<(u32, u32)>>,
-    dropped: u64,
-    warned: bool,
+impl Page {
+    fn slot(&self, index: u32) -> EmojiSlot {
+        EmojiSlot {
+            page: self.gpu.clone(),
+            x: (index % self.columns) * (self.bucket + ATLAS_PAD) + 1,
+            y: (index / self.columns) * (self.bucket + ATLAS_PAD) + 1,
+            size: self.bucket,
+        }
+    }
+    fn bytes(&self) -> usize { (self.gpu.side as usize).pow(2) * 4 }
 }
 
-impl EmojiCache {
-    pub fn new() -> Self {
-        Self {
-            pixels: Vec::new(),
-            height: 0,
-            max_height: DEFAULT_EMOJI_ATLAS_MAX_HEIGHT,
-            next_y: 0,
-            free: Default::default(),
-            slots: HashMap::new(),
-            cells: HashMap::new(),
-            frame: 0,
-            epoch: 0,
-            revision: 0,
-            dirty: Cell::new(None),
-            dropped: 0,
-            warned: false,
-        }
-    }
-
-    /// Cap the atlas height in texels (clamped to at least one 256px shelf). Callers
-    /// with a known device limit set this to `min(limit, budget)` for more headroom.
-    pub fn set_max_height(&mut self, max_height: u32) {
-        self.max_height = max_height.max(SIZE_BUCKETS[SIZE_BUCKETS.len() - 1] + ATLAS_PAD);
-    }
-
-    /// Reset contents without forgetting the device/budget limit. The GPU
-    /// atlas owner must invalidate its upload state at the same time.
-    pub fn clear(&mut self) {
-        let max_height = self.max_height;
-        *self = Self::new();
-        self.max_height = max_height;
-    }
-
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    /// Bumped whenever a cell is recycled under eviction; see the type docs.
-    #[allow(dead_code)] // kept for a future geometry-pool invalidation hook
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    /// Total glyphs dropped because a bucket was full of glyphs already needed this
-    /// frame (the working set exceeded the atlas budget). Should stay 0 in practice.
-    pub fn dropped_glyphs(&self) -> u64 {
-        self.dropped
-    }
-
-    /// Advance the frame clock. Cells drawn in the current frame are never evicted, so
-    /// this must be called once per rendered frame (the engine does so in `flush`).
-    #[allow(dead_code)] // per-frame budget hook, unused until the service tracks frames
-    pub fn begin_frame(&mut self) {
-        self.frame = self.frame.wrapping_add(1);
-    }
-
-    /// Atlas `(width, height)` in texels (height ≥ 1 for a valid texture).
-    pub fn size(&self) -> (u32, u32) {
-        (EMOJI_ATLAS_WIDTH, self.height.max(1))
-    }
-
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
-    }
-
-    /// Take (and clear) the dirty row range accumulated since the last call, so the
-    /// GPU side re-uploads exactly the texels that changed — including recycled cells,
-    /// which an append-only upload would miss.
-    pub fn take_dirty(&self) -> Option<(u32, u32)> {
-        self.dirty.take()
-    }
-
-    /// Slot for a color glyph at a size bucket, rasterizing + packing on first use.
-    /// `None` when the glyph isn't renderable, or the atlas is momentarily full of
-    /// glyphs already needed this frame.
-    pub fn get_or_insert(
-        &mut self,
-        face: &RustyFace,
-        face_id: u16,
-        glyph_id: u32,
-        bucket: u32,
-    ) -> Option<EmojiSlot> {
-        let key = (face_id, glyph_id, bucket);
-        if let Some(&cached) = self.slots.get(&key) {
-            crate::work::count!(emoji_hits, 1);
-            if let Some(slot) = cached {
-                if let Some(occ) = self.cells.get_mut(&(slot.x, slot.y)) {
-                    occ.last_used = self.frame;
-                }
-            }
-            return cached;
-        }
-        crate::work::count!(emoji_rasterizations, 1);
-        let slot = match rasterize(face, glyph_id as u16, bucket) {
-            Some(rgba) => self.place(key, bucket, &rgba),
-            None => None,
-        };
-        self.slots.insert(key, slot);
-        self.revision = self.revision.wrapping_add(1);
-        slot
-    }
-
-    /// Allocate a cell for `bucket`, write the `size`×`size` image into it, and record
-    /// the occupant. `None` only if the bucket is wider than the atlas or fully in use
-    /// this frame.
-    fn place(&mut self, key: (u16, u32, u32), bucket: u32, rgba: &[u8]) -> Option<EmojiSlot> {
-        let (x, y) = self.alloc_cell(bucket)?;
-        self.write_cell(x, y, bucket, rgba);
-        self.cells.insert(
-            (x, y),
-            Occupant {
-                key,
-                size: bucket,
-                last_used: self.frame,
-            },
-        );
-        Some(EmojiSlot { x, y, size: bucket })
-    }
-
-    /// A free cell for `bucket`: reuse one, else open a new shelf, else evict LRU.
-    fn alloc_cell(&mut self, bucket: u32) -> Option<(u32, u32)> {
-        let cell = bucket + ATLAS_PAD;
-        if cell > EMOJI_ATLAS_WIDTH {
-            return None;
-        }
-        let bi = bucket_index(bucket);
-        if let Some(pos) = self.free[bi].pop() {
-            return Some(pos);
-        }
-        // Open a fresh shelf if there's vertical room, filling its free list.
-        if self.next_y + cell <= self.max_height {
-            let y = self.next_y;
-            let cols = EMOJI_ATLAS_WIDTH / cell;
-            for i in 0..cols {
-                self.free[bi].push((i * cell, y));
-            }
-            self.next_y += cell;
-            if self.next_y > self.height {
-                self.height = self.next_y;
-                self.pixels
-                    .resize((EMOJI_ATLAS_WIDTH * self.height * 4) as usize, 0);
-            }
-            return self.free[bi].pop();
-        }
-        // Atlas full: recycle the least-recently-used cell of this bucket that isn't
-        // part of the current frame's working set.
-        if let Some(pos) = self.evict_lru(bucket) {
-            return Some(pos);
-        }
-        // Everything in this bucket is needed this frame — a genuine over-budget frame.
-        crate::work::count!(emoji_drops, 1);
-        self.dropped = self.dropped.wrapping_add(1);
-        if !self.warned {
-            self.warned = true;
-            log::warn!(
-                "emoji atlas full at {bucket}px (cap {} rows): working set exceeds budget, \
-                 dropping glyphs; raise the atlas max height for more headroom",
-                self.max_height
-            );
-        }
-        None
-    }
-
-    /// Evict the LRU occupied cell of `bucket` not drawn this frame; returns its origin
-    /// (now free for reuse). Bumps [`epoch`](Self::epoch) so baked-UV holders refresh.
-    // A linear scan over occupied cells; eviction only runs once the atlas is full, and
-    // cell count is bounded by the cap, so this stays cheap. Swap for a per-bucket LRU
-    // list if profiling ever shows it hot.
-    fn evict_lru(&mut self, bucket: u32) -> Option<(u32, u32)> {
-        let frame = self.frame;
-        let victim = self
-            .cells
-            .iter()
-            .filter(|(_, occ)| occ.size == bucket && occ.last_used != frame)
-            .min_by_key(|(_, occ)| occ.last_used)
-            .map(|(&pos, _)| pos)?;
-        crate::work::count!(emoji_evictions, 1);
-        let occ = self.cells.remove(&victim).unwrap();
-        self.slots.remove(&occ.key);
-        self.epoch = self.epoch.wrapping_add(1);
-        Some(victim)
-    }
-
-    /// Copy a `size`×`size` premultiplied-RGBA image to cell origin `(x, y)` and mark
-    /// those rows dirty for the next GPU upload.
-    fn write_cell(&mut self, x: u32, y: u32, size: u32, rgba: &[u8]) {
-        let row_bytes = (size * 4) as usize;
-        for row in 0..size {
-            let src = (row * size * 4) as usize;
-            let dst = (((y + row) * EMOJI_ATLAS_WIDTH + x) * 4) as usize;
-            self.pixels[dst..dst + row_bytes].copy_from_slice(&rgba[src..src + row_bytes]);
-        }
-        let (lo, hi) = self.dirty.get().unwrap_or((y, y + size));
-        self.dirty.set(Some((lo.min(y), hi.max(y + size))));
-    }
+/// Cache-owned residency is byte-bounded. Batches may keep evicted pages alive,
+/// just as they own their vertex buffers; this cannot prevent cache eviction.
+/// Each page holds at most 16 glyphs, bounding sparse-retention amplification.
+pub(crate) struct EmojiCache {
+    slots: HashMap<GlyphKey, Option<Cell>>,
+    pages: Vec<Option<Page>>,
+    free: Vec<usize>,
+    open: [Option<usize>; 4],
+    resident_bytes: usize,
+    budget: usize,
+    clock: u64,
+    failures: usize,
+    dropped: u64,
 }
 
 impl Default for EmojiCache {
     fn default() -> Self {
-        Self::new()
+        Self {
+            slots: HashMap::new(), pages: Vec::new(), free: Vec::new(), open: [None; 4],
+            resident_bytes: 0, budget: CACHE_BYTES, clock: 0, failures: 0, dropped: 0,
+        }
+    }
+}
+
+impl EmojiCache {
+    pub fn clear(&mut self) {
+        let budget = self.budget;
+        *self = Self::default();
+        self.budget = budget;
+    }
+
+    /// Largest cache-resident page; no pages means (0, 0).
+    pub fn size(&self) -> (u32, u32) {
+        let side = self.pages.iter().flatten().map(|p| p.gpu.side).max().unwrap_or(0);
+        (side, side)
+    }
+
+    pub fn usage(&self) -> (usize, usize) {
+        (self.pages.len() - self.free.len(), self.resident_bytes)
+    }
+
+    pub fn dropped_glyphs(&self) -> u64 { self.dropped }
+
+    pub fn get_or_insert(
+        &mut self, face: &RustyFace, face_id: u16, glyph_id: u32, bucket: u32,
+        device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout,
+    ) -> Option<EmojiSlot> {
+        let key = (face_id, glyph_id, bucket);
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(&cached) = self.slots.get(&key) {
+            crate::work::count!(emoji_hits, 1);
+            let cell = cached?;
+            let page = self.pages[cell.page].as_mut().expect("resident cell");
+            page.last_used = self.clock;
+            return Some(page.slot(cell.index));
+        }
+        crate::work::count!(emoji_rasterizations, 1);
+        let columns = (device.limits().max_texture_dimension_2d / (bucket + ATLAS_PAD)).min(4);
+        let rgba = (columns > 0).then(|| rasterize(face, glyph_id as u16, bucket)).flatten();
+        let Some(rgba) = rgba else {
+            // Only permanent raster/device incompatibility is negatively cached.
+            // Cache pressure never drops a glyph or records a failed placement.
+            if self.failures == MAX_FAILURES {
+                self.slots.retain(|_, slot| slot.is_some());
+                self.failures = 0;
+            }
+            self.slots.insert(key, None);
+            self.failures += 1;
+            if self.dropped == 0 {
+                log::warn!("color glyph rasterization failed; inspect Diagnostics::dropped_glyphs");
+            }
+            self.dropped += 1;
+            crate::work::count!(emoji_drops, 1);
+            return None;
+        };
+        let bi = bucket_index(bucket);
+        let page_index = if let Some(index) = self.open[bi] {
+            index
+        } else {
+            let side = columns * (bucket + ATLAS_PAD);
+            let bytes = (side as usize).pow(2) * 4;
+            // Normal pages are smaller than the budget. A deliberately tiny
+            // internal test budget still permits one page, never drops ink.
+            while self.resident_bytes + bytes > self.budget.max(bytes) {
+                let victim = self.pages.iter().enumerate()
+                    .filter_map(|(i, p)| p.as_ref().map(|p| (i, p.last_used)))
+                    .min_by_key(|&(_, age)| age).expect("resident victim").0;
+                self.evict(victim);
+            }
+            let index = self.free.pop().unwrap_or_else(|| {
+                self.pages.push(None);
+                self.pages.len() - 1
+            });
+            self.pages[index] = Some(Page {
+                gpu: Arc::new(EmojiPage::new(device, layout, side)), bucket, columns,
+                keys: Vec::new(), last_used: self.clock,
+            });
+            self.resident_bytes += bytes;
+            self.open[bi] = Some(index);
+            index
+        };
+        let page = self.pages[page_index].as_mut().expect("open page");
+        page.last_used = self.clock;
+        let cell = Cell { page: page_index, index: page.keys.len() as u32 };
+        page.keys.push(key);
+        if page.keys.len() == (page.columns * page.columns) as usize {
+            self.open[bi] = None;
+        }
+        let slot = page.slot(cell.index);
+        slot.page.upload(queue, slot.x, slot.y, bucket, &rgba);
+        self.slots.insert(key, Some(cell));
+        Some(slot)
+    }
+
+    fn evict(&mut self, index: usize) {
+        let page = self.pages[index].take().expect("resident page");
+        crate::work::count!(emoji_evictions, page.keys.len());
+        self.resident_bytes -= page.bytes();
+        for key in page.keys { self.slots.remove(&key); }
+        let open = &mut self.open[bucket_index(page.bucket)];
+        if *open == Some(index) { *open = None; }
+        self.free.push(index);
     }
 }
 
@@ -737,101 +623,4 @@ mod tests {
         assert_eq!(rgba, [10, 20, 30, 128]);
     }
 
-    /// Place-or-touch a synthetic glyph without a font, mirroring `get_or_insert`'s
-    /// bookkeeping (the hit path bumps recency; the miss path allocates a cell).
-    fn put(cache: &mut EmojiCache, glyph: u32, bucket: u32) -> Option<EmojiSlot> {
-        let key = (0u16, glyph, bucket);
-        if let Some(&cached) = cache.slots.get(&key) {
-            if let Some(slot) = cached {
-                if let Some(occ) = cache.cells.get_mut(&(slot.x, slot.y)) {
-                    occ.last_used = cache.frame;
-                }
-            }
-            return cached;
-        }
-        let rgba = vec![255u8; (bucket * bucket * 4) as usize];
-        let slot = cache.place(key, bucket, &rgba);
-        cache.slots.insert(key, slot);
-        cache.revision = cache.revision.wrapping_add(1);
-        slot
-    }
-
-    /// One shelf of the 256px bucket (`2048 / 258 = 7` cells) — the smallest atlas
-    /// that still packs multiple cells, so eviction is easy to force.
-    fn one_shelf() -> EmojiCache {
-        let mut c = EmojiCache::new();
-        c.set_max_height(256 + ATLAS_PAD); // caps at a single 256px shelf
-        c
-    }
-
-    /// Filling past capacity across frames recycles cells: height stays bounded, the
-    /// epoch bumps once per eviction, and nothing is dropped.
-    #[test]
-    fn eviction_recycles_cells_and_stays_bounded() {
-        let mut c = one_shelf();
-        for g in 0..7 {
-            assert!(put(&mut c, g, 256).is_some());
-        }
-        assert_eq!(c.size().1, 256 + ATLAS_PAD, "one shelf allocated");
-        assert_eq!(c.epoch(), 0, "no eviction while filling the first shelf");
-
-        c.begin_frame();
-        let reused = put(&mut c, 100, 256).expect("8th glyph recycles a cell");
-        assert_eq!(
-            c.size().1,
-            256 + ATLAS_PAD,
-            "atlas did not grow past its cap"
-        );
-        assert_eq!(c.epoch(), 1, "exactly one cell recycled");
-        assert_eq!(c.dropped_glyphs(), 0);
-        // The recycled cell's rows are dirty so the GPU re-uploads them.
-        let d = c.take_dirty().expect("recycled cell marked dirty");
-        assert!(d.0 <= reused.y && reused.y + reused.size <= d.1);
-    }
-
-    /// Eviction picks the least-recently-used cell of the bucket, not an arbitrary one.
-    #[test]
-    fn eviction_is_least_recently_used() {
-        let mut c = one_shelf();
-        for g in 0..7 {
-            c.begin_frame();
-            put(&mut c, g, 256); // glyph g's recency strictly increases with g
-        }
-        c.begin_frame();
-        put(&mut c, 3, 256); // touch glyph 3 -> now most-recently-used
-
-        c.begin_frame();
-        put(&mut c, 50, 256).expect("insert recycles a cell");
-        assert!(!c.slots.contains_key(&(0, 0, 256)), "LRU glyph 0 evicted");
-        assert!(
-            c.slots.contains_key(&(0, 3, 256)),
-            "touched glyph 3 survives"
-        );
-        assert!(c.slots.contains_key(&(0, 50, 256)), "new glyph is present");
-    }
-
-    /// When a single frame's working set exceeds a bucket's capacity, the overflow is
-    /// dropped (and counted) rather than silently corrupting an in-use cell.
-    #[test]
-    fn over_budget_frame_drops_and_counts() {
-        let mut c = one_shelf();
-        for g in 0..7 {
-            assert!(put(&mut c, g, 256).is_some());
-        }
-        // No begin_frame: all seven cells belong to the current frame, so none can be
-        // evicted. The eighth glyph is dropped.
-        assert!(put(&mut c, 99, 256).is_none());
-        assert_eq!(c.dropped_glyphs(), 1);
-    }
-
-    /// Distinct buckets allocate independently and never collide.
-    #[test]
-    fn buckets_are_independent() {
-        let mut c = EmojiCache::new();
-        let a = put(&mut c, 1, 32).unwrap();
-        let b = put(&mut c, 1, 64).unwrap();
-        assert_eq!(a.size, 32);
-        assert_eq!(b.size, 64);
-        assert_ne!((a.x, a.y), (b.x, b.y));
-    }
 }

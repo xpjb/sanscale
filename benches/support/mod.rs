@@ -177,13 +177,13 @@ impl Fonts {
             .iter()
             .map(|f| text.map_font(f.bytes.clone(), 0).unwrap())
             .collect();
-        let normal = text.register_chain(&[fonts[0], fonts[2], fonts[4], fonts[3]]);
-        let italic = text.register_chain(&[fonts[1], fonts[2], fonts[4], fonts[3]]);
-        let duplicate = text.register_chain(&[fonts[0], fonts[2], fonts[4], fonts[3]]);
-        let cjk = text.register_chain(&[fonts[2]]);
+        let normal = text.register_chain(&[fonts[0], fonts[2], fonts[4], fonts[3]]).expect("font chain capacity");
+        let italic = text.register_chain(&[fonts[1], fonts[2], fonts[4], fonts[3]]).expect("font chain capacity");
+        let duplicate = text.register_chain(&[fonts[0], fonts[2], fonts[4], fonts[3]]).expect("font chain capacity");
+        let cjk = text.register_chain(&[fonts[2]]).expect("font chain capacity");
         let mut long = vec![fonts[0]; 16];
         long.extend([fonts[2], fonts[4], fonts[3]]);
-        let long_fallback = text.register_chain(&long);
+        let long_fallback = text.register_chain(&long).expect("font chain capacity");
         (
             text,
             Chains {

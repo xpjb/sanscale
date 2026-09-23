@@ -1,7 +1,7 @@
 //! Vertex format and quad generation for text rendering.
 //!
 //! `pos` is in the **transform's source space** — window pixels under `pixel_ortho`, world
-//! units under an MVP — because `place` bakes the caller's `at`/`size` into it. (It said
+//! units under an MVP — because `place_text` bakes the caller's `at`/`size` into it. (It said
 //! "window pixels" while only one consumer existed; that is a property of what compendium
 //! passed, not of this format.) `loc_em` stays in glyph-local em coordinates for the Slug
 //! fragment shader (curve atlas is em-space). Y matches the old `scale(_, -font_size, _)`
@@ -15,7 +15,7 @@ use crate::cache::GlyphInfo;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct TextVertex {
-    /// Position in the transform's source space (see module docs) — `place`
+    /// Position in the transform's source space (see module docs) — `place_text`
     /// bakes the caller's `at`/`size` in.
     pub pos: [f32; 2],
     /// Packed glyph metadata: band start and band max.

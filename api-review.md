@@ -2,11 +2,21 @@
 
 Reviewed 2026-09-24 at **`e5c9b03ca07add3418acb4e19bc6168f3c04475a`**.
 Scope: all 34 public types/traits/aliases, 61 free/inherent functions, public
-fields, variants, and trait contracts in [the inventory](public-api.md), checked
+fields, variants, and trait contracts in [the reviewed inventory](https://github.com/xpjb/sanscale/blob/712ab2f/public-api.md), checked
 against implementation, examples, and Compendium usage. Runtime probes target
 composition and lifetime boundaries; this is not a proof of every rendering case.
 
-## Verdict
+## Resolution
+
+The eight reproduced contracts and proposed surface cleanup are now implemented.
+See the [locked follow-up](decisions.md#api-review-follow-up--owned-gpu-snapshots-and-explicit-carets-locked)
+and [current regression tests](tests/api_contracts.rs). The README includes the
+[migration and editor integration guide](README.md#editor-integration).
+The original report below is historical, not the current release verdict. Its
+source links are frozen to the reviewed revision; the standalone probe still
+intentionally reproduces the old failures, rather than testing the new API.
+
+## Original verdict
 
 **Keep the architecture; do not publish this revision unchanged.** The main
 problem is contracts the implementation does not uphold, not excessive type
@@ -22,8 +32,8 @@ changed by this review.
 
 ### 1. Per-pass transforms overwrite earlier queued passes
 
-[`set_transform`](src/text.rs#L1404-L1414) says to call once per pass, but
-[`write_matrix`](src/renderer.rs#L388-L392) writes into one persistent uniform
+[`set_transform`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L1404-L1414) says to call once per pass, but
+[`write_matrix`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/renderer.rs#L388-L392) writes into one persistent uniform
 buffer per pipeline. Queue writes execute before the next submission, not at the
 position of the setter in recorded commands.
 
@@ -39,10 +49,10 @@ per-pass contract.
 
 ### 2. Changing target format destroys atlas validity without invalidating batches
 
-[`set_target`](src/text.rs#L1397-L1402) promises pipelines cached per format.
-[`ensure_gpu`](src/text.rs#L1794-L1815) actually replaces the entire GPU state,
+[`set_target`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L1397-L1402) promises pipelines cached per format.
+[`ensure_gpu`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L1794-L1815) actually replaces the entire GPU state,
 including both atlases, when the format changes.
-[`batch_live`](src/text.rs#L1673-L1683) knows nothing about that replacement.
+[`batch_live`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L1673-L1683) knows nothing about that replacement.
 
 **Reproduced:** prepare visible text for `Rgba8Unorm`, switch to `Bgra8Unorm`, set
 the transform again, and draw the retained batch. `batch_live` is **true**, but
@@ -56,8 +66,8 @@ match the actual policy.
 
 ### 3. Batching reverses overlap order across monochrome text and emoji
 
-[`prepare`](src/text.rs#L1487-L1492) promises input order is preserved.
-[`draw_segment`](src/text.rs#L1625-L1650) instead draws all monochrome vertices
+[`prepare`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L1487-L1492) promises input order is preserved.
+[`draw_segment`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L1625-L1650) instead draws all monochrome vertices
 before all emoji vertices within an equal-clip segment. Its own documentation
 states the opposite policy: text always below emoji.
 
@@ -71,11 +81,11 @@ input-order guarantee should win over grouping everything by shader kind.
 
 ### 4. Emoji eviction cannot progress through the public service
 
-[`EmojiCache::begin_frame`](src/emoji.rs#L154-L159) is never called by
+[`EmojiCache::begin_frame`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/emoji.rs#L154-L159) is never called by
 `TextService`. Every cell keeps frame zero, and
-[`evict_lru`](src/emoji.rs#L272-L284) excludes cells used in the current frame.
+[`evict_lru`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/emoji.rs#L272-L284) excludes cells used in the current frame.
 Thus nothing becomes an eviction candidate. Allocation failures are also cached
-as `None` by [`get_or_insert`](src/emoji.rs#L194-L206).
+as `None` by [`get_or_insert`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/emoji.rs#L194-L206).
 
 **Reproduced:** display one different 256px emoji per separately submitted,
 completed frame, dropping each previous batch. At frame 218, the 8,192-row atlas
@@ -94,9 +104,9 @@ so it can be retried.
 
 ### 5. Caret re-anchoring can return a caret outside its reported line
 
-[`clamp_caret`](src/text.rs#L543-L557) falls back to `line_for_byte`, bypassing
-the hard-break correction in [`caret_at`](src/text.rs#L564-L578).
-The byte-only [`caret_rect`](src/text.rs#L488-L490) has the same discrepancy.
+[`clamp_caret`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L543-L557) falls back to `line_for_byte`, bypassing
+the hard-break correction in [`caret_at`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L564-L578).
+The byte-only [`caret_rect`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L488-L490) has the same discrepancy.
 
 **Reproduced with real shaping:** wrap `"ab\ncd"` at 0.7em, place the caret at
 byte 2 on visual line 1, then widen to an unwrapped layout. `clamp_caret` keeps
@@ -111,7 +121,7 @@ back through a contradictory byte-only path.
 
 ### 6. Chain registration silently aliases another live chain at capacity
 
-[`register_chain`](src/text.rs#L1163-L1174) casts an unbounded slot index to
+[`register_chain`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L1163-L1174) casts an unbounded slot index to
 `u16`, without a capacity check or an error return.
 
 **Reproduced:** register 65,536 live Sans chains, then one Mono chain. The new
@@ -134,7 +144,7 @@ recreated after `clear`, and that all resource handles are service-local.
 
 ### 7. Re-prepare alone does not recover an evicted block
 
-The [recovery instruction](src/text.rs#L1662-L1672), also repeated in the README,
+The [recovery instruction](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L1662-L1672), also repeated in the README,
 says to re-prepare when `batch_live` is false. That works for a reshaped live
 handle, but not for an evicted handle.
 
@@ -150,7 +160,7 @@ ownership or auto-rebuild inside `draw_prepared` to make this usable.
 
 ### 8. Pixel-scale changes bypass the retained emoji refresh path
 
-[`set_pixel_scale`](src/text.rs#L1416-L1428) tells callers to update it alongside
+[`set_pixel_scale`](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/text.rs#L1416-L1428) tells callers to update it alongside
 the transform to avoid blurry emoji. Bucket comparison happens in `prepare`,
 not `batch_live`. Unchanged world-space draws therefore retain their old bitmap
 resolution even when following the documented retained-batch check.
@@ -173,7 +183,7 @@ setter plus the current liveness check performs that refresh.
 | `register_chain` | Make allocation fallible/capacity-safe; settle stale-handle semantics. | Finding 6; do not freeze an infallible bounded-resource API accidentally. |
 | Caret geometry | Prefer `caret_rect(Caret)` as the canonical query. Retire the overlapping byte/hint entry points where caller migration permits. | `hit_test` and motion already return `Caret`; consumers currently dismantle it into `Some(line), byte`. Finding 5 shows the cost of parallel rules. |
 | `caret_position` | Remove this redundant projection if simplifying the caret surface. | It is just the x/y of `caret_rect`; no example or Compendium caller needs it. |
-| `FontMetrics` export | Remove the public re-export; keep the implementation type internal. | Its only library producer is the private `Font::metrics`; no public service method exposes it. See [the export](src/lib.rs#L132) and [producer](src/font.rs#L85). Do not add an accessor merely to justify the orphaned export. |
+| `FontMetrics` export | Remove the public re-export; keep the implementation type internal. | Its only library producer is the private `Font::metrics`; no public service method exposes it. See [the export](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/lib.rs#L132) and [producer](https://github.com/xpjb/sanscale/blob/e5c9b03ca07add3418acb4e19bc6168f3c04475a/src/font.rs#L85). Do not add an accessor merely to justify the orphaned export. |
 | Single-item `draw` | Consider taking one `Draw` instead of duplicating its fields positionally. | The current convenience cannot carry `paint`, unlike `prepare`/`draw_batch`. Same vocabulary, no new type or rendering path. Optional; the existing batch route already supports paint. |
 
 The last proposal deliberately revisits the earlier choice to leave plain

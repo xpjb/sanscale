@@ -8,16 +8,6 @@ what's owed.
 
 ---
 
-## Pre-0.1 API review — open findings
-
-[The API review](api-review.md) records verified composition/lifetime failures,
-retention-recovery gaps, and proposed surface cuts against `e5c9b03`. Resolve the
-release-blocking contracts before publication. Recommendations are not yet locked
-design decisions; the review changed no library API. Its standalone reproducer is
-pinned to that baseline rather than the changing checkout.
-
----
-
 ## `chain_view` allocates a `Vec` on every call
 
 `TextService::chain_view` doesn't borrow the chain — it builds a fresh

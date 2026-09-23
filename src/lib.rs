@@ -3,7 +3,7 @@
 //! band tables, and coverage is computed analytically in the fragment shader.
 //! Monochrome text has no glyph bitmap and no hinting, so it is exact at any
 //! scale — zoom is free, and rotated or perspective text is as sharp as upright
-//! text. Color emoji use a separate raster atlas.
+//! text. Color emoji use append-only raster pages.
 //!
 //! # The model
 //!
@@ -29,8 +29,10 @@
 //! For one named paragraph, pass a one-element key slice to [`TextService::shape`].
 //!
 //! [`TextService::clear`] invalidates old shaped handles and batches even after
-//! new layouts are allocated. It retains GPU allocations and the transform, but
-//! resets upload state so the next `prepare` uploads the new atlas contents.
+//! new layouts are allocated. Pipelines, transform and monochrome atlas
+//! allocations stay; replacement contents upload on the next prepare. Emoji
+//! cache ownership is released; batches may still own its old immutable pages.
+//! Recreate fonts/chains/paint and re-shape after clearing.
 //!
 //! Shaping is em-space and carries no pixel size and no color, so the cache is
 //! zoom-invariant. Size and color enter once, at draw time.
@@ -58,7 +60,18 @@
 //!
 //! Re-prepare when draw inputs (including paint) change. [`TextService::drop_paint`]
 //! releases a snapshot but not colors already baked into retained batches;
-//! [`TextService::batch_live`] still tracks layout/atlas changes, not caller inputs.
+//! [`TextService::batch_live`] tracks layout validity and requested emoji buckets,
+//! not caller draw inputs. On false, re-issue shaping to refresh possibly evicted
+//! handles, then prepare. Eviction of an emoji page cannot corrupt a retained
+//! batch: the batch owns the page. Cache-owned pages are limited to 64 MiB;
+//! retained batches/recorded commands can own additional pages.
+//!
+//! [`TextService::set_target`] caches pipelines per format without resetting
+//! atlases. [`TextService::set_transform`] takes only a matrix, works before GPU
+//! initialization, and preserves earlier recorded matrices across one submit.
+//! Targets are single-sample, without depth testing. Flow is currently LTR;
+//! bidirectional paragraph ordering is not implemented, and IME composition is
+//! an application concern.
 //!
 //! # What this crate does not own
 //!
@@ -80,7 +93,7 @@
 //!
 //! let mut text = TextService::new();
 //! let font = text.map_font(sanscale::read_font_file("font.ttf")?, 0)?;
-//! let chain = text.register_chain(&[font]);
+//! let chain = text.register_chain(&[font])?;
 //!
 //! let style = Style { chain, wrap_em: Some(20.0), align: Align::Left, line_spacing: 1.2 };
 //! let key = ParagraphKey { namespace: 0, slot: 0, generation: 0 };
@@ -94,7 +107,7 @@
 //! ```
 //!
 //! Nothing above touches a GPU. [`TextService::prepare`] (and the `draw*` sugar
-//! over it) is the only path that does.
+//! over it), target selection and transform setup are the GPU-facing operations.
 //!
 //! # Performance investigations
 //!
@@ -129,7 +142,7 @@ mod work;
 #[cfg(feature = "perf-counters")]
 pub mod profiling;
 
-pub use font::{FontMetrics, read_font_file};
+pub use font::read_font_file;
 
 pub use text::{
     Align, Batch, BlockKey, Boundaries, Caret, CaretRect, CaretStop, Color, Diagnostics, Draw,

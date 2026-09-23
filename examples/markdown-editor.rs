@@ -321,7 +321,7 @@ impl Editor {
     /// Keep the caret inside the viewport after motion or edits.
     fn scroll_caret_into_view(&mut self, layout: &Layout, view_h: f32) {
         let caret = layout.clamp_caret(self.caret);
-        let rect = layout.caret_rect_on_line(Some(caret.line_index), caret.byte_index);
+        let rect = layout.caret_rect(caret);
         let top = MARGIN + rect.y_em * self.font_px - self.scroll_y;
         let height = (rect.height_em.max(1.0)) * self.font_px;
         if top < MARGIN {
@@ -716,7 +716,7 @@ fn render_frame(
     if caret_visible {
         let c = text
             .measure(handle)
-            .caret_rect_on_line(Some(placed.line_index), placed.byte_index);
+            .caret_rect(placed);
         let width = if editor.caret_block {
             editor.font_px * 0.6
         } else {
@@ -1408,10 +1408,7 @@ impl Gfx {
         let screen = Vec2::new(self.config.width as f32, self.config.height as f32);
 
         self.text.set_target(&self.device, self.config.format);
-        self.text.set_transform(
-            &self.queue,
-            TextService::pixel_ortho(self.config.width, self.config.height),
-        );
+        self.text.set_transform(TextService::pixel_ortho(self.config.width, self.config.height));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {

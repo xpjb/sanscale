@@ -105,7 +105,7 @@ pub fn font_chain(text: &mut TextService, families: &[&str]) -> FontChainHandle 
             }
         }
     }
-    text.register_chain(&handles)
+    text.register_chain(&handles).expect("font chain capacity")
 }
 
 /// A headless GPU device plus the offscreen surface config the renderer needs.
@@ -168,10 +168,7 @@ impl Harness {
     ) {
         let (target, view) = self.offscreen();
         text.set_target(&self.device, self.config.format);
-        text.set_transform(
-            &self.queue,
-            TextService::pixel_ortho(self.config.width, self.config.height),
-        );
+        text.set_transform(TextService::pixel_ortho(self.config.width, self.config.height));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {

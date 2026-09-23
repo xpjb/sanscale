@@ -1097,7 +1097,8 @@ mod tests {
             let id = t.rows[1].cells[1].id;
             let c = &view.texts[&id];
             let at = scene.placed.iter().find(|p| p.0 == id).unwrap().1;
-            let caret = text.measure(c.handle).caret_rect(0);
+            let layout = text.measure(c.handle);
+            let caret = layout.caret_rect(layout.caret_at(0));
             let point = Vec2::new(
                 at.x + caret.x_em * c.size,
                 at.y + (caret.y_em + caret.height_em * 0.5) * c.size,
