@@ -122,7 +122,11 @@ let rect = layout.caret_rect(caret);
 Removing byte-only geometry helpers makes affinity explicit; it does not make
 missing keybindings a compile error. Test navigation, selection extension, word
 boundaries, hard/soft wraps and preferred-column recovery in the consuming editor.
-See `examples/editor.rs` for a complete input adapter.
+Caret stops currently follow shaping clusters: a ligature such as `fi` may have
+no interior stop. For one-grapheme Backspace/Delete, use Unicode grapheme boundaries
+in your text model rather than treating glyph-caret steps as deletion units.
+`examples/editor.rs` is a working input adapter, but currently deletes whole
+clusters. Finer ligature/post-edit positioning is a [deferred follow-up](backlog.md#editor-integration-intra-ligature-caret-positions).
 
 ### Migrating from the reviewed prerelease (`e5c9b03`)
 
