@@ -43,6 +43,9 @@ measurements use em units. You can also supply a world-space transform.
 
 ## API
 
+[Full public declarations](public-api.md) — generated type definitions and signatures,
+including the optional profiling surface.
+
 - **Fonts:** map shared font bytes and register ordered fallback chains. Font
   discovery is yours; [`fontdb`](https://crates.io/crates/fontdb) works for
   system fonts.

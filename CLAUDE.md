@@ -12,6 +12,7 @@ The doc set, and what each one has to stay true to:
 | file | tracks | goes stale when |
 |---|---|---|
 | `README.md` | the public surface as a consumer meets it | a type is renamed or a module added/removed — Quick start, the pipeline diagram *and* the module table each name real identifiers |
+| `public-api.md` | generated declaration inventory for API review | public declarations change — regenerate using the commands in its header; never hand-edit the snapshot |
 | `src/lib.rs` | the crate-level model + the one doctest | the surface moves, or a dependency's major version bumps (`Compatibility`) |
 | `decisions.md` | the **record**: what the design is and why, appends over rewrites. The current surface lives in rustdoc, not here | a decision is overtaken by what got built — append what changed and why, never edit history to look right |
 | `backlog.md` | what's owed, and why it's parked | an item is picked up, or its stated reason stops holding |
