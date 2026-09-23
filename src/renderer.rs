@@ -28,7 +28,7 @@ pub struct TextAtlas {
     band_capacity_height: u32,
     uploaded_curve_len: usize,
     uploaded_band_len: usize,
-    synced_revision: u64,
+    synced_revision: Option<u64>,
 }
 
 impl TextAtlas {
@@ -47,9 +47,16 @@ impl TextAtlas {
             band_capacity_height: 1,
             uploaded_curve_len: 0,
             uploaded_band_len: 0,
-            // Forces the first sync to run, whatever the cache's revision is.
-            synced_revision: u64::MAX,
+            synced_revision: None,
         }
+    }
+
+    /// Retain texture allocations, but forget the uploaded prefix. A replacement
+    /// CPU cache may reuse both revision numbers and texel addresses.
+    pub(crate) fn invalidate_contents(&mut self) {
+        self.synced_revision = None;
+        self.uploaded_curve_len = 0;
+        self.uploaded_band_len = 0;
     }
 
     pub(crate) fn sync(
@@ -59,7 +66,7 @@ impl TextAtlas {
         layout: &wgpu::BindGroupLayout,
         cache: &GlyphCache,
     ) {
-        if self.synced_revision == cache.revision() {
+        if self.synced_revision == Some(cache.revision()) {
             return;
         }
 
@@ -112,7 +119,7 @@ impl TextAtlas {
             self.uploaded_band_len = cache.band_data().len();
         }
 
-        self.synced_revision = cache.revision();
+        self.synced_revision = Some(cache.revision());
     }
 
     fn upload_full(&mut self, queue: &wgpu::Queue, cache: &GlyphCache) {
@@ -522,7 +529,7 @@ pub struct EmojiAtlas {
     bind_group: wgpu::BindGroup,
     width: u32,
     capacity_height: u32,
-    synced_revision: u64,
+    synced_revision: Option<u64>,
 }
 
 impl EmojiAtlas {
@@ -541,8 +548,12 @@ impl EmojiAtlas {
             bind_group,
             width,
             capacity_height: 1,
-            synced_revision: u64::MAX,
+            synced_revision: None,
         }
+    }
+
+    pub(crate) fn invalidate_contents(&mut self) {
+        self.synced_revision = None;
     }
 
     pub(crate) fn sync(
@@ -552,12 +563,13 @@ impl EmojiAtlas {
         layout: &wgpu::BindGroupLayout,
         cache: &EmojiCache,
     ) {
-        if self.synced_revision == cache.revision() {
+        if self.synced_revision == Some(cache.revision()) {
             return;
         }
         let width = cache.size().0;
         let real_height = data_height(cache, width);
-        if width != self.width || real_height > self.capacity_height {
+        let recreate = width != self.width || real_height > self.capacity_height;
+        if recreate {
             // Growth phase: reallocate the texture and re-upload everything. Height is
             // capped by the cache, so `capacity_height` cannot exceed the device limit.
             self.width = width;
@@ -568,6 +580,10 @@ impl EmojiAtlas {
             self.texture = texture;
             self.sampler = sampler;
             self.bind_group = bind_group;
+        }
+        if recreate || self.synced_revision.is_none() {
+            // On reset the old allocation is usable, but none of its contents
+            // are. Full-upload the new populated rows, not the whole capacity.
             upload_emoji_rows(queue, &self.texture, width, 0, real_height, cache.pixels());
             cache.take_dirty();
         } else if let Some((from_row, to_row)) = cache.take_dirty() {
@@ -582,7 +598,7 @@ impl EmojiAtlas {
                 cache.pixels(),
             );
         }
-        self.synced_revision = cache.revision();
+        self.synced_revision = Some(cache.revision());
     }
 }
 

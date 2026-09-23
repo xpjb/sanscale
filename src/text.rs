@@ -179,6 +179,10 @@ impl ShapedHandle {
 /// `namespace` keeps two documents' pool slots from colliding in the shared
 /// cache. It stays a separate field rather than being hashed into `slot` because
 /// a collision here renders the *wrong text*, silently and persistently.
+/// These fields impose no allocation scheme: a globally unique consumer handle
+/// may be split losslessly across namespace/slot. All namespace values are usable.
+/// Allocation identity alone is not an edit version; text/font-span changes must
+/// change the full key. The service keeps this key separate from transient text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ParagraphKey {
     pub namespace: u64,
@@ -904,10 +908,25 @@ struct BlockSlot {
     revision: u64,
 }
 
+// Consumer identities and content keys are disjoint domains. Keep the full
+// keys: HashMap resolves hash collisions by equality, not by trusting a digest
+// as identity. Only the identity-free path retains text as cache-key material.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum BlockIdentity {
+    Named(BlockKey),
+    Transient(Arc<str>, Style),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ParagraphIdentity {
+    Named(ParagraphKey),
+    Transient(Arc<str>),
+}
+
 struct Block {
-    key: BlockKey,
+    key: BlockIdentity,
     style: Style,
-    parts: Vec<ParagraphKey>,
+    parts: Vec<ParagraphIdentity>,
     // Retained independently of paragraph-cache residency for drop_chain.
     span_chains: Box<[FontChainHandle]>,
     layout: Layout,
@@ -1087,9 +1106,9 @@ pub struct TextService {
     /// a frame that shapes thousands of small blocks. Slots are never moved, so
     /// live handles stay valid.
     free_blocks: Vec<u32>,
-    block_lookup: HashMap<BlockKey, ShapedHandle>,
-    shaped: HashMap<(ParagraphKey, FontChainHandle), ParaShape>,
-    paragraphs: HashMap<(ParagraphKey, Style), ParaLayout>,
+    block_lookup: HashMap<BlockIdentity, ShapedHandle>,
+    shaped: HashMap<(ParagraphIdentity, FontChainHandle), ParaShape>,
+    paragraphs: HashMap<(ParagraphIdentity, Style), ParaLayout>,
 
     paints: PaintPool,
     glyphs: GlyphCache,
@@ -1168,19 +1187,12 @@ impl TextService {
             .retain(|(_, style), para| style.chain != chain && !para.span_chains.contains(&chain));
         self.shaped
             .retain(|(_, base), para| *base != chain && !para.span_chains.contains(&chain));
-        for (index, slot) in self.blocks.iter_mut().enumerate() {
-            let stale = slot.block.as_ref().is_some_and(|block| {
+        for index in 0..self.blocks.len() {
+            let stale = self.blocks[index].block.as_ref().is_some_and(|block| {
                 block.style.chain == chain || block.span_chains.contains(&chain)
             });
             if stale {
-                if let Some(block) = slot.block.take() {
-                    self.block_lookup.remove(&block.key);
-                    // Tombstones must invalidate immediately, not only on slot
-                    // reuse: prepare and batch_live use the dense generation array.
-                    self.generations[index] = self.generations[index].wrapping_add(1);
-                    self.geometry[index] = None;
-                    self.free_blocks.push(index as u32);
-                }
+                self.remove_block(index);
             }
         }
     }
@@ -1201,21 +1213,27 @@ impl TextService {
         self.paints.drop(paint);
     }
 
-    /// Drop every font, chain, paint snapshot and cached layout. Atlas textures are retained —
-    /// they are sized, not populated, state.
+    /// Drop every font, chain, paint snapshot and cached layout. Old shaped
+    /// handles and batches remain stale after new layouts are allocated.
+    ///
+    /// GPU allocations and the transform are retained, not their content-validity
+    /// records: the next [`TextService::prepare`] uploads the new atlas contents.
+    /// Slot generation history is retained just as it is for ordinary eviction.
     pub fn clear(&mut self) {
         self.fonts.clear();
         self.chains.clear();
-        self.blocks.clear();
-        self.generations.clear();
-        self.geometry.clear();
-        self.free_blocks.clear();
-        self.block_lookup.clear();
+        for index in 0..self.blocks.len() {
+            self.remove_block(index);
+        }
         self.shaped.clear();
         self.paragraphs.clear();
         self.paints.clear();
         self.glyphs = GlyphCache::new();
-        self.emoji = EmojiCache::new();
+        self.emoji.clear();
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.text_atlas.invalidate_contents();
+            gpu.emoji_atlas.invalidate_contents();
+        }
     }
 
     // -- shaping (GPU-free) --------------------------------------------------
@@ -1241,18 +1259,36 @@ impl TextService {
         parts: &[ParagraphKey],
         source: &dyn ParagraphSource,
     ) -> Option<ShapedHandle> {
+        self.shape_block(
+            BlockIdentity::Named(block),
+            style,
+            parts.iter().copied().map(ParagraphIdentity::Named),
+            Some(source),
+        )
+    }
+
+    fn shape_block(
+        &mut self,
+        block: BlockIdentity,
+        style: &Style,
+        parts: impl Iterator<Item = ParagraphIdentity> + Clone,
+        source: Option<&dyn ParagraphSource>,
+    ) -> Option<ShapedHandle> {
         crate::work::count!(block_requests, 1);
         self.clock += 1;
-        if parts.is_empty() || self.chain_fonts(style.chain).is_none() {
-            return None;
-        }
+        self.chain_fonts(style.chain)?;
 
         // Unchanged parts at the same style: the block is already correct, so
         // this is a comparison rather than a reflow.
         if let Some(&handle) = self.block_lookup.get(&block) {
             if let Some(index) = self.block_index(handle) {
                 if let Some(existing) = self.blocks[index].block.as_mut() {
-                    if existing.style == *style && existing.parts == parts {
+                    // A transient block's full text and style already identify
+                    // its parts. Do not allocate paragraph keys on a warm hit.
+                    if existing.style == *style
+                        && (matches!(&block, BlockIdentity::Transient(..))
+                            || existing.parts.iter().cloned().eq(parts.clone()))
+                    {
                         crate::work::count!(block_hits, 1);
                         existing.last_used = self.clock;
                         return Some(handle);
@@ -1261,10 +1297,14 @@ impl TextService {
             }
         }
 
-        for (index, key) in parts.iter().enumerate() {
-            self.ensure_paragraph(*key, style, index, source)?;
+        let parts: Vec<_> = parts.collect();
+        if parts.is_empty() {
+            return None;
         }
-        let (layout, span_chains) = self.assemble(style, parts);
+        for (index, key) in parts.iter().enumerate() {
+            self.ensure_paragraph(key, style, index, source)?;
+        }
+        let (layout, span_chains) = self.assemble(style, &parts);
 
         // Reuse this block's own slot if it still holds one; otherwise take a
         // free slot and bump its generation so any handle to the old occupant
@@ -1288,9 +1328,9 @@ impl TextService {
             self.generations[index] = self.generations[index].wrapping_add(1);
         }
         self.blocks[index].block = Some(Block {
-            key: block,
+            key: block.clone(),
             style: *style,
-            parts: parts.to_vec(),
+            parts,
             span_chains,
             layout,
             last_used: self.clock,
@@ -1308,39 +1348,22 @@ impl TextService {
         Some(handle)
     }
 
-    /// One-paragraph convenience over [`TextService::shape`] — a title, a field.
-    pub fn shape_one(
-        &mut self,
-        key: ParagraphKey,
-        style: &Style,
-        source: &dyn ParagraphSource,
-    ) -> Option<ShapedHandle> {
-        let block = BlockKey(
-            key.namespace.rotate_left(17) ^ (u64::from(key.slot) << 32 | u64::from(key.generation)),
-        );
-        self.shape(block, style, &[key], source)
-    }
-
-    /// Shape text with no stable consumer identity — a tooltip, a transient
-    /// label, anything the consumer would otherwise have to invent a key for.
+    /// Shape text with no stable consumer identity — a tooltip or a label.
     ///
-    /// Content-keyed, so it still caches; it just cannot survive an edit the way
-    /// an identity can. Newlines split it into paragraphs, as everywhere else.
+    /// Cached by full text **and style**, so two requests with different wrapping
+    /// or fonts coexist. Unlike [`TextService::shape`], an edit names a different
+    /// block rather than updating one in place. Newlines split the text into
+    /// paragraphs; their content keys exclude width, preserving shaping reuse.
+    /// Text is copied into cache keys and retained while those entries are cached.
+    /// These keys cannot alias consumer-supplied block or paragraph identities.
     pub fn shape_transient(&mut self, text: &str, style: &Style) -> Option<ShapedHandle> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut hasher);
-        let content = hasher.finish();
-        let lines: Vec<&str> = text.split('\n').collect();
-        let parts: Vec<ParagraphKey> = (0..lines.len())
-            .map(|index| ParagraphKey {
-                // A reserved namespace, so a content key can never alias one of
-                // the consumer's document identities.
-                namespace: u64::MAX,
-                slot: (content as u32) ^ (index as u32),
-                generation: (content >> 32) as u32,
-            })
-            .collect();
-        self.shape(BlockKey(content), style, &parts, &Paragraphs(&lines))
+        self.shape_block(
+            BlockIdentity::Transient(Arc::from(text), *style),
+            style,
+            text.split('\n')
+                .map(|line| ParagraphIdentity::Transient(Arc::from(line))),
+            None,
+        )
     }
 
     /// Em-space geometry for a block. Borrow it for the length of the call and
@@ -1644,8 +1667,9 @@ impl TextService {
     /// place* — same key, same slot, same handle — so the consumer's draw
     /// list compares identical while the vertices it retained are of the old
     /// text. The service did the reshape; the service answers for it.
-    /// Drawing a stale batch is defined: old vertices and texels — stale
-    /// pixels, never UB.
+    /// Drawing a stale batch is memory-safe, but may sample repurposed atlas
+    /// contents after clear/eviction. Re-prepare on `false`; old pixels are not
+    /// a preserved snapshot.
     pub fn batch_live(&self, batch: &Batch) -> bool {
         epoch_live(batch.emoji_epoch, self.emoji.epoch())
             && batch.blocks.iter().all(|&(slot, generation, revision)| {
@@ -1806,27 +1830,34 @@ impl TextService {
     /// Shape and flow one paragraph if it isn't already cached at this style.
     fn ensure_paragraph(
         &mut self,
-        key: ParagraphKey,
+        key: &ParagraphIdentity,
         style: &Style,
         index: usize,
-        source: &dyn ParagraphSource,
+        source: Option<&dyn ParagraphSource>,
     ) -> Option<()> {
         crate::work::count!(paragraph_requests, 1);
         let clock = self.clock;
-        if let Some(entry) = self.paragraphs.get_mut(&(key, *style)) {
+        if let Some(entry) = self.paragraphs.get_mut(&(key.clone(), *style)) {
             crate::work::count!(paragraph_hits, 1);
             entry.last_used = clock;
-            if let Some(shaped) = self.shaped.get_mut(&(key, style.chain)) {
+            if let Some(shaped) = self.shaped.get_mut(&(key.clone(), style.chain)) {
                 shaped.last_used = clock;
             }
             return Some(());
         }
-        // The only place text is ever pulled from the consumer.
+        // Resolve bytes only on a paragraph miss. Named sources stay lazy;
+        // identity-free paragraphs already own their content as cache keys.
         crate::work::count!(source_reads, 1);
-        let text = source.paragraph_text(index, key)?;
+        let text = match key {
+            ParagraphIdentity::Named(key) => source?.paragraph_text(index, *key)?,
+            ParagraphIdentity::Transient(text) => Cow::Borrowed(text.as_ref()),
+        };
         crate::work::count!(source_bytes, text.len());
-        if !self.shaped.contains_key(&(key, style.chain)) {
-            let spans = source.paragraph_fonts(index, key);
+        if !self.shaped.contains_key(&(key.clone(), style.chain)) {
+            let spans = match key {
+                ParagraphIdentity::Named(key) => source?.paragraph_fonts(index, *key),
+                ParagraphIdentity::Transient(_) => Cow::Borrowed(&[][..]),
+            };
             if !valid_font_spans(&text, &spans) {
                 return None;
             }
@@ -1857,7 +1888,7 @@ impl TextService {
                 shape_spanned(&views, &resolved, &mut self.glyphs, text.as_ref())
             };
             self.shaped.insert(
-                (key, style.chain),
+                (key.clone(), style.chain),
                 ParaShape {
                     run,
                     span_chains: dependencies.into_boxed_slice(),
@@ -1865,11 +1896,11 @@ impl TextService {
                 },
             );
         }
-        let shaped = self.shaped.get_mut(&(key, style.chain))?;
+        let shaped = self.shaped.get_mut(&(key.clone(), style.chain))?;
         shaped.last_used = clock;
         let lines = flow_paragraph(text.as_ref(), &shaped.run.glyphs, style.max_width_em());
         self.paragraphs.insert(
-            (key, *style),
+            (key.clone(), *style),
             ParaLayout {
                 span_chains: shaped.span_chains.clone(),
                 lines,
@@ -1887,7 +1918,11 @@ impl TextService {
     /// Reuse paragraph shaping/flow, but copy all glyphs and carets into a new
     /// composed layout. A one-paragraph edit avoids reshaping the other paragraphs;
     /// assembly is still proportional to the whole block, not the edited range.
-    fn assemble(&self, style: &Style, parts: &[ParagraphKey]) -> (Layout, Box<[FontChainHandle]>) {
+    fn assemble(
+        &self,
+        style: &Style,
+        parts: &[ParagraphIdentity],
+    ) -> (Layout, Box<[FontChainHandle]>) {
         crate::work::count!(assemblies, 1);
         let chain = self.chain_view(style.chain);
         let Some(primary) = chain.first() else {
@@ -1895,8 +1930,8 @@ impl TextService {
         };
         let metrics = primary.font.metrics();
         let line_height_em = metrics.line_height() * style.line_spacing;
-        let baseline_offset_em = metrics.ascent
-            + (line_height_em - (metrics.ascent - metrics.descent)) * 0.5;
+        let baseline_offset_em =
+            metrics.ascent + (line_height_em - (metrics.ascent - metrics.descent)) * 0.5;
 
         let mut lines: Vec<LayoutLine> = Vec::new();
         let mut byte_offset = 0usize;
@@ -1905,7 +1940,7 @@ impl TextService {
 
         let mut dependencies = HashSet::new();
         for key in parts {
-            let Some(para) = self.paragraphs.get(&(*key, *style)) else {
+            let Some(para) = self.paragraphs.get(&(key.clone(), *style)) else {
                 continue;
             };
             dependencies.extend(para.span_chains.iter().copied());
@@ -1966,6 +2001,18 @@ impl TextService {
         )
     }
 
+    /// One invalidation path for clear, chain release and eviction. Keep the
+    /// generation history even when every block is gone: retained handles and
+    /// batches must not become valid again when the slots are populated anew.
+    fn remove_block(&mut self, index: usize) {
+        if let Some(block) = self.blocks[index].block.take() {
+            self.block_lookup.remove(&block.key);
+            self.generations[index] = self.generations[index].wrapping_add(1);
+            self.geometry[index] = None;
+            self.free_blocks.push(index as u32);
+        }
+    }
+
     /// Drop least-recently-used entries once a pool is over its bound. A block
     /// the consumer keeps drawing is kept alive by being re-shaped (a comparison
     /// when nothing moved), so this only ever reaches genuinely cold entries.
@@ -2001,21 +2048,14 @@ impl TextService {
         let cut = live - MAX_BLOCKS * 3 / 4;
         ages.select_nth_unstable(cut);
         let threshold = ages[cut];
-        for (index, slot) in self.blocks.iter_mut().enumerate() {
-            let cold = slot
+        for index in 0..self.blocks.len() {
+            let cold = self.blocks[index]
                 .block
                 .as_ref()
                 .is_some_and(|block| block.last_used <= threshold);
             if cold {
-                if let Some(block) = slot.block.take() {
-                    crate::work::count!(block_evictions, 1);
-                    self.block_lookup.remove(&block.key);
-                    // Tombstones must invalidate immediately, not only on slot
-                    // reuse: prepare and batch_live use the dense generation array.
-                    self.generations[index] = self.generations[index].wrapping_add(1);
-                    self.geometry[index] = None;
-                    self.free_blocks.push(index as u32);
-                }
+                crate::work::count!(block_evictions, 1);
+                self.remove_block(index);
             }
         }
     }
@@ -2402,7 +2442,10 @@ mod tests {
         let caret = layout.caret_rect(0);
         let selected = &layout.selection(0..1)[0];
         assert_eq!((caret.y_em, caret.height_em), (line.top_em, line.height_em));
-        assert_eq!((selected.y_em, selected.height_em), (line.top_em, line.height_em));
+        assert_eq!(
+            (selected.y_em, selected.height_em),
+            (line.top_em, line.height_em)
+        );
     }
 
     /// A selected hard newline shows as a stub past the last glyph, and a blank
@@ -2701,12 +2744,11 @@ mod tests {
         assert_eq!(covered, (0..items.len()).collect::<Vec<_>>());
     }
 
-    /// A text-only batch is immortal: the text atlas grows but never evicts or
-    /// moves a slot, so there is nothing for an epoch to invalidate. Keying
-    /// staleness on the epoch alone would re-`prepare` every retained batch in
-    /// the document each time one emoji cell was recycled.
+    /// Emoji eviction alone cannot invalidate a text-only batch. Block edits,
+    /// eviction and clear are checked separately through generations/revisions
+    /// in batch_live; they can invalidate either kind of batch.
     #[test]
-    fn a_batch_with_no_emoji_never_goes_stale() {
+    fn emoji_eviction_does_not_invalidate_text_only_batches() {
         assert!(epoch_live(None, 0));
         assert!(epoch_live(None, u64::MAX));
         assert!(epoch_live(Some(4), 4));
@@ -2794,15 +2836,28 @@ mod tests {
         let wide = style_of(chain, Some(100.));
         let narrow_handle = text.shape(BlockKey(1), &narrow, &[key], &src).unwrap();
         let narrow_lines = text.measure(narrow_handle).lines.len();
-        let glyphs = text.shaped[&(key, chain)].run.glyphs.as_ptr();
+        let glyphs = text.shaped[&(ParagraphIdentity::Named(key), chain)]
+            .run
+            .glyphs
+            .as_ptr();
         assert!(narrow_lines > 1);
 
         #[cfg(feature = "perf-counters")]
         crate::profiling::reset_work_counters();
         let wide_handle = text.shape(BlockKey(1), &wide, &[key], &src).unwrap();
         assert_eq!(text.measure(wide_handle).lines.len(), 1);
-        assert_eq!(text.shaped[&(key, chain)].run.glyphs.as_ptr(), glyphs);
-        assert_eq!(src.calls.get(), 2, "new width still needs the source for flow");
+        assert_eq!(
+            text.shaped[&(ParagraphIdentity::Named(key), chain)]
+                .run
+                .glyphs
+                .as_ptr(),
+            glyphs
+        );
+        assert_eq!(
+            src.calls.get(),
+            2,
+            "new width still needs the source for flow"
+        );
         #[cfg(feature = "perf-counters")]
         {
             let work = crate::profiling::work_counters();
@@ -3135,7 +3190,11 @@ mod tests {
         // The block must remember dependencies even after paragraph eviction.
         text.paragraphs.clear();
         text.drop_chain(alias);
-        assert!(!text.shaped.contains_key(&(keys[0], chain)));
+        assert!(
+            !text
+                .shaped
+                .contains_key(&(ParagraphIdentity::Named(keys[0]), chain))
+        );
         assert!(text.block_index(styled).is_none());
         assert_eq!(text.measure(styled).len_bytes(), 0);
         assert!(text.geometry[styled.slot as usize].is_none());

@@ -51,7 +51,19 @@ measurements use em units. You can also supply a world-space transform.
   spans change; changing wrap width reuses unchanged paragraphs' shaped glyphs
   and reflows their lines. `Style` sets wrapping, alignment, and line spacing.
   `measure` gives you bounds,
-  hit-testing, caret movement, and selection geometry without a GPU.
+  hit-testing, caret movement, and selection geometry without a GPU. Namespace,
+  slot, and generation are consumer-controlled identity components; keep the
+  full identity unique across sources sharing a service. For one paragraph,
+  call `shape(block_key, &style, &[paragraph_key], &source)`.
+- **Labels:** `shape_transient` caches by full text and style, independently of
+  caller-supplied identities. Different wrapping/font styles coexist; width-only
+  changes reuse paragraph shaping. This path retains text as cache keys until
+  eviction. An edit names a different block; use `shape` for an object whose
+  identity should survive edits.
+- **Reset:** `clear` invalidates shaped handles and retained batches, including
+  after new text is loaded. GPU allocations and the transform stay; the next
+  `prepare` uploads the replacement atlas contents. Re-map fonts and chains after
+  clearing.
 - **Inline styles:** supply `FontSpan` ranges through
   `ParagraphSource::paragraph_fonts`. Register `PaintSpan` ranges with
   `register_paint` and pass the handle in `Draw::paint` to color text without

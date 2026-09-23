@@ -22,6 +22,16 @@
 //!   space*: 1..N paragraphs flowed into one byte range and one line list. It is
 //!   what you measure, hit-test and draw.
 //!
+//! For labels without consumer identities, [`TextService::shape_transient`]
+//! caches a block by full text and [`Style`]. Different styles coexist; width
+//! changes still reuse paragraph shaping. An edit creates a different content
+//! key rather than updating a named block. Both entry points use the same engine.
+//! For one named paragraph, pass a one-element key slice to [`TextService::shape`].
+//!
+//! [`TextService::clear`] invalidates old shaped handles and batches even after
+//! new layouts are allocated. It retains GPU allocations and the transform, but
+//! resets upload state so the next `prepare` uploads the new atlas contents.
+//!
 //! Shaping is em-space and carries no pixel size and no color, so the cache is
 //! zoom-invariant. Size and color enter once, at draw time.
 //!
@@ -52,10 +62,11 @@
 //!
 //! # What this crate does not own
 //!
-//! - **Your text.** The service stores only derived shaping, keyed by identity,
-//!   and asks for a paragraph's characters through [`ParagraphSource`] *only*
-//!   when that paragraph misses the cache. Your rope, gap buffer or CRDT stays
-//!   authoritative.
+//! - **Your document storage.** Identity-keyed shaping stores derived results
+//!   and asks for characters through [`ParagraphSource`] *only* on a paragraph
+//!   cache miss. Your rope, gap buffer or CRDT stays authoritative. The identity-free
+//!   `shape_transient` path instead retains copied strings as keys while cached;
+//!   it does not impose a document model or edit tracking.
 //! - **Your render pass.** You build the pass — target, load op, z-ordering,
 //!   scissor — and hand it in; the service records glyph quads into it.
 //! - **Font discovery.** You resolve family names to bytes (fontdb does this

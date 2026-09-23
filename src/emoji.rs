@@ -127,6 +127,14 @@ impl EmojiCache {
         self.max_height = max_height.max(SIZE_BUCKETS[SIZE_BUCKETS.len() - 1] + ATLAS_PAD);
     }
 
+    /// Reset contents without forgetting the device/budget limit. The GPU
+    /// atlas owner must invalidate its upload state at the same time.
+    pub fn clear(&mut self) {
+        let max_height = self.max_height;
+        *self = Self::new();
+        self.max_height = max_height;
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }

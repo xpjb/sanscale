@@ -948,3 +948,60 @@ actual recoloring, uncached-width and full-parse control samples; it is not a
 replacement for the library's fingerprinted before/after suite or a claim about
 whole-frame latency. Broad width work remains measurable rather than hidden behind
 a warmed width-cache hit.
+
+## Release-readiness follow-up: reset and identity contracts (locked)
+
+The publishing review exposed two reset inconsistencies and two identity-wrapper
+mistakes. These decisions supersede the earlier `shape_one` convenience and the
+claim that retained atlas allocations need no content invalidation.
+
+- **Clear is generation-aware removal, not a new numbering universe.** Clearing,
+  chain release and eviction use the same block-removal path. Slot generation
+  history survives clearing, so refilling cannot revive old shaped handles or
+  make old retained batches live again. Pool slots remain reusable.
+- **Retain GPU allocations, invalidate upload state.** Both atlases can return to
+  their initial unsynchronized state without recreating textures/pipelines. Text
+  upload offsets reset to zero; the next prepare replaces the populated contents,
+  then returns to incremental uploads. A revision mismatch alone was insufficient:
+  the append uploader still skipped the old prefix. No additional reset epoch or
+  generation was added. Clear also preserves the emoji cache's device/budget limit
+  and the GPU transform. Drawing a stale batch is memory-safe, not a promise to
+  preserve old pixels after atlas contents have been replaced.
+- **Keep content-keyed shaping.** `shape_transient` serves strings with no consumer
+  identity; Compendium's owned strings and the examples' labels/status text are
+  real uses. Its block key contains full text and the complete Style. Paragraph
+  content keys exclude width, so changing width reflows without reshaping.
+  Consumer identities and transient content keys are separate internal enum
+  variants in both pools; no reserved consumer namespace or digest masquerading
+  as identity. Equality checks the full key even if hashes collide. This means
+  transient strings are retained as cache-key material until their entries leave
+  the existing bounded pools; named document text remains consumer-owned and lazy.
+- **Remove `shape_one`.** It saved argument plumbing by folding a paragraph's full
+  identity into a smaller block key, undoing the namespace guarantee. It had no
+  in-repo callers. A named single paragraph uses `shape(block, style, &[key], source)`.
+  Both remaining public shaping entry points share the same implementation.
+- **Keep ParagraphKey's namespace/slot/generation representation.** The fence is
+  Compendium's document-local slots feeding a shared cache: its existing identities
+  pass through losslessly without a global paragraph allocator or mapping table.
+  Consumers with globally unique handles may split their bits across the fields;
+  the fields do not mandate document-local allocation. Content/font-span changes
+  still require a new full key. This is not an opaque-key/API redesign.
+
+No width clamping, equivalent-width flow reuse, new cache policy, or example resize
+changes belong to this pass. Style-specific transient blocks can occupy more cache
+entries than the former overwritten block; this is the cost of retaining independent
+results, not a reason to put width into paragraph identity and lose shaping reuse.
+
+Validation checks behavior rather than key-mixing constants: repeated clear/refill
+with already-freed slots; interleaved styles compared with independent named layouts;
+document-local identities coexisting with transient labels; actual shaping/flow
+work counts. Opt-in offscreen GPU tests compare clear/reload with a fresh service,
+require visible and distinct control glyphs, check retained-batch invalidation, and
+verify no atlas reallocations and no repeated steady-state uploads. Both monochrome
+and color emoji are covered, with equal and unequal pre/post-reset glyph counts.
+
+Run CPU coverage with `cargo nextest run --lib --examples --tests --all-features`.
+Run GPU coverage explicitly with
+`cargo nextest run --test service_lifecycle --all-features --run-ignored all`;
+it requires a headless wgpu adapter and the font fixtures listed in that test.
+The ignored GPU cases are opt-in, not silently passed when a device/font is absent.
