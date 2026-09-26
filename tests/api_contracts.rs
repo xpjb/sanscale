@@ -303,13 +303,13 @@ fn emoji_pressure_preserves_retained_and_unsubmitted_draws() {
 
 #[test]
 fn caret_motion_accepts_trait_objects_and_saturating_page_strides() {
-    use sanscale::{Boundaries, CaretStop, Layout, LayoutLineSpec, LineMetrics, Motion};
+    use sanscale::{WordBoundaries, CaretStop, Layout, LayoutLineSpec, LineMetrics, Motion};
     let layout = Layout::from_lines((0..3).map(|i| LayoutLineSpec {
         byte_range: i * 2..i * 2 + 1,
         metrics: LineMetrics { top_em: i as f32, height_em: 1., width_em: 1., ..Default::default() },
         carets: vec![CaretStop { byte_index: i * 2, x_em: 0. }, CaretStop { byte_index: i * 2 + 1, x_em: 1. }],
     }).collect());
-    let classifier: &dyn Boundaries = &();
+    let classifier: &dyn WordBoundaries = &();
     let c = layout.caret_at(3);
     let mut goal = None;
     assert_eq!(layout.caret_move(c, Motion::PageUp(0), &mut goal, classifier), c);

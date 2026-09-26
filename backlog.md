@@ -154,3 +154,37 @@ Use the local `--bench` probe and work assertions to identify the next worthwhil
 refinement, rather than assuming all work is local because parsing/layout identities
 are retained. The editor itself still lacks undo, IME, unsaved-change confirmation,
 and preview selection; these are not silently supplied by the Markdown component.
+
+
+---
+
+## Editor integration: intra-ligature caret positions
+
+Deferred for 0.1 alongside the remaining IME/composition and bidi work, not a
+publication blocker. This is finer layout geometry, not a request for text storage
+or a platform IME controller in the core crate.
+
+Tau2 integration at `8cc5afe` made the distinction concrete: with DejaVu Sans,
+`office` exposes caret-stop bytes `[0, 1, 2, 4, 5, 6]`. The `fi` ligature is one
+shaping cluster, so there is no stop between its letters. Arrow keys skip that
+interior position. A post-edit byte inside the cluster also has no exact stop;
+`caret_x_on` currently falls back to the line edge, not an intra-ligature position.
+
+Sanscale never deletes consumer text. An editor that uses adjacent glyph-cluster
+stops as deletion boundaries can delete several ordinary letters together. The
+plain editor example currently does this. Tau2 instead deletes one Unicode
+grapheme at a time, independent of font/shaping, so it does not have that deletion
+problem. Combining sequences and joined emoji should remain atomic.
+
+The follow-up is clear in outline: provide grapheme-boundary caret positions
+inside multi-grapheme clusters, prefer font-supplied ligature caret coordinates,
+and define an interpolation fallback when the font supplies none. Keep motion,
+hit-testing, selection and post-edit geometry consistent; explicitly resolve
+bytes that are not valid caret stops. The existing public Caret/Motion surface
+can carry this; no new editor facade is needed.
+
+Before implementing, choose/test the fallback policy and cover ordinary letters,
+ligatures, combining marks, ZWJ emoji, wrapping and post-edit placement. Audit the
+examples' deletion policies separately: text-edit semantics must not accidentally
+change with the selected font. This is a focused follow-up, not a claim that
+complete Unicode editing/IME support has already landed.

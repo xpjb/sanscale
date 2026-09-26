@@ -12,6 +12,9 @@ The eight reproduced contracts and proposed surface cleanup are now implemented.
 See the [locked follow-up](decisions.md#api-review-follow-up--owned-gpu-snapshots-and-explicit-carets-locked)
 and [current regression tests](tests/api_contracts.rs). The README includes the
 [migration and editor integration guide](README.md#editor-integration).
+A subsequent pre-publication naming cleanup changed `Boundaries` to
+`WordBoundaries`, `caret_on_line` to `caret_byte_on_line`, and
+`SelectionSpan::line` to `line_index`, without changing behavior.
 The original report below is historical, not the current release verdict. Its
 source links are frozen to the reviewed revision; the standalone probe still
 intentionally reproduces the old failures, rather than testing the new API.

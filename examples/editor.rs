@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use ropey::Rope;
 use sanscale::{
-    Align, BlockKey, Boundaries, Caret, Color, Layout, Motion, ParagraphKey, ParagraphSource, Rect,
+    Align, BlockKey, WordBoundaries, Caret, Color, Layout, Motion, ParagraphKey, ParagraphSource, Rect,
     ShapedHandle, Style, TextService, Vec2,
 };
 use wgpu::util::DeviceExt;
@@ -363,7 +363,7 @@ impl Editor {
 /// Word boundaries are semantics over the rope, not shaping — the library asks
 /// through this seam exactly the way it asks for text through
 /// `ParagraphSource`, and never holds the text.
-impl Boundaries for Doc {
+impl WordBoundaries for Doc {
     fn prev_word(&self, byte: usize) -> Option<usize> {
         let mut chars = self.rope.chars_at(self.rope.byte_to_char(byte));
         let mut offset = byte;
@@ -913,7 +913,7 @@ impl Gfx {
         }
     }
 
-    /// Double-click word selection: the library composes the same `Boundaries`
+    /// Double-click word selection: the library composes the same `WordBoundaries`
     /// the word motions use ([`Layout::select_word_at`]).
     fn select_word_at_cursor(&mut self) {
         let Some(hit) = self.hit_at_cursor() else {

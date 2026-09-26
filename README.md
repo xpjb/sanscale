@@ -111,7 +111,7 @@ let rect = layout.caret_rect(caret);
 ```
 
 - Up/Down → `Motion::Up` / `Down`; retaining `goal_x` prevents drifting across short lines.
-- Ctrl+Left/Right → `WordLeft` / `WordRight`, with a `Boundaries` implementation over
+- Ctrl+Left/Right → `WordLeft` / `WordRight`, with a `WordBoundaries` implementation over
   your text. **Passing `()` falls back to cluster steps, not word navigation.**
 - Home/End, PageUp/PageDown (visual-line stride), and DocStart/DocEnd are also motions.
 - Shift extends from your selection anchor; movement alone does not own a selection.
@@ -122,7 +122,11 @@ let rect = layout.caret_rect(caret);
 Removing byte-only geometry helpers makes affinity explicit; it does not make
 missing keybindings a compile error. Test navigation, selection extension, word
 boundaries, hard/soft wraps and preferred-column recovery in the consuming editor.
-See `examples/editor.rs` for a complete input adapter.
+Caret stops currently follow shaping clusters: a ligature such as `fi` may have
+no interior stop. For one-grapheme Backspace/Delete, use Unicode grapheme boundaries
+in your text model rather than treating glyph-caret steps as deletion units.
+`examples/editor.rs` is a working input adapter, but currently deletes whole
+clusters. Finer ligature/post-edit positioning is a [deferred follow-up](backlog.md#editor-integration-intra-ligature-caret-positions).
 
 ### Migrating from the reviewed prerelease (`e5c9b03`)
 
@@ -135,6 +139,11 @@ See `examples/editor.rs` for a complete input adapter.
   word-boundary arguments also accept trait objects.
 - A stale/incomplete prepare stays non-live. Refresh evicted shape handles before
   preparing; emoji bucket changes now invalidate retained native-color batches.
+
+Pre-publication naming cleanup (also applies when migrating from `8cc5afe`):
+`Boundaries` → `WordBoundaries`, `Layout::caret_on_line` →
+`Layout::caret_byte_on_line`, and `SelectionSpan::line` → `line_index`.
+These are renames only; byte-index return values and behavior are unchanged.
 
 ## Examples
 

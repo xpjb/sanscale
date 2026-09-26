@@ -270,7 +270,7 @@ pub struct Caret {
 ///
 /// Everything here is pure layout geometry except `WordLeft`/`WordRight`,
 /// which classify *text* the service never holds — they consult the caller's
-/// [`Boundaries`]. `PageUp`/`PageDown` carry their stride in visual lines,
+/// [`WordBoundaries`]. `PageUp`/`PageDown` carry their stride in visual lines,
 /// because page size is viewport knowledge, which is also the caller's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Motion {
@@ -292,12 +292,12 @@ pub enum Motion {
 /// [`Motion::WordRight`]. Words are semantics, not shaping, so the crate asks
 /// rather than guesses — the same seam as [`ParagraphSource`]. Return `None`
 /// to decline; the motion degrades to a cluster step. `()` always declines.
-pub trait Boundaries {
+pub trait WordBoundaries {
     fn prev_word(&self, byte_index: usize) -> Option<usize>;
     fn next_word(&self, byte_index: usize) -> Option<usize>;
 }
 
-impl Boundaries for () {
+impl WordBoundaries for () {
     fn prev_word(&self, _: usize) -> Option<usize> {
         None
     }
@@ -315,7 +315,7 @@ pub struct CaretRect {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SelectionSpan {
-    pub line: usize,
+    pub line_index: usize,
     pub x_em: f32,
     pub y_em: f32,
     pub width_em: f32,
@@ -459,7 +459,7 @@ impl Layout {
     /// Caret nearest a point, in em relative to the block's top-left.
     pub fn hit_test(&self, at_em: Vec2) -> Option<Caret> {
         let line_index = self.line_index_for_y(at_em.y)?;
-        let byte_index = self.caret_on_line(line_index, at_em.x)?;
+        let byte_index = self.caret_byte_on_line(line_index, at_em.x)?;
         Some(Caret {
             byte_index,
             line_index,
@@ -480,8 +480,8 @@ impl Layout {
         Some(self.lines.len() - 1)
     }
 
-    /// Nearest caret stop on `line_index` to `x_em`.
-    pub fn caret_on_line(&self, line_index: usize, x_em: f32) -> Option<usize> {
+    /// Byte index of the nearest caret stop on `line_index` to `x_em`.
+    pub fn caret_byte_on_line(&self, line_index: usize, x_em: f32) -> Option<usize> {
         let line = self.lines.get(line_index)?;
         let local_x = x_em - line.align_em;
         line.carets
@@ -602,7 +602,7 @@ impl Layout {
     /// `goal` is the vertical-motion goal column (em), owned by the caller so
     /// the service stays stateless: vertical motions seed and preserve it,
     /// every other motion clears it. Pass the same `&mut Option<f32>` you keep
-    /// beside the caret. `text` supplies word boundaries ([`Boundaries`]); pass
+    /// beside the caret. `text` supplies word boundaries ([`WordBoundaries`]); pass
     /// `&()` to degrade word motions to cluster steps.
     ///
     /// The affinity rules, in one place: a horizontal step landing on the
@@ -615,7 +615,7 @@ impl Layout {
         caret: Caret,
         motion: Motion,
         goal: &mut Option<f32>,
-        text: &(impl Boundaries + ?Sized),
+        text: &(impl WordBoundaries + ?Sized),
     ) -> Caret {
         if self.lines.is_empty() {
             *goal = None;
@@ -665,7 +665,7 @@ impl Layout {
             let x = *goal.get_or_insert_with(|| {
                 self.caret_rect(caret).x_em
             });
-            let byte_index = self.caret_on_line(target, x).unwrap_or(caret.byte_index);
+            let byte_index = self.caret_byte_on_line(target, x).unwrap_or(caret.byte_index);
             Caret {
                 byte_index,
                 line_index: target,
@@ -743,9 +743,9 @@ impl Layout {
     }
 
     /// The word around `byte_index` — the double-click selection. Classified
-    /// by the caller's [`Boundaries`] (words are semantics, not shaping); a
+    /// by the caller's [`WordBoundaries`] (words are semantics, not shaping); a
     /// declining classifier degrades to the cluster around the byte.
-    pub fn select_word_at(&self, byte_index: usize, text: &(impl Boundaries + ?Sized)) -> Range<usize> {
+    pub fn select_word_at(&self, byte_index: usize, text: &(impl WordBoundaries + ?Sized)) -> Range<usize> {
         let byte_index = byte_index.min(self.len_bytes());
         let start = text
             .prev_word(byte_index)
@@ -819,7 +819,7 @@ impl Layout {
                 0.0
             };
             spans.push(SelectionSpan {
-                line: index,
+                line_index: index,
                 x_em: x0.min(x1) + line.align_em,
                 y_em: line.metrics.top_em,
                 width_em: (x1 - x0).abs() + stub,
@@ -2412,7 +2412,7 @@ mod tests {
             spans[0].width_em > 1.0,
             "line 0: one glyph plus the newline stub"
         );
-        assert_eq!(spans[1].line, 1);
+        assert_eq!(spans[1].line_index, 1);
         assert!(
             spans[1].width_em > 0.0,
             "blank line: a visible stub, not nothing"
@@ -2510,7 +2510,7 @@ mod tests {
     #[test]
     fn select_word_composes_boundaries_and_degrades_to_clusters() {
         struct Stub;
-        impl Boundaries for Stub {
+        impl WordBoundaries for Stub {
             fn prev_word(&self, _: usize) -> Option<usize> {
                 Some(0)
             }
