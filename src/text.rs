@@ -1173,7 +1173,17 @@ impl TextService {
     /// long-lived `Database` and `make_shared_face_data`, not a fresh read per
     /// chain.
     pub fn map_font(&mut self, data: FontData, face_index: u32) -> Result<FontHandle, FontError> {
-        let font = Font::from_shared(data, face_index)?;
+        self.map_font_with_variations(data, face_index, &[])
+    }
+
+    /// Map an immutable variable-font instance. Tags are four-byte OpenType axis
+    /// names, such as `*b"wght"`; values use the font's design coordinates.
+    /// Unknown axes are ignored and values clamp to the font's supported range.
+    /// Shaping, metrics and glyph outlines use the same instance. Deduplication
+    /// includes normalized axis coordinates as well as shared data and face index.
+    pub fn map_font_with_variations(&mut self, data: FontData, face_index: u32, variations: &[([u8; 4], f32)]) -> Result<FontHandle, FontError> {
+        if variations.iter().any(|(_, value)| !value.is_finite()) { return Err(FontError::Parse); }
+        let font = Font::from_shared(data, face_index, variations)?;
         let identity = font.data_identity();
         if let Some(existing) = self
             .fonts

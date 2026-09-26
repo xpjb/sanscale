@@ -348,3 +348,30 @@ fn ordered_pipeline_runs_do_not_cross_scissor_segments() {
     assert!(ink(&expected) > 0);
     assert_eq!(diff(&render(&[&merged]), &expected), 0);
 }
+
+#[test]
+fn variable_font_instances_keep_weight_in_metrics_shaping_and_gpu_outlines() {
+    let gpu = Gpu::new();
+    let mut text = TextService::new();
+    gpu.attach(&mut text, FORMAT);
+    let data: sanscale::FontData = std::sync::Arc::new(include_bytes!("fonts/Roboto-variable-subset.ttf").as_slice());
+    let regular = text.map_font(data.clone(), 0).unwrap();
+    let bold = text.map_font_with_variations(data.clone(), 0, &[(*b"wght", 700.)]).unwrap();
+    assert_ne!(regular, bold);
+    assert_eq!(regular, text.map_font_with_variations(data.clone(), 0, &[(*b"wght", 400.)]).unwrap());
+    assert_eq!(bold, text.map_font_with_variations(data.clone(), 0, &[(*b"wdth", 100.), (*b"wght", 700.)]).unwrap());
+    assert!(text.map_font_with_variations(data, 0, &[(*b"wght", f32::NAN)]).is_err());
+    let mut widths = vec![];
+    let mut pixels = vec![];
+    for font in [regular, bold, regular] {
+        let style = Style { chain: text.register_chain(&[font]).unwrap(), wrap_em: None, align: Align::Left, line_spacing: 1. };
+        let d = draw(&mut text, &style, "Bold", 50.);
+        widths.push(text.measure(d.block).width_em());
+        let batch = text.prepare(&gpu.d, &gpu.q, &[d]);
+        pixels.push(gpu.render(&text, &[&batch], FORMAT));
+    }
+    assert_ne!(widths[0], widths[1], "weight-specific advances must reach shaping");
+    assert!(ink(&pixels[1]) > ink(&pixels[0]) * 12 / 10, "bold must have visibly heavier outlines");
+    assert_eq!(widths[0], widths[2]);
+    assert_eq!(pixels[0], pixels[2], "mapping bold must not mutate the regular face or its glyph cache");
+}

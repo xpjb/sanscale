@@ -371,7 +371,7 @@ mod tests {
     fn load(paths: &[&str]) -> Vec<Font> {
         paths
             .iter()
-            .filter_map(|p| Font::from_shared(read_font_file(p).ok()?, 0).ok())
+            .filter_map(|p| Font::from_shared(read_font_file(p).ok()?, 0, &[]).ok())
             .collect()
     }
 

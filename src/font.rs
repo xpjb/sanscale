@@ -41,7 +41,7 @@ pub(crate) struct Font {
 }
 
 impl Font {
-    pub fn from_shared(data: FontData, face_index: u32) -> Result<Self, FontError> {
+    pub fn from_shared(data: FontData, face_index: u32, variations: &[([u8; 4], f32)]) -> Result<Self, FontError> {
         // SAFETY: `bytes` points into the allocation owned by `data`, which this
         // struct holds for its whole life and never reallocates (an `Arc`'s payload
         // is pinned in place regardless of the `Font` moving). `face` is private
@@ -49,7 +49,10 @@ impl Font {
         // declared before `data`, so drop order tears the face down first.
         let bytes: &'static [u8] =
             unsafe { std::mem::transmute::<&[u8], &'static [u8]>((*data).as_ref()) };
-        let face = RustyFace::from_slice(bytes, face_index).ok_or(FontError::Parse)?;
+        let mut face = RustyFace::from_slice(bytes, face_index).ok_or(FontError::Parse)?;
+        face.set_variations(&variations.iter().map(|(tag, value)| rustybuzz::Variation {
+            tag: ttf_parser::Tag::from_bytes(tag), value: *value,
+        }).collect::<Vec<_>>());
         let units_per_em = face.units_per_em() as u16;
         let upem = units_per_em as f32;
         let metrics = FontMetrics {
@@ -69,9 +72,9 @@ impl Font {
     /// Identity of the underlying bytes, for deduping. Two chains that were handed
     /// the same `Arc` map to one entry — which is what lets a shared emoji font be
     /// rasterized once instead of once per chain.
-    pub fn data_identity(&self) -> (*const u8, usize, u32) {
+    pub fn data_identity(&self) -> (*const u8, usize, u32, &[ttf_parser::NormalizedCoordinate]) {
         let bytes: &[u8] = (*self.data).as_ref();
-        (bytes.as_ptr(), bytes.len(), self.face_index)
+        (bytes.as_ptr(), bytes.len(), self.face_index, self.face.variation_coordinates())
     }
 
     pub fn face(&self) -> &RustyFace<'static> {
