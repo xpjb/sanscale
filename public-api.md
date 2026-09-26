@@ -176,6 +176,12 @@ pub struct FontChainHandle {
 }
 ```
 
+Variable font instances use `map_font_with_variations` with OpenType axis tags
+and design coordinates (for example `(*b"wght", 700.0)`). Shaping, metrics and
+outlines share those coordinates. Font identity includes the normalized axis
+values; mapping a bold instance does not change a regular instance. Platform
+font discovery remains the caller's job. No fonts are bundled by the library.
+
 ## `sanscale::FontData`
 
 [src/text.rs:34](src/text.rs#L34)
@@ -489,6 +495,8 @@ pub struct TextService {
 impl TextService {
     pub fn new() -> Self;
     pub fn map_font(&mut self, data: FontData, face_index: u32) -> Result<FontHandle, FontError>;
+    pub fn map_font_with_variations(&mut self, data: FontData, face_index: u32,
+        variations: &[([u8; 4], f32)]) -> Result<FontHandle, FontError>;
     pub fn register_chain(&mut self, fonts: &[FontHandle]) -> Result<FontChainHandle, FontError>;
     pub fn drop_chain(&mut self, chain: FontChainHandle);
     pub fn register_paint(&mut self, spans: &[PaintSpan]) -> Result<PaintHandle, PaintError>;
