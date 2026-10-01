@@ -42,7 +42,9 @@
 //! [`TextService::prepare`], which concatenates blocks into a [`Batch`] — one
 //! GPU buffer **you** hold, split into [`Segment`]s where the clip changes.
 //! Hold a batch and unchanged content costs zero per-frame upload; ignore the
-//! word "batch" entirely and nothing is taken from you.
+//! word "batch" entirely and nothing is taken from you. Shaping and preparation
+//! refresh a block's capacity-LRU age, including cached geometry hits; measurement
+//! and recording an already-prepared batch alone do not.
 //!
 //! # Inline styles
 //!

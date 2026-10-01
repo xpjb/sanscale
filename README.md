@@ -87,6 +87,8 @@ including the optional profiling surface.
 - **Drawing:** `Draw` sets position, size, color, and CPU culling bounds. Use
   `draw_batch` for many blocks, or keep a batch from `prepare` and record it
   with `draw_prepared`. Input order is preserved across text/emoji pipeline runs.
+  Shaping and preparation refresh a block's capacity-LRU age, including cached
+  geometry hits. Measurement and recording a retained batch alone do not.
   Re-prepare when your draw inputs change. When `batch_live` returns false,
   re-issue shaping and refresh the handles first: re-preparing an evicted handle
   cannot recover its text. Changing pixel scale invalidates affected emoji buckets,
