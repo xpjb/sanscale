@@ -1121,3 +1121,23 @@ pixels/liveness and cold eviction. Tau's consumer test assembles the next paint
 before the late allocation and compares both the sweep and following frame with
 the pre-pressure message/editor pixels. This establishes a concrete dropout path,
 not proof that every reported platform flicker has this cause.
+
+**Integration, October 1, 2026:** accepted as a cache-residency improvement, not
+as a confirmed diagnosis of Tau's periodic blink. Merged on top of `719bc56`,
+preserving the newer API names and their decision history. Merged-tree nextest
+passed 98/98 library/example/integration tests, including normally ignored GPU
+cases (run `cd8aad09-288b-4b39-a5cf-d5f8b8bc22ed`); private-item/all-feature
+rustdoc with warnings denied passed. No Clippy or built-in test runner was used.
+
+The age store is not free. A single matched release smoke on this host's existing
+`gpu.unicode.group_1.prepare_warm` fixture (16,384 layouts, 5 warmups, 31 samples,
+no perf counters) measured median CPU preparation 811.519 us before / 823.869 us
+after; prepare-plus-drain totals were 909.379 / 922.568 us. This is a bounded
+single-host timing observation, not a statistically established regression or a
+promise about Windows/Android performance. No extra shaping, geometry rebuilds
+or GPU uploads are introduced by the age update. Reports are
+`/tmp/sanscale-residency-prepare-{before,after}-release.json`; the earlier debug
+smoke is explicitly not timing-regression evidence. Tau retains the tested
+API-compatible revision `4325844`, now included in master history, rather than
+importing unrelated naming changes into its pin. Device confirmation of the
+original reported flicker remains outstanding.
