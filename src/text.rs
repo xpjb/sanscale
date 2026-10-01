@@ -1128,9 +1128,9 @@ pub struct TextService {
     /// a dense 4-byte array instead of pulling a ~200-byte `BlockSlot` into cache.
     generations: Vec<u32>,
     /// Pool 7, also held apart from `blocks`. `prepare` walks this and nothing
-    /// else: on a dense frame it is the only array in the hot loop, and keeping it
-    /// off `Block` is the difference between touching ~96 bytes per item and
-    /// chasing through the block's layout, parts and style to reach it.
+    /// else for cached quads: keeping it off `Block` avoids chasing through the
+    /// layout, parts and style. Preparation also stamps block residency so
+    /// frequently drawn cached handles do not age as if they were unused.
     geometry: Vec<Option<Geometry>>,
     /// Tombstoned block slots, newest first. Allocation pops from here instead of
     /// scanning `blocks` for a hole — a linear scan per `shape` is quadratic over
@@ -1529,8 +1529,10 @@ impl TextService {
     ///
     /// Geometry rebuilds, emoji rasterization/page uploads, monochrome atlas
     /// sync and vertex upload happen here. `draw_segment`/`draw_prepared` purely
-    /// record. The batch keeps its emoji pages even if later preparation evicts
-    /// them; cached CPU geometry stores glyph requests, never stale texture UVs.
+    /// record. Each valid input refreshes its block's capacity-LRU age, even on
+    /// a geometry hit; cached handles need not be re-shaped just to stay warm.
+    /// The batch keeps its emoji pages even if later preparation evicts them;
+    /// cached CPU geometry stores glyph requests, never stale texture UVs.
     /// Panics if no target was selected or `device` differs from its owner.
     ///
     /// Input order is preserved (it is z-order, and it is yours); adjacent
@@ -1541,6 +1543,8 @@ impl TextService {
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, items: &[Draw]) -> Batch {
         crate::work::count!(prepares, 1);
         crate::work::count!(prepared_items, items.len());
+        self.clock += 1;
+        let clock = self.clock;
         let gpu = self.gpu.as_ref().expect("call set_target before prepare");
         assert_eq!(&gpu.device, device, "TextService belongs to a different device");
         let pixel_scale = self.pixel_scale.unwrap_or(1.0);
@@ -1566,7 +1570,12 @@ impl TextService {
                     continue;
                 }
                 let baked = (item.block.slot, item.block.generation, self.blocks[index].revision);
-                if blocks.last() != Some(&baked) { blocks.push(baked); }
+                if blocks.last() != Some(&baked) {
+                    blocks.push(baked);
+                    // Cached layouts can be drawn for thousands of frames without
+                    // another shape call. They are hot, not eviction candidates.
+                    self.blocks[index].block.as_mut().expect("live block").last_used = clock;
+                }
                 let key = GeomKey {
                     color: item.color.0.map(f32::to_bits), paint: item.paint,
                     clip: normalized_clip(item).map(|c| [c.x, c.y, c.width, c.height].map(f32::to_bits)),
@@ -1955,9 +1964,9 @@ impl TextService {
         }
     }
 
-    /// Drop least-recently-used entries once a pool is over its bound. A block
-    /// the consumer keeps drawing is kept alive by being re-shaped (a comparison
-    /// when nothing moved), so this only ever reaches genuinely cold entries.
+    /// Drop least-recently-used entries once a pool is over its bound. Shaping
+    /// and preparation both refresh block age. Recording a retained batch alone
+    /// does not; consumers still refresh evicted handles before preparing again.
     fn evict(&mut self) {
         if self.shaped.len() > MAX_PARAGRAPHS {
             let mut ages: Vec<u64> = self.shaped.values().map(|p| p.last_used).collect();

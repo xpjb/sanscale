@@ -435,3 +435,33 @@ fn gpu_clear_reload_matches_fresh_emoji_with_owned_pages() {
     .expect("color emoji font required");
     check_gpu_reset(font, &[("😀", "😁"), ("😀😂😃", "😁")], true);
 }
+
+#[test]
+fn preparation_keeps_cached_blocks_warm_but_still_evicts_cold_layouts() {
+    let (device, queue) = device();
+    let mut text = TextService::new();
+    let style = install(&mut text, &latin_font());
+    attach(&mut text, &device, &queue);
+    let hot = text.shape_transient("Keep", &style).unwrap();
+    let (reference, retained) = render(&mut text, hot, &device, &queue);
+    assert!(reference.chunks_exact(4).any(|p| p[..3] != [0, 0, 0]), "reference must draw ink");
+    let parts = [ParagraphKey { namespace: 42, slot: 0, generation: 1 }];
+    let cold = text.shape(BlockKey(0), &style, &parts, &Paragraphs(&["x"])).unwrap();
+    // Reach the real block bound without sweeping. All these layouts share a
+    // paragraph: no giant corpus or atlas overflow is required for this bug.
+    for n in 1..131_071 {
+        text.shape(BlockKey(n), &style, &parts, &Paragraphs(&["x"])).unwrap();
+    }
+    assert_eq!(text.diagnostics().cache_occupancy().1, 131_072);
+    // A cached geometry hit is usage even though no shape request occurred.
+    let (warm, _) = render(&mut text, hot, &device, &queue);
+    assert_eq!(warm, reference);
+    text.shape(BlockKey(131_071), &style, &parts, &Paragraphs(&["x"])).unwrap();
+    assert!(text.diagnostics().cache_occupancy().1 < 131_072, "a bounded sweep must occur");
+    assert_eq!(text.measure(cold).line_count(), 0, "cold layouts remain evictable");
+    assert_eq!(text.measure(hot).len_bytes(), "Keep".len(), "preparation must renew block residency");
+    assert!(text.batch_live(&retained), "age renewal must not mutate layout revisions");
+    assert_eq!(render(&mut text, hot, &device, &queue).0, reference);
+    let incomplete = text.prepare(&device, &queue, &[Draw { block: cold, ..Default::default() }]);
+    assert!(!text.batch_live(&incomplete), "preparation cannot revive a stale handle");
+}

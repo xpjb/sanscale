@@ -1096,3 +1096,28 @@ the compiler-resolved public inventory was regenerated. All-target Clippy still
 hits the unchanged redraw-guard style lint in `examples/code-editor.rs:999–1005`
 (`clippy::collapsible_match`), recorded separately as flag
 `d31293b4-fbdc-4f6e-8b6e-be3505f999f3`; no unrelated event-loop rewrite was included.
+
+
+## 2026-10-01 — Preparing cached text renews block residency
+
+Tau2 holds unchanged Markdown/editor layout handles and prepares their vertices on
+repaint without issuing another shape request. The block LRU counted only shaping,
+so those visible blocks stayed as old as their initial layout. At the 131,072-block
+bound, a late status label could sweep them after their Draws had already been
+collected: the current frame lost the text and the following frame re-shaped it.
+A real-font/headless Tau reproduction loses 2,470 message/composer pixels for
+exactly that paint; no font reload, network event or shared vertex arena is needed.
+
+`prepare` now renews the age of valid input blocks, including geometry hits, in the
+same access clock as shaping. No reshaping, layout revision bump, additional GPU
+upload or frame/lease API is introduced. The cost is one block-age store per
+adjacent-distinct valid input. Pool bounds and cold eviction remain unchanged;
+invalid block/paint inputs still do not become complete batches. Measurement and
+recording a retained batch alone do not renew residency, so retained-batch users
+still refresh stale handles before re-preparing.
+
+The upstream lifecycle test crosses the production capacity and checks both hot
+pixels/liveness and cold eviction. Tau's consumer test assembles the next paint
+before the late allocation and compares both the sweep and following frame with
+the pre-pressure message/editor pixels. This establishes a concrete dropout path,
+not proof that every reported platform flicker has this cause.
