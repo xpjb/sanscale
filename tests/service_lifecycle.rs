@@ -465,3 +465,31 @@ fn preparation_keeps_cached_blocks_warm_but_still_evicts_cold_layouts() {
     let incomplete = text.prepare(&device, &queue, &[Draw { block: cold, ..Default::default() }]);
     assert!(!text.batch_live(&incomplete), "preparation cannot revive a stale handle");
 }
+
+#[test]
+fn tabs_are_four_spaces_of_advance_with_original_source_carets() {
+    let mut text = TextService::new();
+    let style = install(&mut text, &latin_font());
+    let tab = text.shape_transient("a\tb", &style).unwrap();
+    let spaces = text.shape_transient("a    b", &style).unwrap();
+    assert_eq!(text.measure(tab).len_bytes(), 3);
+    let a = text.measure(tab);
+    let b = text.measure(spaces);
+    assert!((a.width_em() - b.width_em()).abs() < 0.001);
+    assert!((a.caret_rect(a.caret_at(2)).x_em - b.caret_rect(b.caret_at(5)).x_em).abs() < 0.001);
+    assert_eq!(a.caret_move(a.caret_at(1), sanscale::Motion::Right, &mut None, &()).byte_index, 2);
+}
+
+#[test]
+fn tabs_draw_exactly_like_spaces_not_missing_glyph_boxes() {
+    let (device, queue) = device();
+    let mut text = TextService::new();
+    let style = install(&mut text, &latin_font());
+    attach(&mut text, &device, &queue);
+    let tab = text.shape_transient("a\tb", &style).unwrap();
+    let spaces = text.shape_transient("a    b", &style).unwrap();
+    let (actual, _) = render(&mut text, tab, &device, &queue);
+    let (expected, _) = render(&mut text, spaces, &device, &queue);
+    assert_eq!(actual, expected);
+    assert!(actual.chunks_exact(4).any(|p| p[0] > 0), "must draw text, not two blank frames");
+}

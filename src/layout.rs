@@ -280,8 +280,14 @@ fn shape_runs<'font, 'text>(
         let font = entry.font;
         let upem = font.units_per_em() as f32;
 
+        // Tabs are layout whitespace, not font glyphs. Shape a same-byte-length
+        // space so rustybuzz keeps original source clusters, then widen its
+        // advance below. Never expand the caller's string/paragraph keys.
+        let input = if run_text.contains('\t') {
+            std::borrow::Cow::Owned(run_text.replace('\t', " "))
+        } else { std::borrow::Cow::Borrowed(run_text) };
         let mut buffer = UnicodeBuffer::new();
-        buffer.push_str(run_text);
+        buffer.push_str(&input);
         if context {
             buffer.set_pre_context(&text[..run_start]);
             buffer.set_post_context(&text[run_start + run_text.len()..]);
@@ -306,7 +312,8 @@ fn shape_runs<'font, 'text>(
             let glyph_id = info.glyph_id;
             let gx = x + pos.x_offset as f32 / upem;
             let gy = y + pos.y_offset as f32 / upem;
-            let x_adv = pos.x_advance as f32 / upem;
+            let tab = run_text.as_bytes().get(info.cluster as usize) == Some(&b'\t');
+            let x_adv = pos.x_advance as f32 / upem * if tab { 4. } else { 1. };
             let y_adv = pos.y_advance as f32 / upem;
 
             // Color glyphs render through the emoji atlas, so skip Slug band

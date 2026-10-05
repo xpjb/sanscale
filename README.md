@@ -168,3 +168,7 @@ The Markdown parser belongs to its example, not the library.
 ## License
 
 [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE). Eric Lengyel dedicated the [Slug reference shaders](https://github.com/EricLengyel/Slug) to the public domain.
+
+Tabs are layout whitespace: each `\t` advances four space widths without drawing
+a glyph. Source bytes, paragraph keys, paint ranges and caret stops remain those
+of the original text. These are fixed advances, not configurable column tab stops.

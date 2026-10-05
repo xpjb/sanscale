@@ -1141,3 +1141,23 @@ smoke is explicitly not timing-regression evidence. Tau retains the tested
 API-compatible revision `4325844`, now included in master history, rather than
 importing unrelated naming changes into its pin. Device confirmation of the
 original reported flicker remains outstanding.
+
+
+## October 5, 2026 — Tabs are source-preserving whitespace
+
+Rustybuzz receives a same-byte-length space for a source tab; that glyph's advance
+is four spaces. No tofu outline is uploaded, and source clusters, selection,
+paragraph identities and inline paint ranges remain unchanged. This applies to
+plain and font-spanned shaping, including both Barkdown and Compendium's editor.
+This is a fixed advance, not a configurable tab-stop system. Reopen for configurable
+stops only with an explicit flow/wrapping contract, not by expanding stored text.
+
+Validation: all 8 service-lifecycle tests, including normally ignored GPU tests,
+pass. The new tab regression checks byte/caret coordinates and exact GPU pixels
+against four literal spaces. The prepared-cache pressure regression still passes.
+
+The user now reports Tau beta no longer flickers on the residency fix while
+Compendium still flickers on its older pin. This is additional real-use evidence
+consistent with the cache-residency fix; it does not retrospectively turn the
+original investigation into device-level proof. Both consumers are being brought
+onto master plus this tab fix.
