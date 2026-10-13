@@ -59,23 +59,29 @@ fn wrap(paragraph: &str, glyphs: &[ShapedGlyph], max_width_em: f32, out: &mut Ve
     }
 
     let boundaries = grapheme_boundaries(paragraph);
+    let tokens = tokenize(paragraph)
+        .map(|(start, token)| (start, start + token.len(), token.chars().all(char::is_whitespace)))
+        .collect::<Vec<_>>();
+    let mut glyphs_by_token = vec![Vec::new(); tokens.len()];
+    for glyph in glyphs.iter().copied() {
+        crate::work::count!(flow_glyph_tests, 1);
+        let index = tokens
+            .partition_point(|(start, _, _)| *start <= glyph.cluster)
+            .saturating_sub(1);
+        if tokens.get(index).is_some_and(|(_, end, _)| glyph.cluster < *end) {
+            glyphs_by_token[index].push(glyph);
+        }
+    }
     let mut current_start: Option<usize> = None;
     let mut current_end = 0usize;
     let mut current_origin = 0.0f32;
     let mut current_width = 0.0f32;
     let mut current_glyphs = Vec::new();
 
-    for (token_start, token) in tokenize(paragraph) {
+    for ((token_start, token_end, is_ws), token_glyphs) in
+        tokens.into_iter().zip(glyphs_by_token)
+    {
         crate::work::count!(flow_tokens, 1);
-        // Count the full scan without putting an instrumentation call in its hot loop.
-        crate::work::count!(flow_glyph_tests, glyphs.len());
-        let token_end = token_start + token.len();
-        let is_ws = token.chars().all(char::is_whitespace);
-        let token_glyphs = glyphs
-            .iter()
-            .copied()
-            .filter(|glyph| glyph.cluster >= token_start && glyph.cluster < token_end)
-            .collect::<Vec<_>>();
         let token_origin = token_glyphs
             .first()
             .map(|glyph| glyph.x)
@@ -364,6 +370,22 @@ mod tests {
             at += token.len();
         }
         assert_eq!(at, text.len());
+    }
+
+    #[cfg(feature = "perf-counters")]
+    #[test]
+    fn token_flow_assigns_each_glyph_once() {
+        let text = "word ".repeat(2_000);
+        let glyphs = text.char_indices()
+            .map(|(cluster, _)| glyph(cluster, cluster as f32, 1.))
+            .collect::<Vec<_>>();
+        crate::profiling::reset_work_counters();
+        let lines = flow_paragraph(&text, &glyphs, 80.);
+        assert!(!lines.is_empty());
+        assert_eq!(
+            crate::profiling::work_counters().flow_glyph_tests,
+            glyphs.len() as u64
+        );
     }
 
     #[test]

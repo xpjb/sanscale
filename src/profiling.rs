@@ -8,8 +8,8 @@
 //! Instrumented timing is not production timing. Run the pathological benchmark
 //! twice: without this feature for latency, with it for work/allocation counts.
 //! Counts describe actual work, not estimates based on elapsed time. In particular
-//! `flow_glyph_tests` counts the current token/filter algorithm's inspected glyphs,
-//! whereas `shape_runs` excludes the separately counted fallback probe shapings.
+//! `flow_glyph_tests` counts glyphs assigned to line-break tokens, whereas
+//! `shape_runs` excludes the separately counted fallback probe shapings.
 
 use std::cell::Cell;
 
