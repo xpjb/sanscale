@@ -27,7 +27,7 @@ wgpu = "30"
 ttf-parser = "0.25"
 rustybuzz = "0.20.1"
 bytemuck = { version = "1", features = ["derive"] }
-glam = "0.29"
+glam = "0.30.9"
 half = { version = "2", features = ["bytemuck"] }
 unicode-segmentation = "1.12"
 # Color-emoji (COLR v0/v1) rasterizer for the emoji atlas. Pure Rust, no C deps.
