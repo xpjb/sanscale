@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::cache::{GlyphCache, GlyphInfo};
+use crate::cache::GlyphCache;
 use crate::emoji::{EmojiCache, bucket_for};
 use crate::flow::{FlowLine, flow_paragraph};
 use crate::font::Font;
@@ -434,6 +434,16 @@ impl Layout {
         self.lines.get(index).map(|line| line.byte_range.clone())
     }
 
+    /// Indices of lines intersecting an em-space vertical interval, including its edges.
+    /// Line tops and bottoms must be ordered.
+    pub fn visible_lines(&self, top: f32, bottom: f32) -> Range<usize> {
+        let start = self.lines.partition_point(|line| {
+            line.metrics.top_em + line.metrics.height_em < top
+        });
+        let end = self.lines.partition_point(|line| line.metrics.top_em <= bottom);
+        start..end.max(start)
+    }
+
     /// Total byte length of the block, including newlines between paragraphs.
     pub fn len_bytes(&self) -> usize {
         self.lines
@@ -448,12 +458,10 @@ impl Layout {
         if self.lines.is_empty() {
             return None;
         }
-        for (index, line) in self.lines.iter().enumerate() {
-            if y_em < line.metrics.top_em + line.metrics.height_em {
-                return Some(index);
-            }
-        }
-        Some(self.lines.len() - 1)
+        let index = self.lines.partition_point(|line| {
+            line.metrics.top_em + line.metrics.height_em <= y_em
+        });
+        Some(index.min(self.lines.len() - 1))
     }
 
     /// Caret nearest a point, in em relative to the block's top-left.
@@ -472,12 +480,8 @@ impl Layout {
         if self.lines.is_empty() {
             return None;
         }
-        for (index, line) in self.lines.iter().enumerate() {
-            if byte_index < line.byte_range.end {
-                return Some(index);
-            }
-        }
-        Some(self.lines.len() - 1)
+        let index = self.lines.partition_point(|line| line.byte_range.end <= byte_index);
+        Some(index.min(self.lines.len() - 1))
     }
 
     /// Byte index of the nearest caret stop on `line_index` to `x_em`.
@@ -787,14 +791,24 @@ impl Layout {
     }
 
     pub fn selection(&self, range: Range<usize>) -> Vec<SelectionSpan> {
-        if range.is_empty() {
-            return Vec::new();
-        }
-        /// Visual width of a selected line break, em: the stub an editor shows
-        /// past the last glyph — and the entire highlight of a blank line.
+        self.selection_in(range, 0..self.lines.len()).collect()
+    }
+
+    /// Iterate over selection rectangles in a range of visual lines without allocating.
+    pub fn selection_in(
+        &self, range: Range<usize>, lines: Range<usize>,
+    ) -> impl Iterator<Item = SelectionSpan> + '_ {
         const NEWLINE_STUB_EM: f32 = 0.45;
-        let mut spans = Vec::new();
-        for (index, line) in self.lines.iter().enumerate() {
+        let first = self.lines.partition_point(|line| line.byte_range.end < range.start);
+        let start = lines.start.max(first).min(self.lines.len());
+        let end = if range.is_empty() {
+            start
+        } else {
+            let last = self.lines.partition_point(|line| line.byte_range.start < range.end);
+            lines.end.min(last).max(start)
+        };
+        self.lines[start..end].iter().enumerate().filter_map(move |(offset, line)| {
+            let index = start + offset;
             let start = range.start.max(line.byte_range.start);
             let end = range.end.min(line.byte_range.end);
             // A hard break's separator byte belongs to no line. Selecting past
@@ -809,7 +823,7 @@ impl Layout {
             let newline_selected =
                 hard_break && range.start <= line.byte_range.end && range.end > line.byte_range.end;
             if start >= end && !newline_selected {
-                continue;
+                return None;
             }
             let x0 = caret_x_on(line, start.min(end));
             let x1 = caret_x_on(line, end.max(start));
@@ -818,15 +832,14 @@ impl Layout {
             } else {
                 0.0
             };
-            spans.push(SelectionSpan {
+            Some(SelectionSpan {
                 line_index: index,
                 x_em: x0.min(x1) + line.align_em,
                 y_em: line.metrics.top_em,
                 width_em: (x1 - x0).abs() + stub,
                 height_em: line.metrics.height_em,
-            });
-        }
-        spans
+            })
+        })
     }
 }
 
@@ -1429,6 +1442,11 @@ impl TextService {
         )
     }
 
+    /// Whether a previously shaped handle still resolves in this service.
+    pub fn is_shaped(&self, h: ShapedHandle) -> bool {
+        self.block_index(h).is_some()
+    }
+
     /// Em-space geometry for a block. Borrow it for the length of the call and
     /// hold the [`ShapedHandle`], not this.
     pub fn measure(&self, h: ShapedHandle) -> &Layout {
@@ -1725,11 +1743,11 @@ impl TextService {
         // Bake at the origin *and* at unit size, with the clip normalised to
         // match, so the build depends on everything about this draw except where
         // it lands and how big it is. `prepare` applies both on the way out.
-        let at = Vec2::new(0.0, 0.0);
-        let size = 1.0f32;
         let clip = normalized_clip(item);
-        let mut text_verts = Vec::new();
-        let mut emoji_requests = Vec::new();
+        let (mut text_verts, mut emoji_requests) = self.geometry[index].take()
+            .map(|geometry| (geometry.text, geometry.emoji)).unwrap_or_default();
+        text_verts.clear();
+        emoji_requests.clear();
         {
             let block = self.blocks[index]
                 .block
@@ -1737,8 +1755,6 @@ impl TextService {
                 .expect("checked by caller");
             for_each_visible_glyph(
                 &block.layout,
-                at,
-                size,
                 clip,
                 |glyph, pen_x, pen_y, paragraph_byte| {
                     if glyph.is_color {
@@ -1757,7 +1773,7 @@ impl TextService {
                             &info,
                             pen_x,
                             pen_y,
-                            size,
+                            1.0,
                             foreground.0,
                         );
                     }
@@ -2039,8 +2055,7 @@ fn chain_view<'a>(
         .unwrap_or_default()
 }
 
-/// Walk the glyphs of `layout` that survive `clip`, with their pen positions in
-/// the transform's source space.
+/// Walk the glyphs that survive the clip, in em space at the block's origin.
 ///
 /// Split out of `rebuild_geometry` so the cull is reachable without a device.
 /// It previously lived inline in the one function that needs a GPU to call, which
@@ -2049,32 +2064,36 @@ fn chain_view<'a>(
 /// release. Culling is pure geometry; it should not need a GPU to test.
 fn for_each_visible_glyph(
     layout: &Layout,
-    at: Vec2,
-    size: f32,
     clip: Option<Rect>,
     mut f: impl FnMut(&ShapedGlyph, f32, f32, usize),
 ) {
-    for line in &layout.lines {
+    let lines = match clip {
+        Some(clip) if layout.lines.first().is_none_or(|line| line.metrics.height_em >= 0.0) => {
+            layout.visible_lines(clip.y, clip.max_y())
+        }
+        _ => 0..layout.lines.len(),
+    };
+    crate::work::count!(culled_lines, layout.lines.len() - lines.len());
+    for line in &layout.lines[lines] {
         crate::work::count!(visited_lines, 1);
-        let top = at.y + line.metrics.top_em * size;
-        let bottom = top + line.metrics.height_em * size;
+        let top = line.metrics.top_em;
+        let bottom = top + line.metrics.height_em;
         if clip.is_some_and(|clip| bottom < clip.y || top > clip.max_y()) {
             crate::work::count!(culled_lines, 1);
             continue;
         }
         crate::work::count!(visited_glyphs, line.glyphs.len());
-        let baseline = at.y + line.metrics.baseline_em * size;
-        let origin_x = at.x + line.align_em * size;
+        let baseline = line.metrics.baseline_em;
         for glyph in &line.glyphs {
-            let pen_x = origin_x + glyph.x * size;
-            let pen_y = baseline - glyph.y * size;
+            let pen_x = line.align_em + glyph.x;
+            let pen_y = baseline - glyph.y;
             if glyph.is_color {
-                // A colour glyph is a size x size box hanging from the baseline;
+                // A colour glyph is a unit box hanging from the baseline;
                 // it has no outline to measure, so the box is the bound.
                 let outside = clip.is_some_and(|clip| {
                     pen_y < clip.y
-                        || pen_y - size > clip.max_y()
-                        || pen_x + size < clip.x
+                        || pen_y - 1.0 > clip.max_y()
+                        || pen_x + 1.0 < clip.x
                         || pen_x > clip.max_x()
                 });
                 if !outside {
@@ -2083,21 +2102,16 @@ fn for_each_visible_glyph(
                 continue;
             }
             let Some(info) = glyph.info else { continue };
-            if clip.is_some_and(|clip| !glyph_intersects(&info, pen_x, pen_y, size, clip)) {
+            if clip.is_some_and(|clip| {
+                let (min_x, min_y, max_x, max_y) = info.bbox;
+                !(pen_x + max_x >= clip.x && pen_x + min_x <= clip.max_x()
+                    && pen_y - min_y >= clip.y && pen_y - max_y <= clip.max_y())
+            }) {
                 continue;
             }
             f(glyph, pen_x, pen_y, line.paragraph_byte);
         }
     }
-}
-
-fn glyph_intersects(info: &GlyphInfo, pen_x: f32, pen_y: f32, size: f32, clip: Rect) -> bool {
-    let (min_x, min_y, max_x, max_y) = info.bbox;
-    let left = pen_x + min_x * size;
-    let right = pen_x + max_x * size;
-    let top = pen_y - max_y * size;
-    let bottom = pen_y - min_y * size;
-    right >= clip.x && left <= clip.max_x() && bottom >= clip.y && top <= clip.max_y()
 }
 
 // ---------------------------------------------------------------------------
@@ -2836,8 +2850,6 @@ mod tests {
         let mut n = 0;
         for_each_visible_glyph(
             text.measure(h),
-            Vec2::new(0.0, 0.0),
-            16.0,
             clip,
             |_, _, _, _| n += 1,
         );
@@ -2871,7 +2883,7 @@ mod tests {
         assert!(all > 0, "unclipped must emit something");
 
         let first = text.measure(h).line(0).expect("a first line");
-        let one_line = Rect::new(0.0, 0.0, 10_000.0, first.height_em * 16.0 * 0.9);
+        let one_line = Rect::new(0.0, 0.0, 10_000.0, first.height_em * 0.9);
         let clipped = visible_count(&text, h, Some(one_line));
         assert!(clipped > 0, "the first line is inside the clip");
         assert!(
@@ -2890,9 +2902,28 @@ mod tests {
             return;
         };
         let all = visible_count(&text, h, None);
-        let narrow = Rect::new(0.0, 0.0, 20.0, 10_000.0);
+        let narrow = Rect::new(0.0, 0.0, 1.25, 10_000.0);
         let clipped = visible_count(&text, h, Some(narrow));
         assert!(clipped < all, "a narrow clip must drop trailing glyphs");
+    }
+
+    #[test]
+    fn visible_line_ranges_bound_selection_on_wrapped_and_empty_lines() {
+        let Some((mut text, chain)) = latin_chain() else { return };
+        let h = text.shape_transient("a long wrapped paragraph for testing\n\nlast line", &style_of(chain, Some(4.0))).unwrap();
+        let layout = text.measure(h);
+        assert!(layout.line_count() > 4);
+        let index = layout.line_count() - 2;
+        let line = layout.line(index).unwrap();
+        let visible = layout.visible_lines(line.top_em + 0.1, line.top_em + 0.2);
+        assert_eq!(visible, index..index + 1);
+        let all = 0..layout.len_bytes();
+        let expected = layout.selection(all.clone());
+        let visible_spans = layout.selection_in(all, visible).collect::<Vec<_>>();
+        assert_eq!(visible_spans.len(), 1);
+        assert_eq!(visible_spans[0].line_index, expected[index].line_index);
+        assert_eq!(visible_spans[0].width_em, expected[index].width_em);
+        assert!(layout.visible_lines(layout.height_em() + 1.0, layout.height_em() + 2.0).is_empty());
     }
 
     #[test]
